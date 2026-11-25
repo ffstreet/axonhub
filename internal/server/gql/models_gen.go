@@ -386,6 +386,38 @@ type ModelPerformanceStat struct {
 	RequestCount int      `json:"requestCount"`
 }
 
+type ModelTokenStats struct {
+	ModelID           string `json:"modelId"`
+	ModelName         string `json:"modelName"`
+	TotalInputTokens  int    `json:"totalInputTokens"`
+	TotalOutputTokens int    `json:"totalOutputTokens"`
+	TotalCachedTokens int    `json:"totalCachedTokens"`
+	TotalTokens       int    `json:"totalTokens"`
+	Period            string `json:"period"`
+	Date              string `json:"date"`
+}
+
+type ModelTokenStatsSummary struct {
+	CurrentPeriod []*ModelTokenStats   `json:"currentPeriod"`
+	Trends        *ModelTokenTrendData `json:"trends"`
+}
+
+type ModelTokenTrend struct {
+	ModelID      string `json:"modelId"`
+	ModelName    string `json:"modelName"`
+	Date         string `json:"date"`
+	InputTokens  int    `json:"inputTokens"`
+	OutputTokens int    `json:"outputTokens"`
+	CachedTokens int    `json:"cachedTokens"`
+	TotalTokens  int    `json:"totalTokens"`
+}
+
+type ModelTokenTrendData struct {
+	Trends []*ModelTokenTrend `json:"trends"`
+	Models []string           `json:"models"`
+	Dates  []string           `json:"dates"`
+}
+
 type ModelTokenUsageStats struct {
 	ModelID         string `json:"modelId"`
 	InputTokens     int    `json:"inputTokens"`

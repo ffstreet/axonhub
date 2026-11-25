@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { BarChart4 } from 'lucide-react';
 import { IconInfoCircle } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { BarChart4, TrendingUp } from 'lucide-react';

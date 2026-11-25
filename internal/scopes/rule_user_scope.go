@@ -75,3 +75,23 @@ func UserHasScope(ctx context.Context, requiredScope ScopeSlug) bool {
 
 	return false
 }
+
+// WithUserScopeDecision records the scope decision in the context so that
+// resolvers can enforce a user scope check themselves.
+//
+// Upstream rc.5 replaced the fork's userHasSystemScope(user, scope) helper
+// with EffectiveSystemScope(ctx, user, scope), which also honours delegated
+// plugin authority. This adapter keeps the fork's call sites working while
+// deferring the actual evaluation to the upstream implementation.
+func WithUserScopeDecision(ctx context.Context, requiredScope ScopeSlug) context.Context {
+	user, ok := contexts.GetUser(ctx)
+	if !ok || user == nil {
+		return privacy.DecisionContext(ctx, privacy.Deny)
+	}
+
+	if EffectiveSystemScope(ctx, user, requiredScope) {
+		return privacy.DecisionContext(ctx, privacy.Allow)
+	}
+
+	return privacy.DecisionContext(ctx, privacy.Deny)
+}

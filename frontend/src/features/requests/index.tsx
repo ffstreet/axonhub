@@ -231,6 +231,19 @@ function RequestsContent() {
     let promptTokens = 0;
     let completionTokens = 0;
 
+    requests.forEach((request) => {
+      const usageLogs = (request as any).usageLogs;
+      if (usageLogs && usageLogs.edges && usageLogs.edges.length > 0) {
+        const usage = usageLogs.edges[0].node;
+        totalTokens += usage.totalTokens || 0;
+        promptTokens += usage.promptTokens || 0;
+        completionTokens += usage.completionTokens || 0;
+      }
+    });
+
+    return { totalTokens, promptTokens, completionTokens };
+  }, [requests]);
+
   const autoRefreshResumeKey = useInterval(
     () => {
       refetch();
