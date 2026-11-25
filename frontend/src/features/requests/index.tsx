@@ -225,6 +225,10 @@ function RequestsContent() {
   const requests = data?.edges?.map((edge) => edge.node) || [];
   const pageInfo = data?.pageInfo;
 
+  // Auto-refresh only makes sense on the first page: paginating away and
+  // back would otherwise reset the cursor while a refresh is in flight.
+  const isFirstPage = !paginationArgs.after && cursorHistory.length === 0;
+
   // Calculate token totals for all displayed requests
   const pageTokenTotals = useMemo(() => {
     let totalTokens = 0;

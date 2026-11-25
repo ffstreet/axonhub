@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { IconInfoCircle } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { BarChart4, TrendingUp } from 'lucide-react';
@@ -9,7 +9,18 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { useTokenStats } from '../data/dashboard';
+import { Button } from '@/components/ui/button';
+import { Alert, AlertTitle } from '@/components/ui/alert';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { useTokenStats, useModelTokenStats, useRequestsByModel } from '../data/dashboard';
+import { ModelTokenStatsCard } from './model-token-stats-card';
 
 type TimeRange = 'allTime' | 'thisMonth' | 'thisWeek' | 'thisDay';
 
@@ -73,7 +84,35 @@ function LastUpdatedInfo({ lastUpdated, locale, t }: LastUpdatedInfoProps) {
 export function TokenStatsCard() {
   const { t, i18n } = useTranslation();
   const { data: stats, isLoading, error } = useTokenStats();
+  const { data: modelStats } = useRequestsByModel();
   const [timeRange, setTimeRange] = useState<TimeRange>('thisDay');
+  const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [showModelDetails, setShowModelDetails] = useState(false);
+
+  // Get available models from model stats
+  const availableModels = modelStats?.map((stat) => stat.modelId) || [];
+
+  // Get detailed model stats for all available models
+  const { data: detailedModelStats, isLoading: isLoadingModelStats } = useModelTokenStats(
+    selectedModels.length > 0 ? selectedModels : availableModels,
+    'day'
+  );
+
+  // Calculate total consumption across all models
+  const totals = useMemo(() => {
+    if (!detailedModelStats?.modelData || detailedModelStats.modelData.length === 0) {
+      return null;
+    }
+    return detailedModelStats.modelData.reduce(
+      (acc, curr) => ({
+        totalRequests: acc.totalRequests + curr.count,
+        totalPromptTokens: acc.totalPromptTokens + curr.promptTokens,
+        totalCompletionTokens: acc.totalCompletionTokens + curr.completionTokens,
+        totalTokens: acc.totalTokens + curr.totalTokens,
+      }),
+      { totalRequests: 0, totalPromptTokens: 0, totalCompletionTokens: 0, totalTokens: 0 }
+    );
+  }, [detailedModelStats]);
 
   if (isLoading) {
     return (
