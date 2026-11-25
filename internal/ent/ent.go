@@ -13,17 +13,29 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/channelmodelpriceversion"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/oidcidentity"
+	"github.com/looplj/axonhub/internal/ent/plugin"
+	"github.com/looplj/axonhub/internal/ent/pluginschedule"
+	"github.com/looplj/axonhub/internal/ent/pluginschedulerun"
+	"github.com/looplj/axonhub/internal/ent/pluginstorage"
+	"github.com/looplj/axonhub/internal/ent/plugintableoperation"
+	"github.com/looplj/axonhub/internal/ent/plugintablestorage"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
+	"github.com/looplj/axonhub/internal/ent/promptprotectionrule"
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/ent/requestbodychunk"
+	"github.com/looplj/axonhub/internal/ent/requestbodychunkref"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/ent/system"
@@ -94,17 +106,29 @@ func checkColumn(t, c string) error {
 	initCheck.Do(func() {
 		columnCheck = sql.NewColumnCheck(map[string]func(string) bool{
 			apikey.Table:                   apikey.ValidColumn,
+			apikeyprofiletemplate.Table:    apikeyprofiletemplate.ValidColumn,
 			channel.Table:                  channel.ValidColumn,
 			channelmodelprice.Table:        channelmodelprice.ValidColumn,
 			channelmodelpriceversion.Table: channelmodelpriceversion.ValidColumn,
 			channeloverridetemplate.Table:  channeloverridetemplate.ValidColumn,
 			channelprobe.Table:             channelprobe.ValidColumn,
 			datastorage.Table:              datastorage.ValidColumn,
+			invitation.Table:               invitation.ValidColumn,
 			model.Table:                    model.ValidColumn,
+			oidcidentity.Table:             oidcidentity.ValidColumn,
+			plugin.Table:                   plugin.ValidColumn,
+			pluginschedule.Table:           pluginschedule.ValidColumn,
+			pluginschedulerun.Table:        pluginschedulerun.ValidColumn,
+			pluginstorage.Table:            pluginstorage.ValidColumn,
+			plugintableoperation.Table:     plugintableoperation.ValidColumn,
+			plugintablestorage.Table:       plugintablestorage.ValidColumn,
 			project.Table:                  project.ValidColumn,
 			prompt.Table:                   prompt.ValidColumn,
+			promptprotectionrule.Table:     promptprotectionrule.ValidColumn,
 			providerquotastatus.Table:      providerquotastatus.ValidColumn,
 			request.Table:                  request.ValidColumn,
+			requestbodychunk.Table:         requestbodychunk.ValidColumn,
+			requestbodychunkref.Table:      requestbodychunkref.ValidColumn,
 			requestexecution.Table:         requestexecution.ValidColumn,
 			role.Table:                     role.ValidColumn,
 			system.Table:                   system.ValidColumn,

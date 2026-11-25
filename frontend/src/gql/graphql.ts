@@ -1,16 +1,35 @@
+// 职责: 发送管理端 GraphQL 请求，并在凭证失效时放弃会话。
+// 关联文件:
+//   frontend/src/lib/auth-redirect.ts
+//   frontend/src/lib/auth-session.ts
+//   frontend/src/lib/app-path.ts
+//   frontend/src/stores/authStore.ts
+//   frontend/src/main.tsx
+//   frontend/src/locales/en.json
+//   frontend/src/locales/zh.json
+// 遵循的 Rules:
+//   .agents/rules/frontend-general.md
+// 注意事项:
+//   401 只有在 shouldRedirectUnauthorizedToSignIn 为真时才能清会话并跳转 /sign-in。
+//   回调页上的未登录请求会返回 401；按过期会话处理会打断 OIDC exchange。
 import { toast } from 'sonner';
 import { getTokenFromStorage, removeTokenFromStorage } from '@/stores/authStore';
+import { appPath } from '@/lib/app-path';
+import { getSafeRedirect, shouldRedirectUnauthorizedToSignIn } from '@/lib/auth-redirect';
+import { ensureFreshAccessToken } from '@/lib/auth-session';
 import i18n from '@/lib/i18n';
 
 export class GraphQLRequestError extends Error {
   status?: number;
   isAuthError: boolean;
+  extensions?: Record<string, any>;
 
-  constructor(message: string, options?: { status?: number; isAuthError?: boolean }) {
+  constructor(message: string, options?: { status?: number; isAuthError?: boolean; extensions?: Record<string, any> }) {
     super(message);
     this.name = 'GraphQLRequestError';
     this.status = options?.status;
     this.isAuthError = Boolean(options?.isAuthError);
+    this.extensions = options?.extensions;
   }
 }
 
@@ -30,16 +49,39 @@ export function extractOperationName(query: string): string | undefined {
   return undefined;
 }
 
-export const GRAPHQL_ENDPOINT = '/admin/graphql';
+export const GRAPHQL_ENDPOINT = appPath('/admin/graphql');
+
+function isForbiddenGraphQLError(error: any): boolean {
+  return error?.extensions?.code === 'FORBIDDEN' || error?.message?.toLowerCase().includes('permission denied');
+}
+
+export function isUnauthorizedGraphQLError(error: any): boolean {
+  return error?.extensions?.code === 'UNAUTHENTICATED';
+}
+
+function redirectToSignIn() {
+  const { pathname, search, hash } = window.location;
+  const redirect = getSafeRedirect(pathname + search + hash);
+  window.location.href = appPath(redirect ? `/sign-in?redirect=${encodeURIComponent(redirect)}` : '/sign-in');
+}
+
+function abandonSessionForSignIn(token: string) {
+  if (getTokenFromStorage() !== token) return;
+  if (!shouldRedirectUnauthorizedToSignIn(token, window.location.pathname)) return;
+  removeTokenFromStorage();
+  toast.error(i18n.t('common.errors.sessionExpiredSignIn'));
+  redirectToSignIn();
+}
 
 // GraphQL client function with token support
 export async function graphqlRequest<T>(
   query: string,
   variables?: Record<string, any>,
-  customHeaders?: Record<string, string>
+  customHeaders?: Record<string, string>,
+  init?: { signal?: AbortSignal }
 ): Promise<T> {
   // Get token from localStorage
-  const token = getTokenFromStorage();
+  const token = await ensureFreshAccessToken();
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -64,6 +106,7 @@ export async function graphqlRequest<T>(
     response = await fetch(GRAPHQL_ENDPOINT, {
       method: 'POST',
       headers,
+      signal: init?.signal,
       body: JSON.stringify({
         query,
         variables,
@@ -71,16 +114,21 @@ export async function graphqlRequest<T>(
       }),
     });
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw error;
+    }
     throw new GraphQLRequestError('Network error', { status: undefined, isAuthError: false });
   }
 
-  // Handle explicit auth failures
-  if (response.status === 401 || response.status === 403) {
-    // Clear token and redirect to login
-    removeTokenFromStorage();
-    toast.error(i18n.t('common.errors.sessionExpiredSignIn'));
-    window.location.href = '/sign-in';
+  // Handle explicit auth failures (401 only — 403 is a permission denial, not a session issue)
+  if (response.status === 401) {
+    abandonSessionForSignIn(token);
     throw new GraphQLRequestError('Unauthorized', { status: response.status, isAuthError: true });
+  }
+
+  // Handle permission denial — do NOT clear token or redirect
+  if (response.status === 403) {
+    throw new GraphQLRequestError('Forbidden', { status: 403, isAuthError: false });
   }
 
   // Check content type before parsing JSON
@@ -91,10 +139,10 @@ export async function graphqlRequest<T>(
     });
   }
 
-  let result;
+  let result: { data: T; errors?: Array<{ message?: string; extensions?: Record<string, unknown> }> };
   try {
     result = await response.json();
-  } catch (error) {
+  } catch (_error) {
     throw new GraphQLRequestError('Failed to parse server response as JSON', {
       status: response.status,
     });
@@ -113,23 +161,20 @@ export async function graphqlRequest<T>(
   }
 
   if (result.errors) {
+    const firstError = result.errors[0];
+
     // Check for authentication errors
-    const authError = result.errors.find(
-      (error: any) =>
-        error.message?.includes('unauthorized') ||
-        error.message?.includes('unauthenticated') ||
-        error.extensions?.code === 'UNAUTHENTICATED'
-    );
+    const authError = result.errors.find(isUnauthorizedGraphQLError);
 
     if (authError) {
-      // Clear token and redirect to login
-      removeTokenFromStorage();
-      toast.error(i18n.t('common.errors.sessionExpiredSignIn'));
-      window.location.href = '/sign-in';
+      abandonSessionForSignIn(token);
       throw new GraphQLRequestError('Unauthorized', { status: 401, isAuthError: true });
     }
 
-    throw new GraphQLRequestError(result.errors[0]?.message || 'GraphQL Error');
+    throw new GraphQLRequestError(firstError?.message || 'GraphQL Error', {
+      status: isForbiddenGraphQLError(firstError) ? 403 : undefined,
+      extensions: firstError?.extensions,
+    });
   }
 
   return result.data;

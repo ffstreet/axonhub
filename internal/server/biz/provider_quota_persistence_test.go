@@ -1,0 +1,494 @@
+package biz
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/channel"
+	"github.com/looplj/axonhub/internal/ent/enttest"
+	"github.com/looplj/axonhub/internal/ent/intercept"
+	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
+	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/pkg/xcache"
+	"github.com/looplj/axonhub/internal/server/biz/provider_quota"
+	"github.com/looplj/axonhub/llm/httpclient"
+)
+
+func TestNewProviderQuotaService_WaitsForInitialCacheLoad(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("Codex").
+		SetType(channel.TypeCodex).
+		SetStatus(channel.StatusEnabled).
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"test-model"}).
+		SetDefaultTestModel("test-model").
+		Save(ctx)
+	require.NoError(t, err)
+
+	_, err = client.ProviderQuotaStatus.Create().
+		SetChannelID(channelEntity.ID).
+		SetProviderType(providerquotastatus.ProviderTypeCodex).
+		SetStatus(providerquotastatus.StatusAvailable).
+		SetReady(true).
+		SetQuotaData(map[string]any{}).
+		SetNextCheckAt(time.Now().Add(time.Hour)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	queryStarted := make(chan struct{})
+	releaseQuery := make(chan struct{})
+	var blockOnce sync.Once
+	client.Intercept(intercept.Func(func(_ context.Context, query intercept.Query) error {
+		if query.Type() == ent.TypeProviderQuotaStatus {
+			blockOnce.Do(func() {
+				close(queryStarted)
+				<-releaseQuery
+			})
+		}
+		return nil
+	}))
+
+	systemService := NewSystemService(SystemServiceParams{
+		Ent:         client,
+		CacheConfig: xcache.Config{Mode: xcache.ModeMemory},
+	})
+	serviceResult := make(chan *ProviderQuotaService, 1)
+	go func() {
+		serviceResult <- NewProviderQuotaService(ProviderQuotaServiceParams{
+			Ent:           client,
+			SystemService: systemService,
+			HttpClient:    httpclient.NewHttpClient(),
+		})
+	}()
+
+	select {
+	case <-queryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial quota cache query did not start")
+	}
+
+	var service *ProviderQuotaService
+	returnedBeforeLoad := false
+	select {
+	case service = <-serviceResult:
+		returnedBeforeLoad = true
+	default:
+	}
+
+	close(releaseQuery)
+	if service == nil {
+		service = <-serviceResult
+	}
+
+	var value any
+	var ok bool
+	require.Eventually(t, func() bool {
+		value, ok = service.quotaCache.Load(channelEntity.ID)
+		return ok
+	}, time.Second, 10*time.Millisecond)
+	require.False(t, returnedBeforeLoad, "service must not be published before its initial cache load completes")
+	require.True(t, ok)
+	status, ok := value.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, "codex", status.ProviderType)
+	require.Equal(t, providerquotastatus.StatusAvailable, status.Status)
+}
+
+func TestProviderQuotaService_SaveQuotaError_ResetsChangedProviderIdentity(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("OpenAI compatible").
+		SetType(channel.TypeOpenai).
+		SetBaseURL("https://api.synthetic.new/v1").
+		SetStatus(channel.StatusEnabled).
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"test-model"}).
+		SetDefaultTestModel("test-model").
+		Save(ctx)
+	require.NoError(t, err)
+
+	oldResetAt := time.Now().Add(time.Hour)
+	_, err = client.ProviderQuotaStatus.Create().
+		SetChannelID(channelEntity.ID).
+		SetProviderType(providerquotastatus.ProviderTypeNeuralwatt).
+		SetStatus(providerquotastatus.StatusExhausted).
+		SetReady(false).
+		SetNextResetAt(oldResetAt).
+		SetQuotaData(map[string]any{
+			"error_count": 3,
+			"_limits": []provider_quota.QuotaLimitStatus{{
+				Type:       provider_quota.QuotaLimitTypeToken,
+				Status:     string(providerquotastatus.StatusExhausted),
+				UsageRatio: 1,
+				Ready:      false,
+			}},
+		}).
+		SetNextCheckAt(time.Now().Add(-time.Minute)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	channelWithStatus, err := client.Channel.Query().
+		Where(channel.IDEQ(channelEntity.ID)).
+		WithProviderQuotaStatus().
+		Only(ctx)
+	require.NoError(t, err)
+
+	service := &ProviderQuotaService{
+		AbstractService: &AbstractService{db: client},
+		checkInterval:   5 * time.Minute,
+	}
+	now := time.Now()
+	service.saveQuotaError(ctx, channelWithStatus, "synthetic", "", errors.New("synthetic quota unavailable"), 1, now, nil)
+
+	persisted, err := client.ProviderQuotaStatus.Query().
+		Where(providerquotastatus.ChannelIDEQ(channelEntity.ID)).
+		Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, providerquotastatus.ProviderTypeSynthetic, persisted.ProviderType)
+	require.Equal(t, providerquotastatus.StatusUnknown, persisted.Status)
+	require.False(t, persisted.Ready)
+	require.Nil(t, persisted.NextResetAt)
+	require.EqualValues(t, 1, persisted.QuotaData["error_count"])
+	require.Equal(t, "check_failed", persisted.QuotaData["error_code"])
+	require.NotContains(t, persisted.QuotaData, "error")
+	require.NotContains(t, persisted.QuotaData, "_limits")
+
+	cachedValue, ok := service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok := cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, "synthetic", cached.ProviderType)
+	require.Equal(t, providerquotastatus.StatusUnknown, cached.Status)
+	require.False(t, cached.Ready)
+	require.Empty(t, cached.Limits)
+
+	reloadedService := &ProviderQuotaService{AbstractService: &AbstractService{db: client}}
+	reloadedService.loadQuotaCache(ctx)
+	reloadedValue, ok := reloadedService.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	reloaded, ok := reloadedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, "synthetic", reloaded.ProviderType)
+	require.Equal(t, providerquotastatus.StatusUnknown, reloaded.Status)
+	require.False(t, reloaded.Ready)
+	require.Empty(t, reloaded.Limits)
+}
+
+func TestProviderQuotaService_SaveQuotaError_ProviderChangeDropsForcedCarryFromCache(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("OpenAI compatible").
+		SetType(channel.TypeOpenai).
+		SetBaseURL("https://api.synthetic.new/v1").
+		SetStatus(channel.StatusEnabled).
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"test-model"}).
+		SetDefaultTestModel("test-model").
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Carried status: the old provider's check failed while its row was
+	// unknown, leaving the last non-unknown status (exhausted) in quota_data.
+	_, err = client.ProviderQuotaStatus.Create().
+		SetChannelID(channelEntity.ID).
+		SetProviderType(providerquotastatus.ProviderTypeNeuralwatt).
+		SetStatus(providerquotastatus.StatusUnknown).
+		SetReady(false).
+		SetQuotaData(map[string]any{
+			"error_code":       "check_failed",
+			"error_count":      1,
+			"_previous_status": string(providerquotastatus.StatusExhausted),
+		}).
+		SetNextCheckAt(time.Now().Add(-time.Minute)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	channelWithStatus, err := client.Channel.Query().
+		Where(channel.IDEQ(channelEntity.ID)).
+		WithProviderQuotaStatus().
+		Only(ctx)
+	require.NoError(t, err)
+
+	service := &ProviderQuotaService{
+		AbstractService: &AbstractService{db: client},
+		checkInterval:   5 * time.Minute,
+	}
+	// The channel switched providers, and the new provider's first check
+	// fails with invalid credentials: the provider change forces the reset
+	// path, so the old provider's carried status must be dropped everywhere.
+	service.saveQuotaError(ctx, channelWithStatus, "synthetic", "",
+		fmt.Errorf("bad key: %w", provider_quota.ErrInvalidCredentials), 1, time.Now(), nil)
+
+	persisted, err := client.ProviderQuotaStatus.Query().
+		Where(providerquotastatus.ChannelIDEQ(channelEntity.ID)).
+		Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, providerquotastatus.ProviderTypeSynthetic, persisted.ProviderType)
+	require.Equal(t, providerquotastatus.StatusUnknown, persisted.Status)
+	require.False(t, persisted.Ready)
+	require.EqualValues(t, 1, persisted.QuotaData["error_count"])
+	require.NotContains(t, persisted.QuotaData, "_previous_status",
+		"a provider change must not carry the old provider's last known status into the row")
+
+	cachedValue, ok := service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok := cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, "synthetic", cached.ProviderType)
+	require.Equal(t, providerquotastatus.StatusUnknown, cached.Status)
+	require.Empty(t, cached.LastKnownStatus,
+		"the provider change must clear the carry from the cache entry too")
+
+	// The new provider's status must start first-ever: a fresh save with an
+	// unknown row behind it has no previous status to transition from.
+	reloaded := &ProviderQuotaService{AbstractService: &AbstractService{db: client}}
+	reloaded.loadQuotaCache(ctx)
+	reloadedValue, ok := reloaded.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	reloadedCached, ok := reloadedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Empty(t, reloadedCached.LastKnownStatus)
+}
+
+func TestProviderQuotaService_SaveQuotaStatus_ReplacesStaleClinePassDataWhenUnavailable(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("Cline").
+		SetType(channel.TypeCline).
+		SetStatus(channel.StatusEnabled).
+		SetBaseURL("https://api.cline.bot/v1").
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"cline-pass/deepseek-v4-flash"}).
+		SetDefaultTestModel("cline-pass/deepseek-v4-flash").
+		Save(ctx)
+	require.NoError(t, err)
+
+	oldResetAt := time.Now().Add(time.Hour)
+	_, err = client.ProviderQuotaStatus.Create().
+		SetChannelID(channelEntity.ID).
+		SetProviderType(providerquotastatus.ProviderTypeCline).
+		SetStatus(providerquotastatus.StatusWarning).
+		SetReady(true).
+		SetNextResetAt(oldResetAt).
+		SetQuotaData(map[string]any{
+			"error":       "old quota failure",
+			"error_count": 3,
+			"windows":     map[string]any{"last5h": map[string]any{"usage_ratio": 0.9}},
+			"_limits": []provider_quota.QuotaLimitStatus{{
+				Type:        provider_quota.QuotaLimitTypeToken,
+				Status:      string(providerquotastatus.StatusWarning),
+				UsageRatio:  0.9,
+				Ready:       true,
+				NextResetAt: &oldResetAt,
+			}},
+		}).
+		SetNextCheckAt(time.Now().Add(-time.Minute)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	service := &ProviderQuotaService{
+		AbstractService: &AbstractService{db: client},
+		checkInterval:   5 * time.Minute,
+	}
+	service.saveQuotaStatus(ctx, channelEntity, "cline", "", provider_quota.QuotaData{
+		ProviderType: "cline",
+		Status:       string(providerquotastatus.StatusExhausted),
+		Ready:        false,
+		RawData: map[string]any{
+			"model_scope":  "cline_pass_only",
+			"status_basis": "cline_pass_unavailable",
+			"pool":         "cline_pass",
+			"pass_state":   "unavailable",
+			"balance":      map[string]any{"raw_balance": int64(497582)},
+		},
+	}, time.Now(), false)
+
+	persisted, err := client.ProviderQuotaStatus.Query().
+		Where(providerquotastatus.ChannelIDEQ(channelEntity.ID)).
+		Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, providerquotastatus.StatusExhausted, persisted.Status)
+	require.False(t, persisted.Ready)
+	require.Nil(t, persisted.NextResetAt)
+	require.Equal(t, "unavailable", persisted.QuotaData["pass_state"])
+	require.NotContains(t, persisted.QuotaData, "error")
+	require.NotContains(t, persisted.QuotaData, "error_count")
+	require.NotContains(t, persisted.QuotaData, "windows")
+	require.NotContains(t, persisted.QuotaData, "_limits")
+
+	cachedValue, ok := service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok := cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, providerquotastatus.StatusExhausted, cached.Status)
+	require.False(t, cached.Ready)
+	require.Empty(t, cached.Limits)
+}
+
+func TestProviderQuotaService_SaveQuotaStatus_UpdatesChangedProviderIdentity(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("OpenAI compatible").
+		SetType(channel.TypeOpenai).
+		SetBaseURL("https://api.synthetic.new/v1").
+		SetStatus(channel.StatusEnabled).
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"test-model"}).
+		SetDefaultTestModel("test-model").
+		Save(ctx)
+	require.NoError(t, err)
+
+	_, err = client.ProviderQuotaStatus.Create().
+		SetChannelID(channelEntity.ID).
+		SetProviderType(providerquotastatus.ProviderTypeNeuralwatt).
+		SetStatus(providerquotastatus.StatusExhausted).
+		SetReady(false).
+		SetQuotaData(map[string]any{"provider": "neuralwatt"}).
+		SetNextCheckAt(time.Now().Add(-time.Minute)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	service := &ProviderQuotaService{
+		AbstractService: &AbstractService{db: client},
+		checkInterval:   5 * time.Minute,
+	}
+	service.saveQuotaStatus(ctx, channelEntity, "synthetic", "", provider_quota.QuotaData{
+		ProviderType: "synthetic",
+		Status:       string(providerquotastatus.StatusAvailable),
+		Ready:        true,
+		RawData:      map[string]any{"provider": "synthetic"},
+	}, time.Now(), false)
+
+	persisted, err := client.ProviderQuotaStatus.Query().
+		Where(providerquotastatus.ChannelIDEQ(channelEntity.ID)).
+		Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, providerquotastatus.ProviderTypeSynthetic, persisted.ProviderType)
+	require.Equal(t, providerquotastatus.StatusAvailable, persisted.Status)
+	require.True(t, persisted.Ready)
+	require.Equal(t, "synthetic", persisted.QuotaData["provider"])
+
+	cachedValue, ok := service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok := cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	require.Equal(t, "synthetic", cached.ProviderType)
+	require.Equal(t, providerquotastatus.StatusAvailable, cached.Status)
+	require.True(t, cached.Ready)
+}
+
+func TestProviderQuotaService_SaveQuotaStatus_PersistsSyntheticCredits(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	channelEntity, err := client.Channel.Create().
+		SetName("OpenAI compatible").
+		SetType(channel.TypeOpenai).
+		SetBaseURL("https://api.synthetic.new/v1").
+		SetStatus(channel.StatusEnabled).
+		SetCredentials(objects.ChannelCredentials{APIKey: "test-key"}).
+		SetSupportedModels([]string{"test-model"}).
+		SetDefaultTestModel("test-model").
+		Save(ctx)
+	require.NoError(t, err)
+
+	service := &ProviderQuotaService{
+		AbstractService: &AbstractService{db: client},
+		checkInterval:   5 * time.Minute,
+	}
+
+	periodCost := 0.03
+	periodQuota := 10.50
+	service.saveQuotaStatus(ctx, channelEntity, "synthetic", "", provider_quota.QuotaData{
+		ProviderType: "synthetic",
+		Status:       "available",
+		Ready:        true,
+		Limits: []provider_quota.QuotaLimitStatus{
+			{
+				Type:        provider_quota.QuotaLimitTypeToken,
+				Window:      provider_quota.QuotaWindowWeekly,
+				Status:      "available",
+				UsageRatio:  0.00265,
+				Ready:       true,
+				PeriodCost:  &periodCost,
+				PeriodQuota: &periodQuota,
+			},
+			{
+				Type:       provider_quota.QuotaLimitTypeSearch,
+				Window:     "search_hourly",
+				Status:     "available",
+				UsageRatio: 0.2,
+				Ready:      true,
+			},
+		},
+	}, time.Now(), false)
+
+	assertSyntheticCreditsPersisted := func(t *testing.T, cachedLimits []provider_quota.QuotaLimitStatus) {
+		t.Helper()
+
+		persisted, err := client.ProviderQuotaStatus.Query().
+			Where(providerquotastatus.ChannelIDEQ(channelEntity.ID)).
+			Only(ctx)
+		require.NoError(t, err)
+		limits := extractLimitsFromQuotaData(persisted.QuotaData)
+		require.Len(t, limits, 2)
+		require.NotNil(t, limits[0].PeriodQuota)
+		require.InDelta(t, 10.50, *limits[0].PeriodQuota, 1e-9)
+		require.NotNil(t, limits[0].PeriodCost)
+		require.InDelta(t, 0.03, *limits[0].PeriodCost, 1e-9)
+		require.Equal(t, provider_quota.QuotaLimitTypeSearch, limits[1].Type)
+
+		require.Len(t, cachedLimits, 2)
+		require.NotNil(t, cachedLimits[0].PeriodQuota)
+		require.InDelta(t, 10.50, *cachedLimits[0].PeriodQuota, 1e-9)
+	}
+
+	cachedValue, ok := service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok := cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	assertSyntheticCreditsPersisted(t, cached.Limits)
+
+	// A transient same-provider error must keep the provider money too: the
+	// error path writes a fresh cached status, so re-query after the call.
+	now := time.Now()
+	channelWithStatus, err := client.Channel.Query().
+		Where(channel.IDEQ(channelEntity.ID)).
+		WithProviderQuotaStatus().
+		Only(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, channelWithStatus.Edges.ProviderQuotaStatus)
+
+	service.saveQuotaError(ctx, channelWithStatus, "synthetic", "", errors.New("synthetic quota unavailable"), 1, now, nil)
+
+	cachedValue, ok = service.quotaCache.Load(channelEntity.ID)
+	require.True(t, ok)
+	cached, ok = cachedValue.(*QuotaChannelStatus)
+	require.True(t, ok)
+	assertSyntheticCreditsPersisted(t, cached.Limits)
+}

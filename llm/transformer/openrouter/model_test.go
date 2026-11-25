@@ -6,8 +6,8 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/transformer/openrouter"
 )
 
@@ -34,6 +34,7 @@ func TestResponse_ToOpenAIResponse(t *testing.T) {
 								Content: lo.ToPtr(""),
 							},
 							ReasoningContent: lo.ToPtr("We"),
+							Reasoning:        lo.ToPtr("We"),
 						},
 					},
 				},
@@ -145,6 +146,29 @@ func TestResponse_ToOpenAIResponse(t *testing.T) {
 					PromptTokens:     18810,
 					CompletionTokens: 68,
 					TotalTokens:      18878,
+				},
+			},
+		},
+		{
+			name: "or-reasoning-summary-chunk",
+			file: "or-reasoning-summary.chunk.json",
+			want: &llm.Response{
+				ID:      "gen-1763270400-Rk2Yq8cWm3TnLp4ZsVb1",
+				Model:   "openai/gpt-5-mini",
+				Object:  "chat.completion.chunk",
+				Created: 1763270400,
+				Choices: []llm.Choice{
+					{
+						Index: 0,
+						Delta: &llm.Message{
+							Role: "assistant",
+							Content: llm.MessageContent{
+								Content: lo.ToPtr(""),
+							},
+							ReasoningContent: lo.ToPtr("**Planning** the"),
+							Reasoning:        lo.ToPtr("**Planning** the"),
+						},
+					},
 				},
 			},
 		},

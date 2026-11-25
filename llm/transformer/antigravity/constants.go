@@ -19,19 +19,18 @@ const (
 
 	// EndpointDaily is the primary endpoint (daily sandbox).
 	EndpointDaily = "https://daily-cloudcode-pa.sandbox.googleapis.com"
+	// EndpointDailyDirect is the direct daily endpoint.
+	EndpointDailyDirect = "https://daily-cloudcode-pa.googleapis.com"
 	// EndpointAutopush is a fallback endpoint.
 	EndpointAutopush = "https://autopush-cloudcode-pa.sandbox.googleapis.com"
 	// EndpointProd is the production endpoint.
 	EndpointProd = "https://cloudcode-pa.googleapis.com"
 
-	// UserAgent used for requests.
-	UserAgent = "antigravity/1.15.8 windows/amd64"
-
 	// ApiClient used for X-Goog-Api-Client header.
 	ApiClient = "google-cloud-sdk vscode_cloudshelleditor/0.1"
 
 	// ClientMetadata used for Client-Metadata header.
-	ClientMetadata = `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
+	ClientMetadata = `{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`
 
 	// DefaultProjectID is the fallback project ID (Cloud Code default).
 	DefaultProjectID = "rising-fact-p41fc"

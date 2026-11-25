@@ -1,76 +1,160 @@
 package codex
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/transformer/openai"
 )
 
-func TestIsCodexRequest(t *testing.T) {
-	tests := []struct {
-		name     string
-		msgs     []llm.Message
-		expected bool
-	}{
-		{
-			name: "contains codex prefix in system message",
-			msgs: []llm.Message{
-				{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr(CodexInstructionPrefix + " some instructions")}},
-				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
-			},
-			expected: true,
-		},
-		{
-			name: "contains 'You are Codex' in developer message",
-			msgs: []llm.Message{
-				{Role: "developer", Content: llm.MessageContent{Content: lo.ToPtr("You are Codex, a helpful assistant")}},
-				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
-			},
-			expected: true,
-		},
-		{
-			name: "does not contain codex prefix",
-			msgs: []llm.Message{
-				{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are a helpful assistant")}},
-				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
-			},
-			expected: false,
-		},
-		{
-			name: "no system messages",
-			msgs: []llm.Message{
-				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
-			},
-			expected: false,
-		},
-		{
-			name:     "empty messages",
-			msgs:     []llm.Message{},
-			expected: false,
-		},
-	}
+// TestCodexOutbound_DefaultUserAgentHidesInboundClientUA pins the ownership of
+// the outbound User-Agent (issue #2635): the transformer always presents the
+// Codex-client-like default and never copies the inbound client's UA. Forwarding
+// the client UA is opt-in through the orchestrator's user-agent pass-through
+// middleware, which runs after this transformer and overwrites the default when
+// the switch is enabled.
+func TestCodexOutbound_DefaultUserAgentHidesInboundClientUA(t *testing.T) {
+	ctx := context.Background()
+	outbound := newTestCodexOutbound(t)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, isCodexRequest(tt.msgs))
-		})
-	}
+	const clientUA = "ZCode/3.14.4 (darwin arm64)"
+
+	body := []byte(`{"model":"gpt-5-codex","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	rawReq, err := http.NewRequest(http.MethodPost, "http://localhost:8090/v1/chat/completions", bytes.NewReader(body))
+	require.NoError(t, err)
+	rawReq.Header.Set("Content-Type", "application/json")
+	rawReq.Header.Set("User-Agent", clientUA)
+
+	inboundRequest, err := httpclient.ReadHTTPRequest(rawReq)
+	require.NoError(t, err)
+
+	llmReq, err := openai.NewInboundTransformer().TransformRequest(ctx, inboundRequest)
+	require.NoError(t, err)
+	llmReq.RawRequest = inboundRequest
+
+	req, err := outbound.TransformRequest(ctx, llmReq)
+	require.NoError(t, err)
+
+	assert.Equal(t, codexDefaultUserAgent, req.Headers.Get("User-Agent"))
+	assert.NotEqual(t, clientUA, req.Headers.Get("User-Agent"))
+
+	// The generic inbound-header merge must not reintroduce the client UA either:
+	// User-Agent is a blocked header, so the transformer-owned value survives.
+	merged := httpclient.MergeInboundRequest(req, inboundRequest)
+	assert.Equal(t, codexDefaultUserAgent, merged.Headers.Get("User-Agent"))
+	assert.NotEqual(t, clientUA, merged.Headers.Get("User-Agent"))
+
+	// An already constructed transformer picks up a new default. The real
+	// client's Version still wins during the merge, independently of its UA.
+	outbound.clientVersion = func() string { return "0.200.0" }
+	inboundRequest.Headers.Set("Version", "0.160.0")
+	req, err = outbound.TransformRequest(ctx, llmReq)
+	require.NoError(t, err)
+	require.Equal(t, "0.200.0", req.Headers.Get("Version"))
+	merged = httpclient.MergeInboundRequest(req, inboundRequest)
+	require.Equal(t, "0.160.0", merged.Headers.Get("Version"))
+	require.Equal(t, "codex_cli_rs/0.200.0", merged.Headers.Get("User-Agent"))
 }
 
-func TestSetCodexSystemInstruction(t *testing.T) {
-	msgs := []llm.Message{
-		{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("Existing system instruction")}},
-		{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+// TestCodexOutbound_DefaultUserAgentIsCodexLike keeps the fake identity
+// consistent with the Version header the transformer fabricates.
+func TestCodexOutbound_DefaultUserAgentIsCodexLike(t *testing.T) {
+	assert.Equal(t, "codex_cli_rs/"+codexDefaultVersion, codexDefaultUserAgent)
+}
+
+// TestCodexOutbound_ScrubsClientFingerprintHeaders pins the codex-scoped half of
+// issue #2635: client-private attribution headers must not reach the ChatGPT
+// Codex backend. The scrub is deliberately scoped to this channel rather than
+// added to httpclient's global blockedHeaders, because Http-Referer and X-Title
+// are legitimate app-attribution headers for OpenRouter-style channels.
+func TestCodexOutbound_ScrubsClientFingerprintHeaders(t *testing.T) {
+	ctx := context.Background()
+	outbound := newTestCodexOutbound(t)
+
+	body := []byte(`{"model":"gpt-5-codex","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	rawReq, err := http.NewRequest(http.MethodPost, "http://localhost:8090/v1/chat/completions", bytes.NewReader(body))
+	require.NoError(t, err)
+	rawReq.Header.Set("Content-Type", "application/json")
+	rawReq.Header.Set("User-Agent", "ZCode/3.14.4 (darwin arm64)")
+	// Client fingerprint headers from the issue report.
+	rawReq.Header.Set("Http-Referer", "https://editor.example/session")
+	rawReq.Header.Set("X-Title", "ZCode")
+	rawReq.Header.Set("X-Platform", "darwin")
+	rawReq.Header.Set("X-Zcode-Session", "zcode-session")
+	rawReq.Header.Set("X-Zcode-Client", "ZCode/3.14.4")
+	rawReq.Header.Set("X-Os-Name", "macOS")
+	// A non-fingerprint custom header must still be forwarded.
+	rawReq.Header.Set("X-Custom", "client-value")
+	// Originator is genuine Codex identity and must still be honoured.
+	rawReq.Header.Set("Originator", "codex_cli_rs")
+
+	inboundRequest, err := httpclient.ReadHTTPRequest(rawReq)
+	require.NoError(t, err)
+
+	llmReq, err := openai.NewInboundTransformer().TransformRequest(ctx, inboundRequest)
+	require.NoError(t, err)
+	llmReq.RawRequest = inboundRequest
+
+	req, err := outbound.TransformRequest(ctx, llmReq)
+	require.NoError(t, err)
+
+	// MergeInboundRequest is what actually forwards leftover inbound headers, so
+	// assert on the merged request, not just the transformer output.
+	merged := httpclient.MergeInboundRequest(req, inboundRequest)
+	for _, name := range []string{"Http-Referer", "X-Title", "X-Platform", "X-Zcode-Session", "X-Zcode-Client", "X-Os-Name"} {
+		assert.Empty(t, merged.Headers.Get(name), "%s must not leak to the Codex upstream", name)
 	}
 
-	result := appendCodexSystemInstruction(msgs)
+	assert.Equal(t, "client-value", merged.Headers.Get("X-Custom"))
+	assert.Equal(t, "codex_cli_rs", merged.Headers.Get("Originator"))
+}
 
-	assert.Len(t, result, 3)
-	assert.Equal(t, "system", result[0].Role)
-	assert.Equal(t, CodexInstructions, *result[0].Content.Content)
-	assert.Equal(t, msgs[0], result[1])
-	assert.Equal(t, msgs[1], result[2])
+// TestCodexOutbound_JSONObjectKeywordSurvivesChatConversion pins issue #3004
+// on the Codex channel: the upstream checks the json_object keyword against
+// input items only, so it must not disappear when Chat Completions system
+// content becomes instructions.
+func TestCodexOutbound_JSONObjectKeywordSurvivesChatConversion(t *testing.T) {
+	ctx := context.Background()
+	outbound := newTestCodexOutbound(t)
+
+	body := []byte(`{
+		"model": "gpt-5-codex",
+		"response_format": {"type": "json_object"},
+		"messages": [
+			{"role": "system", "content": "Return a json object describing the person."},
+			{"role": "user", "content": "Ada Lovelace, 36"}
+		]
+	}`)
+	rawReq, err := http.NewRequest(http.MethodPost, "http://localhost:8090/v1/chat/completions", bytes.NewReader(body))
+	require.NoError(t, err)
+	rawReq.Header.Set("Content-Type", "application/json")
+
+	inboundRequest, err := httpclient.ReadHTTPRequest(rawReq)
+	require.NoError(t, err)
+
+	llmReq, err := openai.NewInboundTransformer().TransformRequest(ctx, inboundRequest)
+	require.NoError(t, err)
+	require.NotNil(t, llmReq.ResponseFormat)
+	require.Equal(t, "json_object", llmReq.ResponseFormat.Type)
+
+	req, err := outbound.TransformRequest(ctx, llmReq)
+	require.NoError(t, err)
+
+	decoded := decodeCodexRequestBody(t, req)
+
+	inputJSON, err := json.Marshal(decoded["input"])
+	require.NoError(t, err)
+
+	assert.Contains(t, strings.ToLower(string(inputJSON)), "json")
+
+	instructions, _ := decoded["instructions"].(string)
+	assert.Contains(t, instructions, "Return a json object describing the person.")
 }

@@ -15,11 +15,13 @@ import { useModels } from '../context/models-context';
 import { Model } from '../data/schema';
 import { DataTableRowActions } from './data-table-row-actions';
 import { ModelsStatusDialog } from './models-status-dialog';
+import { useDeveloperLabel } from './models-table';
 
 // Status Switch Cell Component to handle status toggle with confirmation dialog
 function StatusSwitchCell({ row }: { row: Row<Model> }) {
   const model = row.original;
   const [dialogOpen, setDialogOpen] = useState(false);
+  const { channelPermissions } = usePermissions();
 
   const isEnabled = model.status === 'enabled';
   const isArchived = model.status === 'archived';
@@ -30,6 +32,10 @@ function StatusSwitchCell({ row }: { row: Row<Model> }) {
     }
   }, [isArchived]);
 
+  if (!channelPermissions.canWrite) {
+    return <Badge variant='outline'>{model.status}</Badge>;
+  }
+
   return (
     <>
       <Switch checked={isEnabled} onCheckedChange={handleSwitchClick} disabled={isArchived} data-testid='model-status-switch' />
@@ -38,32 +44,45 @@ function StatusSwitchCell({ row }: { row: Row<Model> }) {
   );
 }
 
-// Association Rules Cell Component to handle permission check
-function AssociationRulesCell({ row }: { row: Row<Model> }) {
+// Developer Cell Component to show translated developer name
+function DeveloperCell({ row }: { row: Row<Model> }) {
+  const getDeveloperLabel = useDeveloperLabel();
+  return <Badge variant='outline'>{getDeveloperLabel(row.getValue('developer'))}</Badge>;
+}
+
+// Both counts open the same association editor and share its permission check.
+function AssociationCell({ row, countType }: { row: Row<Model>; countType: 'rules' | 'channels' }) {
   const model = row.original;
   const { setOpen, setCurrentRow } = useModels();
   const { channelPermissions } = usePermissions();
+  const { t } = useTranslation();
 
   const handleOpenAssociationDialog = useCallback(() => {
     setCurrentRow(model);
     setOpen('association');
   }, [model, setCurrentRow, setOpen]);
 
-  const associationCount = model.settings?.associations?.length || 0;
+  const count = countType === 'rules' ? model.settings?.associations?.length || 0 : model.associatedChannelCount || 0;
 
   // Only show button if user has write permissions
   if (!channelPermissions.canWrite) {
     return (
       <div className='flex justify-center'>
-        <Badge variant='secondary'>{associationCount}</Badge>
+        <Badge variant='secondary'>{count}</Badge>
       </div>
     );
   }
 
   return (
-    <Button size='sm' variant='outline' className='h-8 px-3' onClick={handleOpenAssociationDialog}>
+    <Button
+      size='sm'
+      variant='outline'
+      className='h-8 px-3'
+      onClick={handleOpenAssociationDialog}
+      aria-label={`${t(countType === 'rules' ? 'models.columns.associationRules' : 'models.columns.associatedChannels')}: ${count}`}
+    >
       <IconLink className='mr-1 h-3 w-3' />
-      {`${associationCount}`}
+      {count}
     </Button>
   );
 }
@@ -164,9 +183,7 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
     {
       accessorKey: 'developer',
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('models.columns.developer')} />,
-      cell: ({ row }) => {
-        return <Badge variant='outline'>{row.getValue('developer')}</Badge>;
-      },
+      cell: DeveloperCell,
       enableSorting: false,
     },
     {
@@ -281,22 +298,13 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
     {
       id: 'associationRules',
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('models.columns.associationRules')} />,
-      cell: AssociationRulesCell,
+      cell: ({ row }) => <AssociationCell row={row} countType='rules' />,
       enableSorting: false,
     },
     {
       id: 'associatedChannels',
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('models.columns.associatedChannels')} />,
-      cell: ({ row }) => {
-        const model = row.original;
-        const channelCount = model.associatedChannelCount || 0;
-
-        return (
-          <div className='flex justify-center'>
-            <Badge variant='secondary'>{channelCount}</Badge>
-          </div>
-        );
-      },
+      cell: ({ row }) => <AssociationCell row={row} countType='channels' />,
       enableSorting: false,
     },
 
@@ -323,15 +331,15 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
           enableSorting: true,
           enableHiding: false,
         },
-        {
-          id: 'actions',
-          header: t('common.columns.actions'),
-          cell: DataTableRowActions,
-          meta: {
-            className: 'w-[56px] min-w-[56px] pr-3 pl-0',
-          },
-          enableSorting: false,
-          enableHiding: false,
-        },
+        ...(canWrite
+          ? [{
+              id: 'actions',
+              header: t('common.columns.actions'),
+              cell: DataTableRowActions,
+              meta: { className: 'w-[88px] min-w-[88px] pr-3 pl-0' },
+              enableSorting: false,
+              enableHiding: false,
+            }]
+          : []),
   ];
 };

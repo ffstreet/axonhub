@@ -8,7 +8,6 @@ import (
 	"github.com/99designs/gqlgen/graphql/handler/extension"
 	"github.com/99designs/gqlgen/graphql/handler/lru"
 	"github.com/99designs/gqlgen/graphql/handler/transport"
-	"github.com/99designs/gqlgen/graphql/playground"
 	"github.com/vektah/gqlparser/v2/ast"
 	"go.uber.org/fx"
 
@@ -17,22 +16,28 @@ import (
 )
 
 type GraphqlHandler struct {
-	Graphql    http.Handler
-	Playground http.Handler
+	Graphql http.Handler
 }
 
 type Dependencies struct {
 	fx.In
 
-	Ent           *ent.Client
-	APIKeyService *biz.APIKeyService
+	Ent                          *ent.Client
+	APIKeyService                *biz.APIKeyService
+	APIKeyProfileTemplateService *biz.APIKeyProfileTemplateService
+	QuotaService                 *biz.QuotaService
 }
 
 func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
-	gqlSrv := handler.New(NewSchema(deps.APIKeyService))
+	gqlSrv := handler.New(NewSchema(deps.APIKeyService, deps.APIKeyProfileTemplateService, deps.QuotaService))
 
 	gqlSrv.AddTransport(transport.Options{})
-	gqlSrv.AddTransport(transport.GET{})
+	// Intentionally NOT registering transport.GET: the apiKeyQuotaUsages query
+	// accepts a plaintext `key`, and gqlgen's GET transport reads operation
+	// variables from the URL query string. Allowing GET would let secret API
+	// keys land in URLs (reverse-proxy/access logs, browser history, traces).
+	// Programmatic clients (and the genqlient SDK) use POST, so GET has no
+	// legitimate consumer here.
 	gqlSrv.AddTransport(transport.POST{})
 	gqlSrv.AddTransport(transport.MultipartForm{})
 
@@ -48,7 +53,6 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 	})
 
 	return &GraphqlHandler{
-		Graphql:    gqlSrv,
-		Playground: playground.Handler("AxonHub", "/openapi/v1/graphql"),
+		Graphql: gqlSrv,
 	}
 }

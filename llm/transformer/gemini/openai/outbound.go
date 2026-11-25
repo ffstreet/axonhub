@@ -4,17 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/looplj/axonhub/internal/log"
-	"github.com/looplj/axonhub/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // Config holds all configuration for the Gemini OpenAI outbound transformer.
@@ -137,9 +138,10 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 	baseURL := transformer.NormalizeBaseURL(config.BaseURL, "v1beta/openai")
 
 	oaiConfig := &openai.Config{
-		PlatformType:   openai.PlatformOpenAI,
+		PlatformType:   openai.PlatformGoogle,
 		BaseURL:        baseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		ReasoningField: openai.ReasoningFieldContent,
 	}
 
 	outbound, err := openai.NewOutboundTransformerWithConfig(oaiConfig)
@@ -283,6 +285,8 @@ func (t *OutboundTransformer) TransformRequest(
 	switch llmReq.RequestType {
 	case llm.RequestTypeChat, "":
 		// continue
+	case llm.RequestTypeCompact:
+		return nil, fmt.Errorf("%w: compact is only supported by OpenAI Responses API", transformer.ErrInvalidRequest)
 	default:
 		return nil, fmt.Errorf("%w: %s is not supported", transformer.ErrInvalidRequest, llmReq.RequestType)
 	}
@@ -298,12 +302,14 @@ func (t *OutboundTransformer) TransformRequest(
 
 	// Make a copy to avoid modifying the original request
 	req := *llmReq
+	// Gemini OpenAI endpoint does not accept metadata.
+	req.Metadata = nil
 
 	// Fallback: Filter out Google native tools (not supported by OpenAI-compatible endpoint)
 	// This is a graceful degradation when no native Gemini channels are available.
 	if llm.ContainsGoogleNativeTools(req.Tools) {
-		log.Warn(ctx, "Google native tools detected but gemini_openai channel does not support them, filtering out",
-			log.Int("original_tools_count", len(req.Tools)))
+		slog.WarnContext(ctx, "Google native tools detected but gemini_openai channel does not support them, filtering out",
+			slog.Int("original_tools_count", len(req.Tools)))
 
 		req.Tools = llm.FilterGoogleNativeTools(req.Tools)
 
@@ -314,8 +320,8 @@ func (t *OutboundTransformer) TransformRequest(
 			req.ToolChoice = nil
 		}
 
-		log.Debug(ctx, "Filtered Google native tools",
-			log.Int("remaining_tools_count", len(req.Tools)))
+		slog.DebugContext(ctx, "Filtered Google native tools",
+			slog.Int("remaining_tools_count", len(req.Tools)))
 	}
 
 	var extraBody *ExtraBody
@@ -328,7 +334,8 @@ func (t *OutboundTransformer) TransformRequest(
 	}
 
 	// Convert llm.Request to openai.Request
-	oaiReq := openai.RequestFromLLM(&req)
+	oaiReq := openai.RequestFromLLM(ctx, &req, openai.ReasoningFieldContent)
+	fillGeminiThoughtSignatureForGeminiOpenAIRequest(&req, oaiReq)
 
 	geminiReq := Request{Request: *oaiReq}
 	if extraBody != nil {
@@ -356,12 +363,103 @@ func (t *OutboundTransformer) TransformRequest(
 	url := t.BaseURL + "/chat/completions"
 
 	return &httpclient.Request{
-		Method:  http.MethodPost,
-		URL:     url,
-		Headers: headers,
-		Body:    body,
-		Auth:    auth,
+		Method:                http.MethodPost,
+		URL:                   url,
+		Headers:               headers,
+		Body:                  body,
+		Auth:                  auth,
+		SkipInboundQueryMerge: true,
+		Metadata:              nil,
+		APIFormat:             string(llm.APIFormatOpenAIChatCompletion),
 	}, nil
+}
+
+func fillGeminiThoughtSignatureForGeminiOpenAIRequest(src *llm.Request, dst *openai.Request) {
+	if src == nil || dst == nil {
+		return
+	}
+
+	// RequestFromLLM already copies tool metadata into extra_content. Remove
+	// rejected signatures there as well, before applying any message fallback.
+	for i := range dst.Messages {
+		for j := range dst.Messages[i].ToolCalls {
+			tc := &dst.Messages[i].ToolCalls[j]
+			if tc.ExtraContent != nil && tc.ExtraContent.Google != nil &&
+				shared.DecodeGeminiThoughtSignature(&tc.ExtraContent.Google.ThoughtSignature) == nil {
+				tc.ExtraContent = nil
+			}
+		}
+	}
+
+	for i := range src.Messages {
+		if i >= len(dst.Messages) {
+			break
+		}
+
+		srcMsg := src.Messages[i]
+		if len(srcMsg.ToolCalls) == 0 || len(dst.Messages[i].ToolCalls) == 0 {
+			continue
+		}
+
+		dstToolCallIndexByID := make(map[string]int, len(dst.Messages[i].ToolCalls))
+		for j := range dst.Messages[i].ToolCalls {
+			if dst.Messages[i].ToolCalls[j].ID != "" {
+				dstToolCallIndexByID[dst.Messages[i].ToolCalls[j].ID] = j
+			}
+		}
+
+		hasToolCallThoughtSignature := false
+
+		for j := range srcMsg.ToolCalls {
+			raw, ok := srcMsg.ToolCalls[j].TransformerMetadata[openai.TransformerMetadataKeyGoogleThoughtSignature].(string)
+			if !ok || raw == "" {
+				continue
+			}
+
+			dstToolCallIndex := -1
+
+			if srcMsg.ToolCalls[j].ID != "" {
+				if idx, exists := dstToolCallIndexByID[srcMsg.ToolCalls[j].ID]; exists {
+					dstToolCallIndex = idx
+				}
+			}
+
+			if dstToolCallIndex == -1 && j < len(dst.Messages[i].ToolCalls) {
+				dstToolCallIndex = j
+			}
+
+			if dstToolCallIndex == -1 {
+				continue
+			}
+
+			signature := shared.DecodeGeminiThoughtSignature(&raw)
+			if signature == nil {
+				continue
+			}
+			ensureGoogleThoughtSignatureExtraContent(&dst.Messages[i].ToolCalls[dstToolCallIndex]).ThoughtSignature = *signature
+			hasToolCallThoughtSignature = true
+		}
+
+		if hasToolCallThoughtSignature {
+			continue
+		}
+
+		if signature := shared.DecodeGeminiThoughtSignature(srcMsg.ReasoningSignature); signature != nil {
+			ensureGoogleThoughtSignatureExtraContent(&dst.Messages[i].ToolCalls[0]).ThoughtSignature = *signature
+		}
+	}
+}
+
+func ensureGoogleThoughtSignatureExtraContent(tc *openai.ToolCall) *openai.ToolCallGoogleExtraContent {
+	if tc.ExtraContent == nil {
+		tc.ExtraContent = &openai.ToolCallExtraContent{}
+	}
+
+	if tc.ExtraContent.Google == nil {
+		tc.ExtraContent.Google = &openai.ToolCallGoogleExtraContent{}
+	}
+
+	return tc.ExtraContent.Google
 }
 
 func (t *OutboundTransformer) TransformError(ctx context.Context, rawErr *httpclient.Error) *llm.ResponseError {

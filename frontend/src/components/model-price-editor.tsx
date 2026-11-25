@@ -4,14 +4,15 @@ import { IconPlus, IconTrash } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { FormControl, FormField, FormItem, FormMessage } from '@/components/ui/form';
-import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 
 const priceItemCodes = ['prompt_tokens', 'completion_tokens', 'prompt_cached_tokens', 'prompt_write_cached_tokens'] as const;
 const promptWriteCacheVariantCodes = ['five_min', 'one_hour'] as const;
-type PricingMode = 'flat_fee' | 'usage_per_unit' | 'usage_tiered';
+// An empty mode marks cache-write items whose 5m/1h variants carry the rates (no aggregate).
+type PricingMode = '' | 'flat_fee' | 'usage_per_unit' | 'usage_tiered' | 'usage_volume';
 
 type PriceEditorFormValues = {
   prices: Array<{
@@ -20,7 +21,7 @@ type PriceEditorFormValues = {
       items: Array<{
         itemCode: (typeof priceItemCodes)[number];
         pricing: {
-          mode: PricingMode;
+          mode?: PricingMode | null;
           flatFee?: string | null;
           usagePerUnit?: string | null;
           usageTiered?: {
@@ -33,7 +34,8 @@ type PriceEditorFormValues = {
         promptWriteCacheVariants?: Array<{
           variantCode: (typeof promptWriteCacheVariantCodes)[number];
           pricing: {
-            mode: PricingMode;
+            // Variants must always carry a real mode; the empty mode is aggregate-only.
+            mode: Exclude<PricingMode, ''>;
             flatFee?: string | null;
             usagePerUnit?: string | null;
             usageTiered?: {
@@ -58,7 +60,13 @@ function asFieldArrayPath(path: string) {
 }
 
 function usePriceEditorWatch<TValue>(control: Control<PriceEditorFormValues>, name: string) {
-  return useWatch({ control, name: asFieldPath(name) }) as unknown as TValue;
+  // compute + deepEqual guard: value-unchanged broadcasts (e.g. deleting a card elsewhere)
+  // must not force this subscriber to re-render.
+  return useWatch({
+    control,
+    name: asFieldPath(name),
+    compute: (value) => value,
+  }) as unknown as TValue;
 }
 
 type PriceItem = PriceEditorFormValues['prices'][number]['price']['items'][number];
@@ -172,15 +180,12 @@ const PriceItemRow = memo(function PriceItemRow({
     control,
     name: asFieldArrayPath(`prices.${priceIndex}.price.items.${itemIndex}.pricing.usageTiered.tiers`),
   });
-  const tiers = usePriceEditorWatch<Tier[] | undefined>(
-    control,
-    `prices.${priceIndex}.price.items.${itemIndex}.pricing.usageTiered.tiers`
-  );
+  const tiers = usePriceEditorWatch<Tier[] | undefined>(control, `prices.${priceIndex}.price.items.${itemIndex}.pricing.usageTiered.tiers`);
   const { setValue } = useFormContext<PriceEditorFormValues>();
   const requiredMessage = t('price.validation.priceRequired');
 
   useEffect(() => {
-    if (pricingMode === 'usage_tiered' && tierFields.length === 0) {
+    if ((pricingMode === 'usage_tiered' || pricingMode === 'usage_volume') && tierFields.length === 0) {
       appendTier({ upTo: null, pricePerUnit: '' });
     }
   }, [appendTier, pricingMode, tierFields.length]);
@@ -257,6 +262,7 @@ const PriceItemRow = memo(function PriceItemRow({
                     <SelectItem value='flat_fee'>{t('price.mode_flat_fee')}</SelectItem>
                     <SelectItem value='usage_per_unit'>{t('price.mode_usage_per_unit')}</SelectItem>
                     <SelectItem value='usage_tiered'>{t('price.mode_usage_tiered')}</SelectItem>
+                    <SelectItem value='usage_volume'>{t('price.mode_usage_volume')}</SelectItem>
                   </SelectContent>
                 </Select>
               </FormItem>
@@ -277,6 +283,7 @@ const PriceItemRow = memo(function PriceItemRow({
                       )}
                       <Input
                         {...field}
+                        data-testid={itemCode && `price-per-unit-${itemCode}`}
                         value={(field.value as unknown as string | null | undefined) || ''}
                         placeholder='0.00'
                         className={`h-8 text-right ${currencyPrefix ? 'pl-8' : ''}`}
@@ -328,8 +335,8 @@ const PriceItemRow = memo(function PriceItemRow({
           </Button>
         </div>
 
-        {pricingMode === 'usage_tiered' && (
-          <div className='col-span-full ml-4 mt-2 min-w-0 space-y-2 rounded-md border border-dashed p-3'>
+        {(pricingMode === 'usage_tiered' || pricingMode === 'usage_volume') && (
+          <div className='col-span-full mt-2 ml-4 min-w-0 space-y-2 rounded-md border border-dashed p-3'>
             <div className='text-muted-foreground flex items-center justify-between text-xs'>
               <span>{t('price.tiers')}</span>
               <Button type='button' variant='outline' size='icon-sm' onClick={() => appendTier({ upTo: null, pricePerUnit: '0' })}>
@@ -349,11 +356,9 @@ const PriceItemRow = memo(function PriceItemRow({
                           <Input
                             type='number'
                             {...field}
-                            value={isLastTier ? '' : (field.value as unknown as number | null | undefined) ?? ''}
+                            value={isLastTier ? '' : ((field.value as unknown as number | null | undefined) ?? '')}
                             onChange={(e) =>
-                              isLastTier
-                                ? field.onChange(null)
-                                : field.onChange(e.target.value ? parseInt(e.target.value) : null)
+                              isLastTier ? field.onChange(null) : field.onChange(e.target.value ? parseInt(e.target.value) : null)
                             }
                             placeholder={isLastTier ? '∞' : t('price.upTo')}
                             disabled={isLastTier}
@@ -499,9 +504,9 @@ const PriceVariantRow = memo(function PriceVariantRow({
     return formatted.replace(/[0.,\s]+/g, '').replace(/[A-Z]/g, '');
   }, [currencyCode, t]);
 
-  // Initialize tiers for usage_tiered mode
+  // Initialize tiers for usage_tiered and usage_volume mode
   useEffect(() => {
-    if (pricingMode === 'usage_tiered' && tierFields.length === 0) {
+    if ((pricingMode === 'usage_tiered' || pricingMode === 'usage_volume') && tierFields.length === 0) {
       appendTier({ upTo: null, pricePerUnit: '' });
     }
   }, [appendTier, pricingMode, tierFields.length]);
@@ -562,6 +567,7 @@ const PriceVariantRow = memo(function PriceVariantRow({
                   <SelectItem value='flat_fee'>{t('price.mode_flat_fee')}</SelectItem>
                   <SelectItem value='usage_per_unit'>{t('price.mode_usage_per_unit')}</SelectItem>
                   <SelectItem value='usage_tiered'>{t('price.mode_usage_tiered')}</SelectItem>
+                  <SelectItem value='usage_volume'>{t('price.mode_usage_volume')}</SelectItem>
                 </SelectContent>
               </Select>
             </FormItem>
@@ -597,9 +603,7 @@ const PriceVariantRow = memo(function PriceVariantRow({
         {pricingMode === 'flat_fee' && (
           <FormField
             control={control}
-            name={asFieldPath(
-              `prices.${priceIndex}.price.items.${itemIndex}.promptWriteCacheVariants.${variantIndex}.pricing.flatFee`
-            )}
+            name={asFieldPath(`prices.${priceIndex}.price.items.${itemIndex}.promptWriteCacheVariants.${variantIndex}.pricing.flatFee`)}
             render={({ field }) => (
               <FormItem className='min-w-0 flex-1'>
                 <FormControl>
@@ -626,7 +630,7 @@ const PriceVariantRow = memo(function PriceVariantRow({
         </Button>
       </div>
 
-      {pricingMode === 'usage_tiered' && (
+      {(pricingMode === 'usage_tiered' || pricingMode === 'usage_volume') && (
         <div className='ml-4 space-y-2 rounded-md border border-dashed p-2'>
           <div className='text-muted-foreground flex items-center justify-between text-[10px]'>
             <span>{t('price.tiers')}</span>
@@ -655,11 +659,9 @@ const PriceVariantRow = memo(function PriceVariantRow({
                         <Input
                           type='number'
                           {...field}
-                          value={isLastTier ? '' : (field.value as unknown as number | null | undefined) ?? ''}
+                          value={isLastTier ? '' : ((field.value as unknown as number | null | undefined) ?? '')}
                           onChange={(e) =>
-                            isLastTier
-                              ? field.onChange(null)
-                              : field.onChange(e.target.value ? parseInt(e.target.value) : null)
+                            isLastTier ? field.onChange(null) : field.onChange(e.target.value ? parseInt(e.target.value) : null)
                           }
                           placeholder={isLastTier ? '∞' : t('price.upTo')}
                           disabled={isLastTier}
@@ -705,12 +707,7 @@ const PriceVariantRow = memo(function PriceVariantRow({
                 )}
                 rules={{ required: requiredMessage }}
               />
-              <Button
-                type='button'
-                variant='ghost'
-                size='icon-sm'
-                onClick={() => removeTier(tierIndex)}
-              >
+              <Button type='button' variant='ghost' size='icon-sm' onClick={() => removeTier(tierIndex)}>
                 <IconTrash size={10} className='text-destructive' />
               </Button>
             </div>

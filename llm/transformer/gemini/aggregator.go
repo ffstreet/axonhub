@@ -18,6 +18,8 @@ type candidateAggregator struct {
 	inlineDataParts   []*Blob
 	finishReason      string
 	groundingMetadata *GroundingMetadata
+	originalParts     []*Part
+	hasSignatureOnly  bool
 }
 
 // AggregateStreamChunks aggregates Gemini streaming response chunks into a complete response.
@@ -83,6 +85,8 @@ func AggregateStreamChunks(
 					if part == nil {
 						continue
 					}
+					agg.originalParts = append(agg.originalParts, part)
+					agg.hasSignatureOnly = agg.hasSignatureOnly || part.isSignatureOnly()
 
 					switch {
 					case part.Text != "":
@@ -104,6 +108,7 @@ func AggregateStreamChunks(
 								Arguments: string(argsJSON),
 							},
 						}
+						setOutboundToolCallThoughtSignature(agg.toolCalls[toolCallIndex], part.ThoughtSignature)
 
 					case part.InlineData != nil:
 						agg.inlineDataParts = append(agg.inlineDataParts, part.InlineData)
@@ -146,6 +151,7 @@ func buildGeminiResponse(
 	usage *UsageMetadata,
 ) ([]byte, llm.ResponseMeta, error) {
 	candidates := make([]*Candidate, len(candidateAggs))
+	completed := len(candidateAggs) > 0
 
 	for i := range candidates {
 		agg := candidateAggs[int64(i)]
@@ -181,12 +187,18 @@ func buildGeminiResponse(
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			}
 
+			var thoughtSignature string
+			if signature := getInboundGeminiToolCallThoughtSignature(*tc); signature != nil {
+				thoughtSignature = *signature
+			}
+
 			parts = append(parts, &Part{
 				FunctionCall: &FunctionCall{
 					ID:   tc.ID,
 					Name: tc.Function.Name,
 					Args: args,
 				},
+				ThoughtSignature: thoughtSignature,
 			})
 		}
 
@@ -197,11 +209,17 @@ func buildGeminiResponse(
 			})
 		}
 
+		// Keep standalone signature parts in their original positions, without
+		// merging them into text or moving them onto a tool call.
+		if agg.hasSignatureOnly {
+			parts = agg.originalParts
+		}
 		content.Parts = parts
 
 		// Determine finish reason
 		finishReason := agg.finishReason
 		if finishReason == "" {
+			completed = false
 			finishReason = "STOP"
 		}
 
@@ -232,7 +250,8 @@ func buildGeminiResponse(
 	}
 
 	return data, llm.ResponseMeta{
-		ID:    responseID,
-		Usage: llmUsage,
+		ID:        responseID,
+		Usage:     llmUsage,
+		Completed: completed,
 	}, nil
 }

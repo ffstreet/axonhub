@@ -1,26 +1,26 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { z } from 'zod';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { graphqlRequest } from '@/gql/graphql';
 import { ROLES_QUERY } from '@/gql/roles';
-import { Search } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { useAuthStore } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { canEditUserPermissions } from '@/lib/permission-utils';
+import { formatUserName } from '@/lib/utils';
+import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
-import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage, useFormField } from '@/components/ui/form';
 import { ScopesSelect } from '@/components/scopes-select';
+import { useDebounce } from '@/hooks/use-debounce';
+import { usePermissions } from '@/hooks/usePermissions';
 import { User } from '../data/schema';
-import { useAddUserToProject, useUpdateProjectUser, useAllUsers } from '../data/users';
+import { useAddUserToProject, useUpdateProjectUser, useAllUsersOptions } from '../data/users';
 
 interface Role {
   id: string;
@@ -44,16 +44,97 @@ interface Props {
   onOpenChange: (open: boolean) => void;
 }
 
+interface UserFieldPickerProps {
+  field: { value: string; onChange: (value: string) => void };
+  options: { value: string; label: string }[];
+  isLoading: boolean;
+  hasMore: boolean;
+  isLoadingMore: boolean;
+  onLoadMore: () => void;
+  searchValue: string;
+  onSearchValueChange: (value: string) => void;
+  portalContainer: HTMLDivElement | null;
+  onOpenChange: (open: boolean) => void;
+}
+
+// The picker's inner input is not wrapped by <FormControl>, so the form a11y
+// ids (label htmlFor, required-error association) are passed through explicitly.
+function UserFieldPicker({
+  field,
+  options,
+  isLoading,
+  hasMore,
+  isLoadingMore,
+  onLoadMore,
+  searchValue,
+  onSearchValueChange,
+  portalContainer,
+  onOpenChange,
+}: UserFieldPickerProps) {
+  const { t } = useTranslation();
+  const { error, formItemId, formDescriptionId, formMessageId } = useFormField();
+
+  return (
+    <AutoCompleteSelect
+      selectedValue={field.value || ''}
+      onSelectedValueChange={(value) => field.onChange(value)}
+      items={options}
+      isLoading={isLoading}
+      emptyMessage={t('users.form.noUsersFound')}
+      placeholder={t('users.form.selectUserPlaceholder')}
+      portalContainer={portalContainer}
+      searchValue={searchValue}
+      onSearchValueChange={onSearchValueChange}
+      hasMore={hasMore}
+      isLoadingMore={isLoadingMore}
+      onLoadMore={onLoadMore}
+      onOpenChange={onOpenChange}
+      inputProps={{
+        id: formItemId,
+        ...(error ? { 'aria-invalid': true } : {}),
+        'aria-describedby': `${formDescriptionId} ${formMessageId}`.trim(),
+      }}
+    />
+  );
+}
+
 export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Props) {
   const { t } = useTranslation();
-  const currentUser = useAuthStore((state) => state.auth.user);
+  const { user: currentUser, isProjectOwner } = usePermissions();
   const selectedProjectId = useSelectedProjectId();
+  const canChangeOwnership = !!selectedProjectId && isProjectOwner;
   const isEdit = !!currentRow;
   const [roles, setRoles] = useState<Role[]>([]);
   const [loading, setLoading] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
   const [canEdit, setCanEdit] = useState(true);
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
+
+  // Add-to-project user picker: the input text is owned by the picker; a
+  // debounced copy drives the server-side email search so results are not
+  // capped at the first page. The picker clears its input on open, which also
+  // clears the search term, so the selected label is never fed back as a filter.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [searchValue, setSearchValue] = useState('');
+  const debouncedSearchValue = useDebounce(searchValue, 300);
+  const {
+    data: usersData,
+    isFetching,
+    isFetchingNextPage,
+    fetchNextPage,
+    hasNextPage,
+  } = useAllUsersOptions({ search: pickerOpen ? debouncedSearchValue : '', enabled: open && pickerOpen });
+  const userOptions = useMemo(() => {
+    const options = new Map<string, { value: string; label: string }>();
+    for (const page of usersData?.pages ?? []) {
+      for (const edge of page.edges) {
+        options.set(edge.node.id, {
+          value: edge.node.id,
+          label: `${formatUserName(edge.node.firstName, edge.node.lastName)} (${edge.node.email})`,
+        });
+      }
+    }
+    return Array.from(options.values());
+  }, [usersData]);
 
   const addUserToProject = useAddUserToProject();
   const updateProjectUser = useUpdateProjectUser();
@@ -67,15 +148,6 @@ export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Prop
       userId: z.string().min(1, t('users.validation.userRequired')),
     });
   }, [isEdit, t]);
-
-  // Fetch all users - only when dialog is open
-  const { data: usersData, isLoading: usersLoading } = useAllUsers(
-    {
-      first: 100,
-      where: searchTerm ? { emailContainsFold: searchTerm } : undefined,
-    },
-    { enabled: open }
-  );
 
   const form = useForm<UserForm>({
     resolver: zodResolver(dynamicFormSchema),
@@ -147,7 +219,7 @@ export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Prop
 
       await updateProjectUser.mutateAsync({
         userId: currentRow.id,
-        isOwner: values.isOwner,
+        isOwner: canChangeOwnership && values.isOwner !== currentRow.isOwner ? values.isOwner : undefined,
         scopes: values.scopes,
         addRoleIDs: addRoleIDs.length > 0 ? addRoleIDs : undefined,
         removeRoleIDs: removeRoleIDs.length > 0 ? removeRoleIDs : undefined,
@@ -158,7 +230,7 @@ export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Prop
     } else {
       await addUserToProject.mutateAsync({
         userId: values.userId || '',
-        isOwner: values.isOwner,
+        isOwner: canChangeOwnership ? values.isOwner : undefined,
         scopes: values.scopes,
         roleIDs: values.roleIDs,
       });
@@ -174,15 +246,14 @@ export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Prop
     form.setValue('roleIDs', newRoles);
   };
 
-  const availableUsers = usersData?.edges?.map((edge) => edge.node) || [];
-
   return (
     <Dialog
       open={open}
       onOpenChange={(state) => {
         if (!state) {
           form.reset();
-          setSearchTerm('');
+          setSearchValue('');
+          setPickerOpen(false);
         }
         onOpenChange(state);
       }}
@@ -212,57 +283,41 @@ export function ProjectUserActionDialog({ currentRow, open, onOpenChange }: Prop
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>{t('users.form.selectUser')}</FormLabel>
-                      <Select onValueChange={field.onChange} value={field.value}>
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder={t('users.form.selectUserPlaceholder')} />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          <div className='flex items-center border-b px-3 pb-2'>
-                            <Search className='mr-2 h-4 w-4 shrink-0 opacity-50' />
-                            <Input
-                              placeholder={t('users.form.searchUsers')}
-                              value={searchTerm}
-                              onChange={(e) => setSearchTerm(e.target.value)}
-                              className='h-8 border-0 p-0 focus-visible:ring-0'
-                            />
-                          </div>
-                          {usersLoading ? (
-                            <div className='text-muted-foreground p-2 text-center text-sm'>{t('common.loading')}</div>
-                          ) : availableUsers.length === 0 ? (
-                            <div className='text-muted-foreground p-2 text-center text-sm'>{t('users.form.noUsersFound')}</div>
-                          ) : (
-                            availableUsers.map((user) => (
-                              <SelectItem key={user.id} value={user.id}>
-                                {user.firstName} {user.lastName} ({user.email})
-                              </SelectItem>
-                            ))
-                          )}
-                        </SelectContent>
-                      </Select>
+                      <UserFieldPicker
+                        field={field}
+                        options={userOptions}
+                        isLoading={isFetching && !usersData}
+                        hasMore={!!hasNextPage}
+                        isLoadingMore={isFetchingNextPage}
+                        onLoadMore={fetchNextPage}
+                        searchValue={searchValue}
+                        onSearchValueChange={setSearchValue}
+                        portalContainer={dialogContent}
+                        onOpenChange={setPickerOpen}
+                      />
                       <FormMessage />
                     </FormItem>
                   )}
                 />
               )}
 
-              {/* Project Owner Checkbox */}
-              <FormField
-                control={form.control}
-                name='isOwner'
-                render={({ field }) => (
-                  <FormItem className='flex flex-row items-start space-y-0 space-x-3'>
-                    <FormControl>
-                      <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                    </FormControl>
-                    <div className='space-y-1 leading-none'>
-                      <FormLabel>{t('users.form.isOwner')}</FormLabel>
-                      <p className='text-muted-foreground text-sm'>{t('users.form.ownerDescription')}</p>
-                    </div>
-                  </FormItem>
-                )}
-              />
+              {canChangeOwnership && (
+                <FormField
+                  control={form.control}
+                  name='isOwner'
+                  render={({ field }) => (
+                    <FormItem className='flex flex-row items-start space-y-0 space-x-3'>
+                      <FormControl>
+                        <Checkbox checked={field.value} onCheckedChange={field.onChange} />
+                      </FormControl>
+                      <div className='space-y-1 leading-none'>
+                        <FormLabel>{t('users.form.isOwner')}</FormLabel>
+                        <p className='text-muted-foreground text-sm'>{t('users.form.ownerDescription')}</p>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+              )}
 
               {/* Roles Section */}
               <div className='space-y-3'>

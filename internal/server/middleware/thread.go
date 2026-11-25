@@ -9,8 +9,8 @@ import (
 	"github.com/looplj/axonhub/internal/tracing"
 )
 
-// WithThread is a middleware that extracts the X-Thread-ID header and
-// gets or creates the corresponding thread entity in the database.
+// WithThread extracts the configured thread ID and stores its identity in the
+// request context. The stored thread has only ID, ProjectID, and ThreadID.
 func WithThread(config tracing.Config, threadService *biz.ThreadService) gin.HandlerFunc {
 	// Use the configured thread header name, or default to "AH-Thread-Id"
 	threadHeader := config.ThreadHeader
@@ -20,6 +20,9 @@ func WithThread(config tracing.Config, threadService *biz.ThreadService) gin.Han
 
 	return func(c *gin.Context) {
 		threadID := c.GetHeader(threadHeader)
+		if threadID == "" {
+			threadID = contexts.GetPluginRequestContext(c.Request.Context()).ThreadID
+		}
 		if threadID == "" {
 			c.Next()
 			return
@@ -33,7 +36,7 @@ func WithThread(config tracing.Config, threadService *biz.ThreadService) gin.Han
 		}
 
 		// Get or create thread (errors are logged but don't block the request)
-		thread, err := threadService.GetOrCreateThread(c.Request.Context(), projectID, threadID)
+		thread, err := threadService.ResolveThreadForRequest(c.Request.Context(), projectID, threadID)
 		if err != nil {
 			log.Warn(c.Request.Context(), "failed to get or create thread", log.String("thread_id", threadID), log.Int("project_id", projectID), log.Cause(err))
 			c.Next()
@@ -41,7 +44,7 @@ func WithThread(config tracing.Config, threadService *biz.ThreadService) gin.Han
 			return
 		}
 
-		// Store thread in context
+		// Stored value has only ID, ProjectID, and ThreadID.
 		ctx := contexts.WithThread(c.Request.Context(), thread)
 		c.Request = c.Request.WithContext(ctx)
 

@@ -47,15 +47,21 @@ Thread (完整用户对话会话)
 ### 配置
 ```yaml
 # config.yml
-trace:
-  thread_header: "AH-Thread-Id"
-  trace_header: "AH-Trace-Id"
-  extra_trace_headers:
-    - "Sentry-Trace"
+server:
+  trace:
+    thread_header: "AH-Thread-Id"
+    trace_header: "AH-Trace-Id"
+    extra_trace_headers:
+      - "Sentry-Trace"
+    response_trace_headers:
+      - "AH-Trace-Id"
+      - "X-Oneapi-Request-Id"
 ```
 
 - 通过 `extra_trace_headers` 复用已有的埋点请求头。
-- 如不配置，将采用上述默认值。
+- `response_trace_headers` 会在响应开始前回写本次最终采用的 Trace ID；为空时不回写。它与入站解析配置独立，可为上游网关配置多个兼容头。
+- 浏览器客户端如需读取这些头，还应将相应名称加入 `server.cors.exposed_headers`。
+- 未配置 `thread_header` 或 `trace_header` 时，将采用上面的默认头名。
 
 ### 在 OpenAI 兼容客户端中使用追踪
 ```bash
@@ -149,6 +155,20 @@ func sendTracedMessage(ctx context.Context, apiKey string) (*anthropic.Message, 
 - 在管理后台配置默认数据存储，若该存储不可用会自动回退到主存储，保障访问稳定。
 - 大体量内容可放在外部存储（本地磁盘、S3、GCS），追踪页面仍能快速加载。
 
+#### 数据库请求正文去重
+
+新写入数据库、至少 32 KiB 的 JSON 请求正文，会在同一项目内共享内容相同的数据块。这样可以减少多次请求和渠道执行中重复保存的会话历史，同时完整保留原始 JSON、未知字段和数字精度。请求详情和 Responses 续链会自动加载完整正文。
+
+小正文、没有项目的渠道测试、旧数据及外部存储保持原格式；响应正文和响应流式块不变。清理时先解除对应所有者的引用，仅在最后一个引用消失后删除共享块；保留的 trace 和 thread 继续受到保护。
+
+外部存储的执行请求正文（包括已有记录）仍可在请求详情中读取，GraphQL 查询无需额外选择 `requestID`。
+
+Responses 的 `input` 数组保留粗历史块，只在未封口尾部按消息边界细分，减少小量追加的重复数据；正文仍逐字节保真。[回放方法与测量结果](../development/request-body-replay.md)说明了存储和延迟取舍。
+
+升级仅新增块表和存储标记，不改写旧请求正文。包含请求日志的备份会将分块正文展开成原有的可移植 JSON 格式，恢复时在目标项目中重新去重。仅包含用量统计的备份不会读取请求正文。
+
+**降级：** 旧版程序无法读取新写入的分块正文。降级前请导出包含请求日志的备份，用旧版本恢复到独立数据库，并核验恢复结果后再切换。不要将旧版程序直接指向已有分块正文的数据库。渠道执行记录仍不属于现有备份格式的范围。
+
 ### Claude Code 追踪支持
 - 将 `server.trace.claude_code_trace_enabled` 设为 `true`，AxonHub 会自动读取 Claude Code 产生的追踪 ID。
 - `/anthropic/v1/messages` (及 `/v1/messages`) 的 `metadata.user_id` 会作为追踪 ID 使用，同时不会影响请求体给后续逻辑的读取。
@@ -176,7 +196,57 @@ func sendTracedMessage(ctx context.Context, apiKey string) (*anthropic.Message, 
   </tr>
 </table>
 
+### 最佳实践
+
+#### Trace 设计建议
+
+**单个 Trace 应包含合理数量的 Request**
+
+虽然 AxonHub 理论上支持单个 Trace 包含无限数量的 Request，但在实际生产环境中，我们建议：
+
+- **推荐范围**：单个 Trace 包含 10-50 个 Request
+- **可接受范围**：最多 100 个 Request
+- **避免场景**：单个 Trace 超过 1000 个 Request
+
+**原因**：
+- **内存消耗**：每个 Request 的请求体和响应体大小通常在 1-5MB，100 个 Request 可能占用 500MB 内存
+- **性能影响**：过多 Request 会导致 Trace 页面加载缓慢，影响用户体验
+- **可读性**：包含大量 Request 的 Trace 难以阅读和调试
+
+**优化建议**：
+1. **拆分工作流**：将复杂的 agent 工作流拆分为多个 Trace，每个 Trace 代表一个逻辑单元
+2. **使用 Thread 关联**：通过 Thread ID 关联多个 Trace，保持会话完整性
+3. **控制 agent 迭代次数**：在 agent 循环中设置合理的最大迭代次数，避免无限循环
+4. **定期清理**：设置数据保留策略，定期清理过期的 Trace 数据
+
+**示例场景**：
+
+✅ **良好实践**：
+```
+Thread (用户会话)
+  ├── Trace 1: 用户问题分析 (5 个 Request)
+  ├── Trace 2: 方案设计 (10 个 Request)
+  ├── Trace 3: 代码生成 (20 个 Request)
+  └── Trace 4: 结果验证 (8 个 Request)
+```
+
+❌ **避免做法**：
+```
+Thread (用户会话)
+  └── Trace: 完整工作流 (500+ 个 Request)
+```
+
+#### Request Body 大小控制
+
+- 对于包含大量上下文的请求，考虑使用 Prompt Caching（如 Anthropic 的缓存功能）
+- 避免在 Request Body 中存储不必要的大文件（如完整的日志文件）
+- 对于图片、视频等大文件，使用 URL 引用而非 base64 编码
+
 ### 故障排查
 - **未生成追踪** – 确认请求已通过认证且项目 ID 正确解析（API Key 必须隶属于某个项目）。
 - **缺少线程关联** – 在请求中提供 `AH-Thread-Id`，或先通过 API 创建线程。
 - **追踪 ID 异常** – 检查上游代理是否覆盖了相关请求头。
+
+### 相关文档
+- [请求处理流程指南](../getting-started/request-processing.md)
+- [负载均衡指南](load-balance.md)

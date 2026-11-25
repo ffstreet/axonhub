@@ -18,27 +18,59 @@ type ModelCardCost struct {
 	CacheWrite float64 `json:"cacheWrite"`
 }
 
+// CatalogPrice records how a single reference rate is maintained. Legacy cards
+// have no entries and their existing prices remain under administrator control.
+type CatalogPrice struct {
+	Canonical string `json:"canonical,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	ModelID   string `json:"modelID,omitempty"`
+	Follow    bool   `json:"follow,omitempty"`
+	Missing   bool   `json:"missing,omitempty"`
+}
+
 type ModelCardLimit struct {
 	Context int `json:"context"`
 	Output  int `json:"output"`
 }
 
 type ModelCard struct {
-	Reasoning   ModelCardReasoning  `json:"reasoning"`
-	ToolCall    bool                `json:"toolCall"`
-	Temperature bool                `json:"temperature"`
-	Modalities  ModelCardModalities `json:"modalities"`
-	Vision      bool                `json:"vision"`
-	Cost        ModelCardCost       `json:"cost"`
-	Limit       ModelCardLimit      `json:"limit"`
-	Knowledge   string              `json:"knowledge"`
-	ReleaseDate string              `json:"releaseDate"`
-	LastUpdated string              `json:"lastUpdated"`
+	Reasoning ModelCardReasoning `json:"reasoning"`
+	// ReasoningEfforts lists the reasoning effort levels the model accepts, using the
+	// unified values from llm/reasoning.go. Nil means the levels are unknown.
+	ReasoningEfforts []string                `json:"reasoningEfforts"`
+	ToolCall         bool                    `json:"toolCall"`
+	Temperature      bool                    `json:"temperature"`
+	Modalities       ModelCardModalities     `json:"modalities"`
+	Vision           bool                    `json:"vision"`
+	CatalogAliases   []string                `json:"catalogAliases,omitempty"`
+	CatalogPrices    map[string]CatalogPrice `json:"catalogPrices,omitempty"`
+	Cost             ModelCardCost           `json:"cost"`
+	Limit            ModelCardLimit          `json:"limit"`
+	Knowledge        string                  `json:"knowledge"`
+	ReleaseDate      string                  `json:"releaseDate"`
+	LastUpdated      string                  `json:"lastUpdated"`
 }
 
 type ModelSettings struct {
-	Associations []*ModelAssociation `json:"associations"`
+	DisableDeveloperSettingsInheritance bool                `json:"disableDeveloperSettingsInheritance"`
+	Associations                        []*ModelAssociation `json:"associations"`
+	LoadBalancerStrategy                string              `json:"loadBalancerStrategy"`
+	TraceStickyMode                     string              `json:"traceStickyMode"`
 }
+
+const (
+	ModelAssociationConditionFieldPromptTokens        = "prompt_tokens"
+	ModelAssociationConditionFieldStream              = "stream"
+	ModelAssociationConditionFieldRequestFormat       = "request_format"
+	ModelAssociationConditionFieldReasoningEffort     = "reasoning_effort"
+	ModelAssociationConditionFieldDailyTime           = "daily_time"
+	ModelAssociationConditionFieldHasImage            = "has_image"
+	ModelAssociationConditionFieldHasVideo            = "has_video"
+	ModelAssociationConditionFieldHasDocument         = "has_document"
+	ModelAssociationConditionFieldHasAudio            = "has_audio"
+	ModelAssociationConditionFieldRequestHeader       = "request_header"
+	ModelAssociationConditionFieldRequestHeaderPrefix = "request_header."
+)
 
 type ModelAssociation struct {
 	// channel_model: the specified model id in the specified channel
@@ -50,12 +82,18 @@ type ModelAssociation struct {
 	Type             string                       `json:"type"`
 	Priority         int                          `json:"priority"` // Lower value = higher priority, default 0
 	Disabled         bool                         `json:"disabled"`
+	When             *ModelAssociationWhen        `json:"when,omitempty"`
 	ChannelModel     *ChannelModelAssociation     `json:"channelModel"`
 	ChannelRegex     *ChannelRegexAssociation     `json:"channelRegex"`
 	Regex            *RegexAssociation            `json:"regex"`
 	ModelID          *ModelIDAssociation          `json:"modelId"`
 	ChannelTagsModel *ChannelTagsModelAssociation `json:"channelTagsModel"`
 	ChannelTagsRegex *ChannelTagsRegexAssociation `json:"channelTagsRegex"`
+}
+
+type ModelAssociationWhen struct {
+	Enabled   bool       `json:"enabled"`
+	Condition *Condition `json:"condition,omitempty"`
 }
 
 type ExcludeAssociation struct {
@@ -92,4 +130,28 @@ type ChannelTagsModelAssociation struct {
 type ChannelTagsRegexAssociation struct {
 	ChannelTags []string `json:"channelTags"`
 	Pattern     string   `json:"pattern"`
+}
+
+// Field returns the named basic reference rate on the card.
+func (c *ModelCardCost) Field(name string) *float64 {
+	switch name {
+	case "input":
+		return &c.Input
+	case "output":
+		return &c.Output
+	case "cacheRead":
+		return &c.CacheRead
+	case "cacheWrite":
+		return &c.CacheWrite
+	default:
+		return nil
+	}
+}
+
+// ReferencePrice distinguishes a missing quote from a configured zero rate.
+func (c *ModelCard) ReferencePrice(field string) *float64 {
+	if c == nil || c.CatalogPrices[field].Missing {
+		return nil
+	}
+	return c.Cost.Field(field)
 }

@@ -4,24 +4,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"sync"
 	"time"
 
+	"github.com/samber/lo"
+
+	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcontext"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/modelname"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // OutboundPersistentStream wraps a stream and tracks all responses for final saving to database.
 // It implements the streams.Stream interface and handles persistence in the Close method.
+// Next, Current, and tail collection share one consumer goroutine. Cancellation
+// callbacks only close the source; they never access the buffered accounting state.
 //
 //nolint:containedctx // Checked.
 type OutboundPersistentStream struct {
+	current *httpclient.StreamEvent
+
 	ctx context.Context
 
 	RequestService  *biz.RequestService
@@ -32,9 +46,23 @@ type OutboundPersistentStream struct {
 	requestExec *ent.RequestExecution
 
 	transformer    transformer.Outbound
+	apiFormat      llm.APIFormat
 	perf           *biz.PerformanceRecord
 	responseChunks []*httpclient.StreamEvent
-	closed         bool
+	// First reported model only. Intra-stream changes are not tracked.
+	upstreamModelID string
+	terminalState   streamTerminalState
+	terminalError   string
+	outcome         streamOutcome
+	closeOnce       sync.Once
+	closeErr        error
+	sourceCloseOnce sync.Once
+	sourceCloseErr  error
+	sourceEnd       llm.SourceEndReason
+	persistenceErr  error
+	state           *PersistenceState
+	terminalTracker *StreamTerminalTracker
+	lifecycle       *streamLifecycle
 }
 
 var _ streams.Stream[*httpclient.StreamEvent] = (*OutboundPersistentStream)(nil)
@@ -48,8 +76,13 @@ func NewOutboundPersistentStream(
 	usageLogService *biz.UsageLogService,
 	outboundTransformer transformer.Outbound,
 	perf *biz.PerformanceRecord,
+	state *PersistenceState,
 ) *OutboundPersistentStream {
-	return &OutboundPersistentStream{
+	format := outboundTransformer.APIFormat()
+	if requestExec != nil && requestExec.Format != "" {
+		format = llm.APIFormat(requestExec.Format)
+	}
+	s := &OutboundPersistentStream{
 		ctx:             ctx,
 		stream:          stream,
 		request:         request,
@@ -57,63 +90,288 @@ func NewOutboundPersistentStream(
 		RequestService:  requestService,
 		UsageLogService: usageLogService,
 		transformer:     outboundTransformer,
+		apiFormat:       format,
 		perf:            perf,
 		responseChunks:  make([]*httpclient.StreamEvent, 0),
-		closed:          false,
+		state:           state,
+		terminalTracker: NewStreamTerminalTrackerForRequest(request, state),
+		lifecycle:       streamLifecycleFromContext(ctx),
 	}
+	if s.lifecycle != nil {
+		s.lifecycle.trackAttempt(s)
+	}
+
+	return s
+}
+
+func (ts *OutboundPersistentStream) consumeTailEvent(event *httpclient.StreamEvent) error {
+	if event == nil {
+		return nil
+	}
+	ts.responseChunks = append(ts.responseChunks, httpclient.SummarizeBinaryChunk(event))
+	if ts.terminalState == streamTerminalNone && ts.terminalTracker.Observe(event) {
+		ts.terminalState = classifyAcceptedTerminalEvent(event)
+		ts.state.OutboundStreamTerminal = ts.terminalState
+		ts.outcome.observeTerminalEvent(ts.terminalState, event)
+	}
+	return nil
 }
 
 func (ts *OutboundPersistentStream) Next() bool {
-	return ts.stream.Next()
+	ts.current = nil
+	if ts.stream.Next() {
+		ts.recordCurrent()
+		return true
+	}
+	if err := ts.stream.Err(); err != nil && !errors.Is(err, io.EOF) {
+		ts.sourceEnd = llm.SourceEndError
+	} else if ts.sourceEnd == llm.SourceEndSemantic {
+		return false
+	} else if ts.ctx.Err() != nil {
+		ts.sourceEnd = llm.SourceEndCanceled
+	} else {
+		ts.sourceEnd = llm.SourceEndCleanEOF
+	}
+	return false
 }
 
+// Current is a cached read; repeated reads must not duplicate persisted chunks.
 func (ts *OutboundPersistentStream) Current() *httpclient.StreamEvent {
-	event := ts.stream.Current()
-	if event != nil {
-		ts.responseChunks = append(ts.responseChunks, event)
-	}
+	return ts.current
+}
 
-	return event
+func (ts *OutboundPersistentStream) recordCurrent() {
+	event := ts.stream.Current()
+	ts.current = event
+	if event != nil {
+		if string(event.Data) == "[DONE]" && isNonChoiceTerminalEvent(event) {
+			ts.sourceEnd = llm.SourceEndSemantic
+		}
+		if ts.upstreamModelID == "" {
+			ts.upstreamModelID = modelname.FromEvent(event, ts.apiFormat)
+		}
+		// For raw binary audio chunks (TTS stream_format=audio), persist only a size
+		// summary to avoid buffering the full audio payload in memory.
+		ts.responseChunks = append(ts.responseChunks, httpclient.SummarizeBinaryChunk(event))
+		if ts.terminalState == streamTerminalNone {
+			if ts.terminalTracker.Observe(event) {
+				ts.terminalState = classifyAcceptedTerminalEvent(event)
+				ts.state.OutboundStreamTerminal = ts.terminalState
+				if ts.terminalState != streamTerminalCompleted {
+					ts.terminalError = streamTerminalErrorMessage(event, ts.terminalState)
+				}
+				ts.outcome.observeTerminalEvent(ts.terminalState, event)
+				ts.markPerformanceTerminal(ts.terminalState, ts.terminalError)
+				if isNonChoiceTerminalEvent(event) {
+					ts.sourceEnd = llm.SourceEndSemantic
+				}
+			}
+		}
+	}
 }
 
 func (ts *OutboundPersistentStream) Err() error {
 	return ts.stream.Err()
 }
 
+// Close finalizes the attempt. Callers must have stopped reading: under a
+// stream lifecycle, Close collects the remaining source on the calling goroutine.
 func (ts *OutboundPersistentStream) Close() error {
-	if ts.closed {
-		return nil
+	ts.closeOnce.Do(func() {
+		if ts.lifecycle != nil {
+			ts.collectTail()
+		}
+		ts.closeErr = errors.Join(ts.finalizeClose(), ts.persistenceErr)
+	})
+
+	return ts.closeErr
+}
+
+// collectTail keeps reading the source within the tail budget after delivery
+// was acknowledged, so trailing usage is still accounted. Before
+// acknowledgement the source is released first.
+func (ts *OutboundPersistentStream) collectTail() {
+	ctx, acknowledged, release := ts.lifecycle.tailContext()
+	defer release()
+	// Acknowledged tails are aborted by the lifecycle budget. Otherwise close
+	// the source synchronously before reading; no second abort callback is needed.
+	if !acknowledged {
+		ts.abortSource()
 	}
 
-	ts.closed = true
+	result := streamTailResult{end: llm.SourceEndCanceled, err: ctx.Err()}
+	if ctx.Err() == nil {
+		result = collectStreamTail(ctx, ts.stream, ts.consumeTailEvent)
+		if err := ctx.Err(); err != nil {
+			result = streamTailResult{end: llm.SourceEndCanceled, err: err}
+		}
+	}
+
+	ts.sourceEnd = tailSourceEnd(result, ts.sourceEnd)
+}
+
+func (ts *OutboundPersistentStream) abortSource() {
+	_ = ts.closeSource()
+}
+
+// closeSource serializes transport cleanup across timeout callbacks and finalization.
+// Keep this separate from closeOnce: an abort must unblock the reader while Close
+// is still collecting the tail. All callers wait for cleanup and share its error.
+func (ts *OutboundPersistentStream) closeSource() error {
+	ts.sourceCloseOnce.Do(func() {
+		ts.sourceCloseErr = ts.stream.Close()
+	})
+	return ts.sourceCloseErr
+}
+
+func (ts *OutboundPersistentStream) finalizeClose() error {
 	ctx := ts.ctx
 
-	log.Debug(ctx, "Closing persistent stream", log.Int("chunk_count", len(ts.responseChunks)))
+	log.Debug(ctx, "Closing persistent stream", log.Int("chunk_count", len(ts.responseChunks)), log.Bool("execution_completed", ts.terminalState == streamTerminalCompleted))
 
 	streamErr := ts.stream.Err()
-	if streamErr != nil {
-		// Use context without cancellation to ensure persistence even if client canceled
+	ctxErr := ctx.Err()
+	ts.outcome.observeTransportError(streamErr)
+	ts.outcome.observeContextError(ctxErr)
+	if ts.outcome.hasFinalEvidence() {
+		ts.terminalState = ts.outcome.finalState()
+	}
+
+	// A terminal event carries the final stream outcome. Persist its structured
+	// response even if a transport or context error arrives afterward.
+	if ts.terminalState != streamTerminalNone {
+		ts.logFinalizationDecision(ctx, "terminal_event_received", streamErr, ctxErr,
+			ts.terminalState == streamTerminalCompleted, nil)
+		log.Debug(ctx, "Stream terminal event received, performing final persistence",
+			log.String("terminal_state", string(ts.terminalState)))
+		ts.persistResponseChunks(ctx, ts.accountingSourceEnd(streamErr, ctxErr))
+
+		return ts.closeSource()
+	}
+
+	var responseBody []byte
+	var meta llm.ResponseMeta
+	var aggErr error
+	aggregatedCompleted := false
+	sourceEnd := ts.accountingSourceEnd(streamErr, ctxErr)
+	if len(ts.responseChunks) > 0 {
+		responseBody, meta, aggErr = ts.transformer.AggregateStreamChunks(context.WithoutCancel(ctx), ts.state.RawProviderRequest, ts.responseChunks)
+		if ts.state != nil && aggErr == nil {
+			ts.state.AccountingFinal = meta.AccountingFinal(sourceEnd)
+			ts.state.AccountingSourceEnd = sourceEnd
+		}
+		aggregatedCompleted = aggErr == nil && len(responseBody) > 0 && meta.ID != "" && isCompletedAggregated(meta)
+		if ts.apiFormat == llm.APIFormatOpenAIChatCompletion && (streamErr != nil || ctxErr != nil) {
+			aggregatedCompleted = aggregatedCompleted && ts.terminalTracker.AllChoicesFinished()
+		}
+		ts.logFinalizationDecision(ctx, "aggregated_outbound_chunks", streamErr, ctxErr, aggregatedCompleted, aggErr)
+		if aggregatedCompleted {
+			log.Debug(ctx, "Stream has valid complete response without terminal event, treating as completed")
+			if streamErr != nil || ctxErr != nil {
+				ts.outcome.observeValidatedCompletion()
+			} else {
+				ts.outcome.observeAggregatedCompletion(true)
+			}
+			ts.markPerformanceTerminal(streamTerminalCompleted, "")
+			enqueueCompletedPerformance(ts.ctx, ts.state)
+		}
+	} else {
+		ts.logFinalizationDecision(ctx, "no_outbound_chunks_to_aggregate", streamErr, ctxErr, false, nil)
+	}
+	if !aggregatedCompleted && ts.state.CleanEOFCompletionEvidence && streamErr == nil && aggErr == nil && len(responseBody) > 0 {
+		aggregatedCompleted = true
+		ts.outcome.observeValidatedCompletion()
+		ts.markPerformanceTerminal(streamTerminalCompleted, "")
+		enqueueCompletedPerformance(ts.ctx, ts.state)
+	}
+	if ts.outcome.hasFinalEvidence() {
+		ts.terminalState = ts.outcome.finalState()
+	}
+	decision := ts.outcome.finalDecision()
+	if ts.terminalState == streamTerminalNone {
+		ts.terminalState = decision.state
+	}
+
+	if decision.state != streamTerminalCompleted && (streamErr != nil || ctxErr != nil) {
+		ts.logFinalizationDecision(ctx, "stream_error_or_context", streamErr, ctxErr, false, aggErr)
 		persistCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
-		if ts.requestExec != nil {
-			if err := ts.RequestService.UpdateRequestExecutionStatusFromError(persistCtx, ts.requestExec.ID, streamErr); err != nil {
-				log.Warn(persistCtx, "Failed to update request execution status from error", log.Cause(err))
-			}
-		}
+		ts.persistExecutionFailure(persistCtx, decision.cause)
 
-		return ts.stream.Close()
+		return ts.closeSource()
+	}
+
+	if decision.state != streamTerminalCompleted {
+		ts.logFinalizationDecision(ctx, "incomplete_stream_without_terminal_event", streamErr, ctxErr, aggregatedCompleted, aggErr)
+		persistCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		// Upstream dropped mid-stream (clean EOF, no terminal). Persist what we
+		// buffered so operators can inspect the truncated generation.
+		ts.persistExecutionFailure(persistCtx, decision.cause)
+
+		return ts.closeSource()
 	}
 
 	// Stream completed successfully - perform final persistence
 	log.Debug(ctx, "Stream completed successfully, performing final persistence")
+	logDecision := "completed_after_aggregation"
+	if len(responseBody) == 0 {
+		logDecision = "completed_via_chunk_persistence"
+	}
+	ts.logFinalizationDecision(ctx, logDecision, streamErr, ctxErr, aggregatedCompleted, aggErr)
 
-	ts.persistResponseChunks(ctx)
+	if len(responseBody) > 0 {
+		ts.persistAggregatedResponse(context.WithoutCancel(ctx), responseBody, meta, sourceEnd)
+	} else {
+		ts.persistResponseChunks(ctx, sourceEnd)
+	}
 
-	return ts.stream.Close()
+	return ts.closeSource()
 }
 
-func (ts *OutboundPersistentStream) persistResponseChunks(ctx context.Context) {
+func (ts *OutboundPersistentStream) markPerformanceTerminal(state streamTerminalState, message string) {
+	if ts.perf == nil || ts.perf.RequestCompleted {
+		return
+	}
+
+	switch state {
+	case streamTerminalCompleted, streamTerminalIncomplete:
+		// Token limits and content filtering end a response without indicating
+		// a channel fault. Keep them out of failure counts and auto-disable rules.
+		ts.perf.MarkSuccess()
+	case streamTerminalCanceled:
+		ts.perf.MarkCanceled()
+	case streamTerminalFailed:
+		ts.perf.MarkFailedWithMessage(500, message)
+	case streamTerminalNone:
+	}
+}
+
+func (ts *OutboundPersistentStream) logFinalizationDecision(ctx context.Context, decision string, streamErr error, ctxErr error, aggregatedCompleted bool, aggregatedErr error) {
+	fields := []log.Field{
+		log.String("decision", decision),
+		log.Bool("terminal_event_seen", ts.terminalState != streamTerminalNone),
+		log.Int("chunk_count", len(ts.responseChunks)),
+		log.String("api_format", string(ts.transformer.APIFormat())),
+		log.Bool("aggregated_completed", aggregatedCompleted),
+	}
+
+	if streamErr != nil {
+		fields = append(fields, log.String("stream_err", streamErr.Error()))
+	}
+	if ctxErr != nil {
+		fields = append(fields, log.String("ctx_err", ctxErr.Error()))
+	}
+	if aggregatedErr != nil {
+		fields = append(fields, log.String("aggregated_err", aggregatedErr.Error()))
+	}
+
+	log.Debug(ctx, "Outbound stream finalization decision", fields...)
+}
+
+func (ts *OutboundPersistentStream) persistResponseChunks(ctx context.Context, sourceEnd llm.SourceEndReason) {
 	defer func() {
 		if cause := recover(); cause != nil {
 			log.Warn(ctx, "Failed to persist outbound response chunks", log.Any("cause", cause))
@@ -126,67 +384,271 @@ func (ts *OutboundPersistentStream) persistResponseChunks(ctx context.Context) {
 		persistCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
-		responseBody, meta, err := ts.transformer.AggregateStreamChunks(persistCtx, ts.responseChunks)
+		responseBody, meta, err := ts.transformer.AggregateStreamChunks(persistCtx, ts.state.RawProviderRequest, ts.responseChunks)
 		if err != nil {
 			log.Warn(persistCtx, "Failed to aggregate chunks using transformer", log.Cause(err))
+			// Aggregation failure must not discard a known terminal outcome or
+			// overwrite it with a local processing error. Persist status separately
+			// without trusting any partial response or usage returned with the error.
+			status := ts.terminalState.executionStatus()
+			if updateErr := ts.RequestService.UpdateRequestExecutionStatusWithMetrics(
+				persistCtx, ts.requestExec, status, ts.terminalError, nil, ts.failureLatencyMetrics(), ts.upstreamModelID,
+				ts.responseHeaders(), ts.responseChunks...,
+			); updateErr != nil {
+				log.Warn(persistCtx, "Failed to update terminal execution after aggregation failure",
+					log.Cause(updateErr), log.Any("status", status))
+				ts.persistenceErr = errors.Join(ts.persistenceErr, updateErr)
+			}
 			return
 		}
-
-		// Try to create usage log from aggregated response
-		if usage := meta.Usage; usage != nil {
-			_, err = ts.UsageLogService.CreateUsageLogFromRequest(persistCtx, ts.request, ts.requestExec, usage)
-			if err != nil {
-				log.Warn(persistCtx, "Failed to create usage log from request", log.Cause(err))
-			}
+		if ts.state != nil {
+			ts.state.AccountingFinal = meta.AccountingFinal(sourceEnd)
+			ts.state.AccountingSourceEnd = sourceEnd
 		}
 
-		// Build latency metrics from performance record
-		var metrics *biz.LatencyMetrics
-
-		if ts.perf != nil {
-			firstTokenLatencyMs, requestLatencyMs, _ := ts.perf.Calculate()
-
-			metrics = &biz.LatencyMetrics{
-				LatencyMs: &requestLatencyMs,
-			}
-			if ts.perf.Stream && ts.perf.FirstTokenTime != nil {
-				metrics.FirstTokenLatencyMs = &firstTokenLatencyMs
-			}
-		}
-
-		err = ts.RequestService.UpdateRequestExecutionCompleted(
-			persistCtx,
-			ts.requestExec.ID,
-			meta.ID,
-			responseBody,
-			metrics,
-		)
-		if err != nil {
-			log.Warn(
-				persistCtx,
-				"Failed to update request execution with chunks, trying basic completion",
-				log.Cause(err),
-			)
-		}
-
-		// Save all response chunks at once
-		if err := ts.RequestService.SaveRequestExecutionChunks(persistCtx, ts.requestExec.ID, ts.responseChunks); err != nil {
-			log.Warn(persistCtx, "Failed to save request execution chunks", log.Cause(err))
-		}
+		ts.persistAggregatedResponse(persistCtx, responseBody, meta, sourceEnd)
 	}
 }
 
-// PersistentOutboundTransformer wraps an outbound transformer with enhanced capabilities.
-type PersistentOutboundTransformer struct {
-	wrapped transformer.Outbound
-	state   *PersistenceState
+func (ts *OutboundPersistentStream) responseHeaders() http.Header {
+	return ts.state.executionResponseHeaders(ts.requestExec.ID)
+}
+
+// failureLatencyMetrics captures the latency metrics collected before the stream failed,
+// so a failed execution still records its time-to-first-token and total latency.
+func (ts *OutboundPersistentStream) failureLatencyMetrics() *biz.LatencyMetrics {
+	if ts.perf == nil || ts.perf.StartTime.IsZero() {
+		return nil
+	}
+
+	endTime := ts.perf.EndTime
+	if endTime.IsZero() {
+		endTime = time.Now()
+	}
+
+	latencyMs := biz.ClampLatency(endTime.Sub(ts.perf.StartTime).Milliseconds())
+	metrics := &biz.LatencyMetrics{LatencyMs: &latencyMs}
+
+	if ts.perf.Stream && ts.perf.FirstTokenTime != nil {
+		firstTokenLatencyMs := biz.ClampLatency(ts.perf.FirstTokenTime.Sub(ts.perf.StartTime).Milliseconds())
+		metrics.FirstTokenLatencyMs = &firstTokenLatencyMs
+	}
+
+	return metrics
+}
+
+// persistExecutionFailure marks the execution failed (or canceled) with a classified
+// error and the latency metrics captured before the failure.
+func (ts *OutboundPersistentStream) persistExecutionFailure(ctx context.Context, rawErr error) {
+	if ts.requestExec == nil {
+		return
+	}
+
+	err := persistRequestExecutionFailure(ctx, ts.RequestService, ts.requestExec, rawErr, ts.failureLatencyMetrics(), ts.upstreamModelID, ts.responseHeaders(), ts.responseChunks...)
+	if err != nil {
+		log.Warn(ctx, "Failed to update request execution status from error", log.Cause(err))
+	}
+}
+
+func (ts *OutboundPersistentStream) persistAggregatedResponse(ctx context.Context, responseBody []byte, meta llm.ResponseMeta, sourceEnd llm.SourceEndReason) {
+	if ts.requestExec == nil {
+		return
+	}
+
+	// Try to create usage log from aggregated response
+	if usage := meta.Usage; usage != nil && accountingMayBeFinal(ts.apiFormat, meta, sourceEnd) {
+		_, err := ts.UsageLogService.CreateUsageLogFromRequest(ctx, ts.request, ts.requestExec, usage)
+		if err != nil {
+			log.Warn(ctx, "Failed to create usage log from request", log.Cause(err))
+			ts.persistenceErr = errors.Join(ts.persistenceErr, err)
+		}
+	}
+	if meta.Usage == nil || !accountingMayBeFinal(ts.apiFormat, meta, sourceEnd) {
+		log.Warn(ctx, "Authoritative usage unavailable",
+			log.Int("execution_id", ts.requestExec.ID), log.String("reason", accountingUnavailableReason(meta, sourceEnd)))
+	}
+
+	// Build latency metrics from performance record
+	var metrics *biz.LatencyMetrics
+
+	if ts.perf != nil {
+		firstTokenLatencyMs, requestLatencyMs, _ := ts.perf.Calculate()
+
+		metrics = &biz.LatencyMetrics{
+			LatencyMs: &requestLatencyMs,
+		}
+		if ts.perf.Stream && ts.perf.FirstTokenTime != nil {
+			metrics.FirstTokenLatencyMs = &firstTokenLatencyMs
+		}
+	}
+
+	status := ts.terminalState.executionStatus()
+	err := ts.RequestService.UpdateRequestExecutionFinalized(
+		ctx,
+		ts.requestExec,
+		status,
+		ts.terminalError,
+		meta.ID,
+		responseBody,
+		metrics,
+		ts.upstreamModelID,
+		ts.responseHeaders(), ts.responseChunks...,
+	)
+	if err != nil {
+		ts.persistenceErr = errors.Join(ts.persistenceErr, err)
+		log.Warn(
+			ctx,
+			"Failed to update finalized request execution",
+			log.Cause(err),
+			log.Any("status", status),
+		)
+	}
+}
+
+func (s streamTerminalState) executionStatus() requestexecution.Status {
+	switch s {
+	case streamTerminalFailed, streamTerminalIncomplete:
+		return requestexecution.StatusFailed
+	case streamTerminalCanceled:
+		return requestexecution.StatusCanceled
+	default:
+		return requestexecution.StatusCompleted
+	}
+}
+
+func isCompletedAggregated(meta llm.ResponseMeta) bool {
+	return meta.Completed
+}
+
+func (ts *OutboundPersistentStream) accountingSourceEnd(streamErr, ctxErr error) llm.SourceEndReason {
+	switch {
+	case streamErr != nil && !errors.Is(streamErr, io.EOF):
+		return llm.SourceEndError
+	case ts.sourceEnd == llm.SourceEndSemantic || ts.sourceEnd == llm.SourceEndCleanEOF || ts.sourceEnd == llm.SourceEndBudget:
+		return ts.sourceEnd
+	case ctxErr != nil:
+		return llm.SourceEndCanceled
+	default:
+		return llm.SourceEndUnknown
+	}
+}
+
+func accountingMayBeFinal(format llm.APIFormat, meta llm.ResponseMeta, sourceEnd llm.SourceEndReason) bool {
+	if meta.AccountingFinal(sourceEnd) {
+		return true
+	}
+
+	// The named raw aggregators own provenance. Other adapters retain their
+	// established usage behavior until they provide the same evidence.
+	switch format {
+	case llm.APIFormatOpenAIChatCompletion, llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponseWebSocket, llm.APIFormatOpenAIResponseCompact, llm.APIFormatAnthropicMessage:
+		return false
+	default:
+		return meta.Usage != nil
+	}
+}
+
+func accountingUnavailableReason(meta llm.ResponseMeta, sourceEnd llm.SourceEndReason) string {
+	if sourceEnd == llm.SourceEndBudget {
+		return "budget"
+	}
+	if sourceEnd == llm.SourceEndError {
+		return "provider-error"
+	}
+	if sourceEnd == llm.SourceEndCanceled {
+		return "truncated"
+	}
+	if meta.AccountingEvidence == llm.AccountingEvidenceCleanEndCandidate {
+		return "truncated"
+	}
+	return "absent"
 }
 
 var errSkipCandidateByCircuitBreaker = errors.New("skip candidate by circuit breaker")
 
+// PersistentOutboundTransformer wraps an outbound transformer with shared persistence state.
+type PersistentOutboundTransformer struct {
+	wrapped                       transformer.Outbound
+	state                         *PersistenceState
+	outboundLlmRequestMiddlewares []pipeline.OutboundLlmRequestMiddleware
+}
+
+func shouldForceStreamingForCandidate(candidate *ChannelModelsCandidate, req *llm.Request) bool {
+	if candidate == nil || candidate.Channel == nil || req == nil {
+		return false
+	}
+
+	if req.Stream != nil && *req.Stream {
+		return false
+	}
+
+	if candidate.Channel.Policies.Stream != objects.CapabilityPolicyRequire {
+		return false
+	}
+
+	return supportsAutoAggregateRequest(req)
+}
+
+func selectOutboundForCandidate(candidate *ChannelModelsCandidate) transformer.Outbound {
+	if candidate == nil || candidate.Channel == nil {
+		return nil
+	}
+
+	if candidate.APIFormat != "" && candidate.Channel.Outbounds != nil {
+		if out, ok := candidate.Channel.Outbounds[candidate.APIFormat]; ok {
+			return out
+		}
+	}
+
+	return candidate.Channel.Outbound
+}
+
+// refreshCandidateAPIFormat synchronizes the candidate-level protocol with the
+// model currently being attempted. Candidates selected through the model
+// association path carry a per-model format table; the fallback computation is
+// kept for candidates constructed by older callers and tests.
+func (p *PersistentOutboundTransformer) refreshCandidateAPIFormat(
+	ctx context.Context,
+	candidate *ChannelModelsCandidate,
+	modelIndex int,
+	req *llm.Request,
+) {
+	if candidate == nil || candidate.Channel == nil || modelIndex < 0 || modelIndex >= len(candidate.Models) {
+		return
+	}
+
+	if len(candidate.modelAPIFormats) == len(candidate.Models) {
+		candidate.APIFormat = candidate.modelAPIFormats[modelIndex]
+		return
+	}
+
+	// Preserve an explicitly populated format when no per-model table is
+	// available. This covers legacy/specified selectors that already selected
+	// their endpoint before entering the persistent transformer.
+	if candidate.APIFormat != "" || req == nil {
+		return
+	}
+
+	requestModel := req.Model
+	if p != nil && p.state != nil && p.state.OriginalModel != "" {
+		requestModel = p.state.OriginalModel
+	}
+
+	entry := candidate.Models[modelIndex]
+	endpoints, forced := applyForcedAPIFormats(ctx, candidate.Channel, []biz.ChannelModelEntry{entry}, requestModel, candidate.Channel.ResolveEndpoints())
+	candidate.APIFormat = selectEndpointAPIFormat(ctx, endpoints, req, forced)
+}
+
 // APIFormat returns the API format of the transformer.
 func (p *PersistentOutboundTransformer) APIFormat() llm.APIFormat {
 	return p.wrapped.APIFormat()
+}
+
+// SupportsCodexResponseHeaders reports whether the selected outbound transformer
+// owns the Codex response-header contract.
+func (p *PersistentOutboundTransformer) SupportsCodexResponseHeaders() bool {
+	supports, ok := p.wrapped.(interface{ SupportsCodexResponseHeaders() bool })
+	return ok && supports.SupportsCodexResponseHeaders()
 }
 
 func (p *PersistentOutboundTransformer) TransformError(ctx context.Context, rawErr *httpclient.Error) *llm.ResponseError {
@@ -194,9 +656,16 @@ func (p *PersistentOutboundTransformer) TransformError(ctx context.Context, rawE
 }
 
 func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, llmRequest *llm.Request) (*httpclient.Request, error) {
+	hasAdditionalTools := containsAdditionalToolsInputItems(llmRequest)
+
 	// Candidates should already be selected by inbound transformer
 	if len(p.state.ChannelModelsCandidates) == 0 {
 		return nil, errors.New("no candidates available: candidates should be selected by inbound transformer")
+	}
+	if p.state.ResponsesContinuation != nil {
+		if err := selectResponsesContinuationCandidate(ctx, p, llmRequest); err != nil {
+			return nil, err
+		}
 	}
 
 	// Select current candidate for this attempt
@@ -208,27 +677,154 @@ func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, ll
 	entry := candidate.Models[p.state.CurrentModelIndex]
 
 	p.state.CurrentCandidate = candidate
-	p.wrapped = candidate.Channel.Outbound
+	p.state.OutboundAttempt++
+	p.state.StreamCompleted = false
+	p.state.OutboundStreamTerminal = streamTerminalNone
+	p.state.CleanEOFCompletionEvidence = false
+	p.refreshCandidateAPIFormat(ctx, candidate, p.state.CurrentModelIndex, llmRequest)
+
+	p.wrapped = selectOutboundForCandidate(candidate)
 
 	log.Debug(ctx, "using candidate",
 		log.String("channel", candidate.Channel.Name),
 		log.String("request_model", p.state.OriginalModel),
 		log.String("actual_model", entry.ActualModel),
+		log.String("api_format", candidate.APIFormat),
 	)
 
 	llmRequest.Model = entry.ActualModel
+	var continuationErr error
+	llmRequest, continuationErr = prepareResponsesAttempt(ctx, p, llmRequest)
+	if continuationErr != nil {
+		return nil, continuationErr
+	}
+
+	outboundFormat := p.wrapped.APIFormat()
+	if candidate.APIFormat != "" {
+		outboundFormat = llm.APIFormat(candidate.APIFormat)
+	}
+
+	if candidate.Channel != nil {
+		ctx = contexts.WithAttemptChannel(ctx, contexts.AttemptChannel{
+			ID:   candidate.Channel.ID,
+			Name: candidate.Channel.Name,
+			Type: string(candidate.Channel.Type),
+		})
+	}
 
 	// Apply channel transform options to create a new request
 	llmRequest = applyTransformOptions(llmRequest, candidate.Channel.Settings)
+	llmRequest = applyReasoningEffortMapping(llmRequest, candidate.Channel.Settings)
+	llmRequest = applyModelDefaultMaxTokens(llmRequest, candidate, outboundFormat)
+	for _, middleware := range p.outboundLlmRequestMiddlewares {
+		transformedRequest, err := middleware.OnOutboundLlmRequest(ctx, llmRequest, outboundFormat)
+		if err != nil {
+			if isPluginOverloaded(err) {
+				p.state.PluginOverloaded = true
+			}
+			return nil, fmt.Errorf("failed to apply %s middleware: %w", middleware.Name(), err)
+		}
+		llmRequest = transformedRequest
+	}
+	llmRequest = filterResponseCustomToolMessagesForNonResponsesOutbound(llmRequest, outboundFormat)
 
-	return p.wrapped.TransformRequest(ctx, llmRequest)
+	if llmRequest.Stream == nil && outboundFormat == llm.APIFormatAnthropicMessage {
+		llmRequest.Stream = lo.ToPtr(false)
+	}
+
+	if shouldForceStreamingForCandidate(candidate, llmRequest) {
+		streamPtr := lo.ToPtr(true)
+		llmRequest.Stream = streamPtr
+		if llmRequest.StreamOptions == nil {
+			llmRequest.StreamOptions = &llm.StreamOptions{}
+		}
+		llmRequest.StreamOptions.IncludeUsage = true
+		if p.state != nil && p.state.LlmRequest != nil {
+			p.state.LlmRequest.Stream = streamPtr
+			if p.state.LlmRequest.StreamOptions == nil {
+				p.state.LlmRequest.StreamOptions = &llm.StreamOptions{}
+			}
+			p.state.LlmRequest.StreamOptions.IncludeUsage = true
+		}
+	}
+
+	httpRequest, err := p.wrapped.TransformRequest(ctx, llmRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve the emitted protocol once for raw middleware, plugin matching,
+	// pass-through, and persistence. Transformers may omit the request field.
+	if httpRequest.APIFormat != "" {
+		outboundFormat = llm.APIFormat(httpRequest.APIFormat)
+	} else {
+		httpRequest.APIFormat = string(outboundFormat)
+	}
+	if hasAdditionalTools && !isResponsesFormat(outboundFormat) && outboundFormat != llm.APIFormatOpenAIResponseCompact {
+		return nil, fmt.Errorf(
+			"%w: %w: additional_tools input items cannot be converted to %s",
+			transformer.ErrUnsupportedConversion,
+			transformer.ErrInvalidRequest,
+			outboundFormat,
+		)
+	}
+
+	return httpRequest, nil
+}
+
+func containsAdditionalToolsInputItems(request *llm.Request) bool {
+	if request == nil || request.ProviderExtensions == nil || request.ProviderExtensions.OpenAIResponses == nil || request.ProviderExtensions.OpenAIResponses.Request == nil {
+		return false
+	}
+
+	for _, fragment := range request.ProviderExtensions.OpenAIResponses.Request.RawInputItems {
+		if fragment.Type == "additional_tools" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func filterResponseCustomToolMessagesForNonResponsesOutbound(
+	llmRequest *llm.Request,
+	outboundFormat llm.APIFormat,
+) *llm.Request {
+	if llmRequest == nil {
+		return nil
+	}
+
+	if !isResponsesFormat(llmRequest.APIFormat) || isResponsesFormat(outboundFormat) || !containsResponseCustomToolMessages(llmRequest.Messages) {
+		return llmRequest
+	}
+
+	cloned := *llmRequest
+	cloned.Messages = shared.FilterOutResponseCustomToolMessages(llmRequest.Messages)
+
+	return &cloned
+}
+
+func isResponsesFormat(format llm.APIFormat) bool {
+	return format == llm.APIFormatOpenAIResponse || format == llm.APIFormatOpenAIResponseWebSocket || format == llm.APIFormatOpenAIResponseCompact
+}
+
+func containsResponseCustomToolMessages(messages []llm.Message) bool {
+	for _, msg := range messages {
+		for _, toolCall := range msg.ToolCalls {
+			if toolCall.Type == llm.ToolTypeResponsesCustomTool || toolCall.ResponseCustomToolCall != nil {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (p *PersistentOutboundTransformer) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {
 	return p.wrapped.TransformResponse(ctx, response)
 }
 
-func (p *PersistentOutboundTransformer) TransformStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+func (p *PersistentOutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
 	persistentStream := NewOutboundPersistentStream(
 		ctx,
 		stream,
@@ -238,16 +834,17 @@ func (p *PersistentOutboundTransformer) TransformStream(ctx context.Context, str
 		p.state.UsageLogService,
 		p.wrapped, // Pass the wrapped outbound transformer for chunk aggregation
 		p.state.Perf,
+		p.state,
 	)
 
-	return p.wrapped.TransformStream(ctx, persistentStream)
+	return p.wrapped.TransformStream(ctx, req, persistentStream)
 }
 
 func (p *PersistentOutboundTransformer) AggregateStreamChunks(
-	ctx context.Context,
+	ctx context.Context, req *httpclient.Request,
 	chunks []*httpclient.StreamEvent,
 ) ([]byte, llm.ResponseMeta, error) {
-	return p.wrapped.AggregateStreamChunks(ctx, chunks)
+	return p.wrapped.AggregateStreamChunks(ctx, req, chunks)
 }
 
 // GetRequestExecution returns the current request execution.
@@ -262,11 +859,64 @@ func (p *PersistentOutboundTransformer) GetRequest() *ent.Request {
 
 // GetCurrentChannel returns the current channel.
 func (p *PersistentOutboundTransformer) GetCurrentChannel() *biz.Channel {
-	if p.state.CurrentCandidate == nil {
+	if p.state == nil || p.state.CurrentCandidate == nil {
 		return nil
 	}
 
 	return p.state.CurrentCandidate.Channel
+}
+
+// SameChannelRetryLimit implements the optional pipeline.ChannelSameChannelRetryLimit
+// interface: it lets a channel override the global "max single channel retries".
+// ok is false when the channel configures no override, so the pipeline keeps the
+// global retry policy value.
+func (p *PersistentOutboundTransformer) SameChannelRetryLimit() (int, bool) {
+	ch := p.GetCurrentChannel()
+	if ch == nil || ch.Settings == nil || ch.Settings.MaxSingleChannelRetries == nil {
+		return 0, false
+	}
+
+	return *ch.Settings.MaxSingleChannelRetries, true
+}
+
+// ResponseTimeouts implements pipeline.ResponseTimeoutProvider. It returns the
+// channel-level response timeout overrides for the current attempt, or nil for a
+// timeout the channel inherits from the global retry policy. Resolving here (per
+// attempt) keeps the overrides correct when a retry switches channels.
+func (p *PersistentOutboundTransformer) ResponseTimeouts(_ context.Context) (*time.Duration, *time.Duration) {
+	channel := p.GetCurrentChannel()
+	if channel == nil || channel.Settings == nil {
+		return nil, nil
+	}
+
+	settings := channel.Settings.ResponseTimeout
+	if !settings.IsCustom() {
+		return nil, nil
+	}
+
+	return secondsToDuration(settings.StreamFirstEventTimeoutSeconds),
+		secondsToDuration(settings.NonStreamResponseTimeoutSeconds)
+}
+
+func secondsToDuration(seconds *int) *time.Duration {
+	if seconds == nil {
+		return nil
+	}
+
+	timeout := time.Duration(*seconds) * time.Second
+
+	return &timeout
+}
+
+// trackCurrentChannelSelection records an actual retry attempt. Initial
+// attempts are tracked by LoadBalancedSelector after it assembles the final
+// priority-ordered candidate list.
+func (p *PersistentOutboundTransformer) trackCurrentChannelSelection() {
+	if p == nil || p.state == nil || p.state.ChannelService == nil || p.state.CurrentCandidate == nil || p.state.CurrentCandidate.Channel == nil {
+		return
+	}
+
+	p.state.ChannelService.IncrementChannelSelection(p.state.CurrentCandidate.Channel.ID)
 }
 
 // GetCurrentModelID returns the current model ID for logging purposes.
@@ -286,12 +936,34 @@ func (p *PersistentOutboundTransformer) GetRequestedModel() string {
 // HasMoreChannels returns true if there are more candidates available for retry.
 // It implements the pipeline.Retryable interface.
 func (p *PersistentOutboundTransformer) HasMoreChannels() bool {
+	if p.state.PluginOverloaded {
+		return false
+	}
 	return p.state.CurrentCandidateIndex+1 < len(p.state.ChannelModelsCandidates)
+}
+
+// resetPassThroughStreamState releases the abandoned attempt's raw provider stream
+// and clears its recorder so the next attempt starts with a clean slate.
+func (p *PersistentOutboundTransformer) resetPassThroughStreamState() {
+	if p.state.PassThroughRecorder != nil {
+		_ = p.state.PassThroughRecorder.Close()
+		p.state.PassThroughRecorder = nil
+	}
 }
 
 // NextChannel moves to the next available candidate for retry.
 // It implements the pipeline.Retryable interface.
 func (p *PersistentOutboundTransformer) NextChannel(ctx context.Context) error {
+	if lifecycleOwner := streamLifecycleFromContext(ctx); lifecycleOwner != nil {
+		lifecycleOwner.closeAttempt()
+	}
+
+	// Remember the channel being left before the index moves. The event is
+	// published only after the switch succeeds.
+	leftChannel, leftModel, attempt := p.channelBeingLeft()
+
+	p.resetPassThroughStreamState()
+
 	p.state.CurrentCandidateIndex++
 
 	p.state.CurrentModelIndex = 0
@@ -301,10 +973,16 @@ func (p *PersistentOutboundTransformer) NextChannel(ctx context.Context) error {
 
 	// Reset request execution for the new candidate
 	p.state.RequestExec = nil
+	p.state.PassThroughApplied = false
 
 	candidate := p.state.ChannelModelsCandidates[p.state.CurrentCandidateIndex]
 	p.state.CurrentCandidate = candidate
-	p.wrapped = candidate.Channel.Outbound
+	p.state.StreamCompleted = false
+	p.state.OutboundStreamTerminal = streamTerminalNone
+	p.state.CleanEOFCompletionEvidence = false
+	p.trackCurrentChannelSelection()
+	p.refreshCandidateAPIFormat(ctx, candidate, p.state.CurrentModelIndex, p.state.LlmRequest)
+	p.wrapped = selectOutboundForCandidate(candidate)
 
 	if log.DebugEnabled(ctx) {
 		model := candidate.Models[0].ActualModel
@@ -312,8 +990,11 @@ func (p *PersistentOutboundTransformer) NextChannel(ctx context.Context) error {
 			log.String("channel", candidate.Channel.Name),
 			log.String("model", model),
 			log.Int("index", p.state.CurrentCandidateIndex),
+			log.String("api_format", candidate.APIFormat),
 		)
 	}
+
+	p.publishRequestFailover(ctx, leftChannel, leftModel, attempt, candidate.Channel)
 
 	return nil
 }
@@ -330,35 +1011,120 @@ func (p *PersistentOutboundTransformer) CanRetry(err error) bool {
 		return false
 	}
 
+	// Retrying the same channel cannot resolve local capacity rejection.
+	// Plugin overload also disables failover through state.PluginOverloaded;
+	// queue/RPM rejections can still move to the next channel.
+	if isLocalAdmissionError(err) {
+		return false
+	}
+
+	// Empty response detection: allow same-channel retry so the pipeline can
+	// re-execute the request against the same (or next model in the) channel.
+	if errors.Is(err, pipeline.ErrEmptyResponse) ||
+		errors.Is(err, pipeline.ErrEmptyStreamChunks) ||
+		errors.Is(err, pipeline.ErrEmptyAggregatedBody) {
+		log.Debug(context.Background(), "empty response detected",
+			log.Int("channel_id", p.state.CurrentCandidate.Channel.ID),
+		)
+
+		return true
+	}
+
+	// 429 Too Many Requests: skip same-channel retry and switch channels.
+	// The upstream is explicitly rate-limiting this channel, so retrying the same
+	// channel would just burn a retry attempt without any chance of success.
+	// Instead, force a channel switch so the next candidate (e.g. a backup channel)
+	// is tried immediately. The load balancer (e.g. ErrorAware strategy) will
+	// deprioritize this channel for subsequent requests and it will naturally
+	// recover as the rate-limit window resets.
+	//
+	// A channel that lists 429 in RetryableStatusCodes opts out: for that channel
+	// the code means "the upstream endpoint is busy", where a same-channel retry
+	// can win the race, so the error falls through to the per-channel check below.
+	if (httpclient.IsRateLimitErr(err) || ExtractStatusCodeFromError(err) == http.StatusTooManyRequests) &&
+		!channelRetriesOn429(p.state.CurrentCandidate.Channel) {
+		log.Debug(context.Background(), "429 rate limit, skipping same-channel retry to switch to next channel",
+			log.Int("channel_id", p.state.CurrentCandidate.Channel.ID),
+		)
+
+		return false
+	}
+
+	// 520 Unknown Error (typically a Cloudflare edge failure with an empty
+	// body): the whole backend edge is unresponsive, so iterating model aliases
+	// on the same channel just burns attempts without any chance of success.
+	// Force a channel switch instead of grinding through the candidate's model
+	// list on a dead backend.
+	if ExtractStatusCodeFromError(err) == 520 {
+		log.Debug(context.Background(), "520 edge error, skipping same-channel retry to switch to next channel",
+			log.Int("channel_id", p.state.CurrentCandidate.Channel.ID),
+		)
+
+		return false
+	}
+
+	// 402 Payment Required (e.g. Cline credit balance exhausted): the account
+	// behind this channel cannot serve any model, so iterating model aliases
+	// on the same channel just burns attempts. Force a channel switch so a
+	// backup channel with a funded account is tried immediately.
+	if ExtractStatusCodeFromError(err) == http.StatusPaymentRequired {
+		log.Debug(context.Background(), "402 payment required, skipping same-channel retry to switch to next channel",
+			log.Int("channel_id", p.state.CurrentCandidate.Channel.ID),
+		)
+
+		return false
+	}
+
 	// if there are more models available in the current candidate, try the next model.
 	if p.state.CurrentModelIndex+1 < len(p.state.CurrentCandidate.Models) {
 		return true
 	}
 
-	// otherwise check if the error is retryable.
-	return isRetryableError(err)
+	// otherwise check if the error is retryable for the current channel.
+	return isRetryableErrorForChannel(err, p.state.CurrentCandidate.Channel)
 }
 
 // PrepareForRetry implements the pipeline.ChannelRetryable interface.
 // This will reset the request execution for the same channel, so that the same request can be retried.
 // It will try the next model in the same channel if available.
 func (p *PersistentOutboundTransformer) PrepareForRetry(ctx context.Context) error {
+	if lifecycleOwner := streamLifecycleFromContext(ctx); lifecycleOwner != nil {
+		lifecycleOwner.closeAttempt()
+	}
+
+	// fork: re-read the channel state so a credential disabled mid-request is
+	// picked up before the next same-channel attempt, and so a channel that has
+	// left service ends the retry instead of burning the remaining budget
+	// (see retry_channel_refresh.go).
+	if err := p.refreshChannelBeforeRetry(ctx); err != nil {
+		return err
+	}
+
 	candidate := p.state.CurrentCandidate
 
 	// Reset request execution for the same channel.
 	p.state.RequestExec = nil
+	p.state.PassThroughApplied = false
+	p.state.CleanEOFCompletionEvidence = false
+	p.state.StreamCompleted = false
+	p.state.OutboundStreamTerminal = streamTerminalNone
+
+	p.resetPassThroughStreamState()
 
 	// If there's another model in the list, advance to it.
 	if p.state.CurrentModelIndex+1 < len(candidate.Models) {
 		// Increase the model index to the next model.
 		p.state.CurrentModelIndex++
-		p.wrapped = candidate.Channel.Outbound
+		p.refreshCandidateAPIFormat(ctx, candidate, p.state.CurrentModelIndex, p.state.LlmRequest)
+		p.wrapped = selectOutboundForCandidate(candidate)
+		p.trackCurrentChannelSelection()
 
 		if log.DebugEnabled(ctx) {
 			model := candidate.Models[p.state.CurrentModelIndex].ActualModel
 			log.Debug(ctx, "prepared same channel retry for next model",
 				log.Any("channel", candidate.Channel.Name),
 				log.Any("model", model),
+				log.String("api_format", candidate.APIFormat),
 				log.Int("current_candidate_index", p.state.CurrentCandidateIndex),
 				log.Int("current_entry_index", p.state.CurrentModelIndex),
 			)
@@ -366,6 +1132,8 @@ func (p *PersistentOutboundTransformer) PrepareForRetry(ctx context.Context) err
 
 		return nil
 	}
+
+	p.trackCurrentChannelSelection()
 
 	// Otherwise, we're retrying the current (last) model.
 	// It handle the models count less than retry policy.
@@ -400,15 +1168,38 @@ func (p *PersistentOutboundTransformer) CustomizeExecutor(executor pipeline.Exec
 
 	// 1. Apply proxy settings. Test proxy override takes precedence over channel settings.
 	if p.state.Proxy != nil {
-		customizedExecutor = httpclient.NewHttpClientWithProxy(p.state.Proxy)
+		if channel.HTTPClient != nil {
+			customizedExecutor = channel.HTTPClient.WithProxy(p.state.Proxy)
+		} else {
+			customizedExecutor = httpclient.NewHttpClientWithProxy(p.state.Proxy)
+		}
 	} else if channel.HTTPClient != nil {
 		// Use the channel's own HTTP client, which is pre-configured with its proxy settings.
 		customizedExecutor = channel.HTTPClient
 	}
-	// 2. Allow the specific outbound transformer (e.g., for AWS signing) to further customize the client.
-	if custom, ok := channel.Outbound.(pipeline.ChannelCustomizedExecutor); ok {
+	// 2. Allow the selected outbound transformer (e.g., for AWS signing or Responses WebSocket) to further customize the client.
+	outbound := p.wrapped
+	if outbound == nil {
+		outbound = channel.Outbound
+	}
+	if custom, ok := outbound.(pipeline.ChannelCustomizedExecutor); ok {
 		return custom.CustomizeExecutor(customizedExecutor)
 	}
 
 	return customizedExecutor
+}
+
+func finalizeTransportRequest(p *PersistentOutboundTransformer) pipeline.Middleware {
+	return pipeline.OnRawRequest("finalize_transport_request", func(_ context.Context, request *httpclient.Request) (*httpclient.Request, error) {
+		if p == nil || p.wrapped == nil {
+			return request, nil
+		}
+
+		finalizer, ok := p.wrapped.(transformer.TransportRequestFinalizer)
+		if !ok {
+			return request, nil
+		}
+
+		return finalizer.FinalizeTransportRequest(request), nil
+	})
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type InputHTMLAttributes } from 'react';
 import { Command as CommandPrimitive } from 'cmdk';
 import { Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -19,6 +19,14 @@ type Props<T extends string> = {
   portalContainer?: HTMLElement | null;
   /** 自定义输入框的 className */
   inputClassName?: string;
+  /** 透传给输入框的属性（如表单 a11y：id / aria-invalid / aria-describedby） */
+  inputProps?: InputHTMLAttributes<HTMLInputElement>;
+  searchValue?: string;
+  onSearchValueChange?: (value: string) => void;
+  hasMore?: boolean;
+  isLoadingMore?: boolean;
+  onLoadMore?: () => void | Promise<unknown>;
+  onOpenChange?: (open: boolean) => void;
 };
 
 // AutoCompleteSelect: strictly selects from provided items. No free-form values are allowed.
@@ -31,9 +39,24 @@ export function AutoCompleteSelect<T extends string>({
   placeholder = 'Search...',
   portalContainer,
   inputClassName,
+  inputProps,
+  searchValue: controlledSearchValue,
+  onSearchValueChange,
+  hasMore = false,
+  isLoadingMore = false,
+  onLoadMore,
+  onOpenChange,
 }: Props<T>) {
   const [open, setOpen] = useState(false);
-  const [searchValue, setSearchValue] = useState('');
+  const [internalSearchValue, setInternalSearchValue] = useState('');
+  const searchValue = controlledSearchValue ?? internalSearchValue;
+  const setSearchValue = onSearchValueChange ?? setInternalSearchValue;
+  const isServerSearch = !!onSearchValueChange;
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    setOpen(nextOpen);
+    onOpenChange?.(nextOpen);
+  };
 
   // map value -> label for quick lookup
   const labels = useMemo(
@@ -50,16 +73,21 @@ export function AutoCompleteSelect<T extends string>({
 
   // Filter items locally based on search string
   const filtered = useMemo(() => {
-    if (!searchValue) return items;
+    if (isServerSearch || !searchValue) return items;
     const q = searchValue.toLowerCase();
     return items.filter((it) => it.label.toLowerCase().includes(q));
-  }, [items, searchValue]);
+  }, [isServerSearch, items, searchValue]);
 
   const onInputBlur = (e: React.FocusEvent<HTMLInputElement>) => {
     // Strict mode: on blur, revert input text to the selected label
-    // unless focus moves within the list
+    // unless focus moves within the list. When a value is selected but its label
+    // is not (yet) resolvable in `items` (e.g. server-searched options), leave the
+    // text as-is so the resolved label is never clobbered to the placeholder.
     if (!e.relatedTarget?.hasAttribute('cmdk-list')) {
-      setSearchValue(labels[selectedValue] ?? '');
+      const label = labels[selectedValue];
+      if (!selectedValue || label !== undefined) {
+        setSearchValue(label ?? '');
+      }
     }
   };
 
@@ -69,37 +97,40 @@ export function AutoCompleteSelect<T extends string>({
     if (!exists) return;
     onSelectedValueChange(inputValue as T);
     setSearchValue(labels[inputValue] ?? '');
-    setOpen(false);
+    handleOpenChange(false);
   };
 
-  // Keep the search field in sync with the selected item when selection changes externally
-  // This also initializes the field with the current label.
+  // Keep the closed input synchronized with the selection without overwriting an active server search.
+  // Skip the sync when the value's label is not resolvable in `items` (server-searched options may be
+  // an empty page after the selected label briefly drove the search term) — writing '' here would
+  // flip the input to the placeholder and re-trigger the search, loop.
   useEffect(() => {
-    setSearchValue(labels[selectedValue] ?? '');
-  }, [labels, selectedValue]);
+    if (open) return;
+    const label = labels[selectedValue];
+    if (!selectedValue || label !== undefined) {
+      setSearchValue(label ?? '');
+    }
+  }, [labels, open, selectedValue]);
 
   return (
     <div className='flex w-full min-w-0 items-center'>
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover open={open} onOpenChange={handleOpenChange}>
         <Command shouldFilter={false} className='w-full bg-transparent'>
           <PopoverAnchor asChild>
             <CommandPrimitive.Input
               asChild
               value={searchValue}
               onValueChange={setSearchValue}
-              onKeyDown={(e) => setOpen(e.key !== 'Escape')}
+              onKeyDown={(e) => handleOpenChange(e.key !== 'Escape')}
               onMouseDown={() => {
-                setOpen((prev) => {
-                  if (!prev) {
-                    setSearchValue(''); // 打开时清空搜索，显示所有选项
-                  }
-                  return !prev;
-                });
+                if (!open) {
+                  setSearchValue('');
+                  handleOpenChange(true);
+                }
               }}
-              onFocus={() => setOpen(true)}
               onBlur={onInputBlur}
             >
-              <Input placeholder={placeholder} className={cn('w-full', inputClassName)} />
+              <Input placeholder={placeholder} className={cn('w-full', inputClassName)} {...inputProps} />
             </CommandPrimitive.Input>
           </PopoverAnchor>
           {!open && <CommandList aria-hidden='true' className='hidden' />}
@@ -110,10 +141,10 @@ export function AutoCompleteSelect<T extends string>({
                 e.preventDefault();
               }
             }}
-            className='w-[var(--radix-popover-trigger-width)] max-w-[var(--radix-popover-trigger-width)] p-0'
+            className='w-max max-w-[min(400px,90vw)] min-w-[var(--radix-popover-trigger-width)] p-0'
             container={portalContainer}
           >
-            <CommandList>
+            <CommandList hasMore={hasMore} isLoadingMore={isLoadingMore} onLoadMore={onLoadMore}>
               {isLoading && (
                 <CommandPrimitive.Loading>
                   <div className='p-1'>
@@ -138,6 +169,13 @@ export function AutoCompleteSelect<T extends string>({
                 </CommandGroup>
               ) : null}
               {!isLoading ? <CommandEmpty>{emptyMessage ?? 'No items.'}</CommandEmpty> : null}
+              {isLoadingMore && (
+                <CommandPrimitive.Loading>
+                  <div className='p-1'>
+                    <Skeleton className='h-6 w-full' />
+                  </div>
+                </CommandPrimitive.Loading>
+              )}
             </CommandList>
           </PopoverContent>
         </Command>

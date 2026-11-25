@@ -2,7 +2,8 @@
 
 import { useCallback } from 'react';
 import { format } from 'date-fns';
-import { ColumnDef } from '@tanstack/react-table';
+import { ColumnDef, VisibilityState } from '@tanstack/react-table';
+import { z } from 'zod';
 import { zhCN, enUS } from 'date-fns/locale';
 import { FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -11,7 +12,80 @@ import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { DataTableColumnHeader } from '@/components/data-table-column-header';
+import { IconArchive, IconPin, IconRotate } from '@tabler/icons-react';
 import { Trace } from '../data/schema';
+import { useArchiveTrace, useUnarchiveTrace, useRetainTrace, useUnretainTrace } from '../data/traces';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import React from 'react';
+
+function TraceActionButtons({ trace }: { trace: Trace }) {
+  const { t } = useTranslation();
+  const [showArchiveDialog, setShowArchiveDialog] = React.useState(false);
+  const archiveMutation = useArchiveTrace();
+  const unarchiveMutation = useUnarchiveTrace();
+  const retainMutation = useRetainTrace();
+  const unretainMutation = useUnretainTrace();
+  const status = trace.status ?? 'active';
+
+  return (
+    <>
+      <div className='flex items-center gap-1'>
+        {status === 'active' && (
+          <>
+            <Button variant='ghost' size='sm' onClick={() => setShowArchiveDialog(true)} title={t('common.actions.archive')}>
+              <IconArchive className='h-4 w-4' />
+            </Button>
+            <Button variant='ghost' size='sm' onClick={() => retainMutation.mutate(trace.id)} title={t('common.actions.retain')}>
+              <IconPin className='h-4 w-4' />
+            </Button>
+          </>
+        )}
+        {status === 'archived' && (
+          <Button variant='ghost' size='sm' onClick={() => unarchiveMutation.mutate(trace.id)} title={t('common.actions.unarchive')}>
+            <IconRotate className='h-4 w-4' />
+          </Button>
+        )}
+        {status === 'retained' && (
+          <Button variant='ghost' size='sm' onClick={() => unretainMutation.mutate(trace.id)} title={t('common.actions.unretain')}>
+            <IconRotate className='h-4 w-4' />
+          </Button>
+        )}
+      </div>
+      <AlertDialog open={showArchiveDialog} onOpenChange={setShowArchiveDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('traces.dialogs.archiveTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('traces.dialogs.archiveDescription')}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.actions.cancel')}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { archiveMutation.mutate(trace.id); setShowArchiveDialog(false); }}>
+              {t('common.actions.archive')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+export const DEFAULT_TRACES_COLUMN_VISIBILITY: VisibilityState = {};
+
+const tracesColumnVisibilitySchema = z.record(z.string(), z.boolean());
+
+export function parseTracesColumnVisibility(value: unknown): VisibilityState {
+  const parsed = tracesColumnVisibilitySchema.safeParse(value);
+  return parsed.success ? { ...DEFAULT_TRACES_COLUMN_VISIBILITY, ...parsed.data } : DEFAULT_TRACES_COLUMN_VISIBILITY;
+}
 
 export function useTracesColumns(): ColumnDef<Trace>[] {
   const { t, i18n } = useTranslation();
@@ -116,7 +190,10 @@ export function useTracesColumns(): ColumnDef<Trace>[] {
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('traces.columns.details')} />,
       cell: ({ row }) => {
         const handleViewDetails = () => {
-          navigateWithSearch({ to: '/project/traces/$traceId', params: { traceId: row.original.id } });
+          navigateWithSearch({
+            to: '/project/traces/$traceId',
+            params: { traceId: row.original.id },
+          });
         };
 
         return (
@@ -135,40 +212,21 @@ export function useTracesColumns(): ColumnDef<Trace>[] {
         return <div className='text-xs'>{format(date, 'yyyy-MM-dd HH:mm:ss', { locale })}</div>;
       },
     },
-    // {
-    //   accessorKey: 'updatedAt',
-    //   header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.updatedAt')} />,
-    //   cell: ({ row }) => {
-    //     const date = new Date(row.getValue('updatedAt'))
-    //     return <div className='text-xs'>{format(date, 'yyyy-MM-dd HH:mm:ss', { locale })}</div>
-    //   },
-    // },
-    // {
-    //   id: 'actions',
-    //   cell: ({ row }) => {
-    //     const trace = row.original
-    //     const navigate = useNavigate()
-
-    //     return (
-    //       <DropdownMenu>
-    //         <DropdownMenuTrigger asChild>
-    //           <Button variant='ghost' className='h-8 w-8 p-0'>
-    //             <span className='sr-only'>{t('traces.actions.openMenu')}</span>
-    //             <MoreHorizontal className='h-4 w-4' />
-    //           </Button>
-    //         </DropdownMenuTrigger>
-    //         <DropdownMenuContent align='end'>
-    //           <DropdownMenuItem onClick={() => {
-    //             navigate({ to: '/project/traces/$traceId', params: { traceId: trace.id } })
-    //           }}>
-    //             <Eye className='mr-2 h-4 w-4' />
-    //             {t('traces.actions.viewDetails')}
-    //           </DropdownMenuItem>
-    //         </DropdownMenuContent>
-    //       </DropdownMenu>
-    //     )
-    //   },
-    // },
+    {
+      accessorKey: 'lastRequestAt',
+      header: ({ column }) => <DataTableColumnHeader column={column} title={t('traces.columns.lastRequestAt')} />,
+      cell: ({ row }) => {
+        const date = new Date(row.getValue('lastRequestAt'));
+        return <div className='text-xs'>{format(date, 'yyyy-MM-dd HH:mm:ss', { locale })}</div>;
+      },
+    },
+    {
+      id: 'actions',
+      header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.actions')} />,
+      enableHiding: false,
+      meta: { className: 'w-[100px]' },
+      cell: ({ row }) => <TraceActionButtons trace={row.original} />,
+    },
   ];
 
   return columns;

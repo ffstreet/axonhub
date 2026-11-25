@@ -2,8 +2,7 @@ package orchestrator
 
 import (
 	"context"
-
-	"github.com/zhenzou/executors"
+	"time"
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
@@ -16,11 +15,11 @@ type mockStrategy struct {
 	score float64
 }
 
-func (m *mockStrategy) Score(ctx context.Context, channel *biz.Channel) float64 {
+func (m *mockStrategy) Score(ctx context.Context, channel *biz.Channel, metrics *biz.AggregatedMetrics) float64 {
 	return m.score
 }
 
-func (m *mockStrategy) ScoreWithDebug(ctx context.Context, channel *biz.Channel) (float64, StrategyScore) {
+func (m *mockStrategy) ScoreWithDebug(ctx context.Context, channel *biz.Channel, metrics *biz.AggregatedMetrics) (float64, StrategyScore) {
 	return m.score, StrategyScore{
 		StrategyName: m.name,
 		Score:        m.score,
@@ -35,14 +34,9 @@ func (m *mockStrategy) Name() string {
 // mockMetricsProvider is a mock implementation of ChannelMetricsProvider for testing.
 type mockMetricsProvider struct {
 	metrics map[int]*biz.AggregatedMetrics
-	err     error
 }
 
 func (m *mockMetricsProvider) GetChannelMetrics(ctx context.Context, channelID int) (*biz.AggregatedMetrics, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-
 	if metrics, ok := m.metrics[channelID]; ok {
 		return metrics, nil
 	}
@@ -50,12 +44,16 @@ func (m *mockMetricsProvider) GetChannelMetrics(ctx context.Context, channelID i
 	return &biz.AggregatedMetrics{}, nil
 }
 
-type mockRetryPolicyProvider struct {
-	policy *biz.RetryPolicy
-}
+func (m *mockMetricsProvider) IncrementChannelSelection(channelID int) {
+	metrics, ok := m.metrics[channelID]
+	if !ok {
+		metrics = &biz.AggregatedMetrics{}
+		m.metrics[channelID] = metrics
+	}
 
-func (m *mockRetryPolicyProvider) RetryPolicyOrDefault(ctx context.Context) *biz.RetryPolicy {
-	return m.policy
+	metrics.RequestCount++
+	now := time.Now()
+	metrics.LastSelectedAt = &now
 }
 
 type mockSelectionTracker struct {
@@ -70,24 +68,6 @@ func (m *mockSelectionTracker) IncrementChannelSelection(channelID int) {
 	m.selections[channelID]++
 }
 
-// mockTraceProvider is a mock implementation of ChannelTraceProvider for testing.
-type mockTraceProvider struct {
-	lastSuccessChannel map[int]int // traceID -> channelID
-	err                error
-}
-
-func (m *mockTraceProvider) GetLastSuccessfulChannelID(ctx context.Context, traceID int) (int, error) {
-	if m.err != nil {
-		return 0, m.err
-	}
-
-	if channelID, ok := m.lastSuccessChannel[traceID]; ok {
-		return channelID, nil
-	}
-
-	return 0, nil
-}
-
 // newTestChannelService creates a minimal channel service for testing.
 // It bypasses the normal initialization to avoid requiring a ScheduledExecutor.
 func newTestChannelService(client *ent.Client) *biz.ChannelService {
@@ -97,7 +77,9 @@ func newTestChannelService(client *ent.Client) *biz.ChannelService {
 	})
 
 	return biz.NewChannelService(biz.ChannelServiceParams{
-		Executor:      executors.NewPoolScheduleExecutor(),
+		ModelCache: biz.NewModelCacheService(biz.ModelCacheServiceParams{
+			Ent: client,
+		}),
 		Ent:           client,
 		SystemService: systemService,
 	})
@@ -113,10 +95,9 @@ func newTestRequestService(client *ent.Client) *biz.RequestService {
 		Client:        client,
 		SystemService: systemService,
 		CacheConfig:   xcache.Config{},
-		Executor:      executors.NewPoolScheduleExecutor(),
 	})
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
 
-	return biz.NewRequestService(client, systemService, usageLogService, dataStorageService)
+	return biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry())
 }

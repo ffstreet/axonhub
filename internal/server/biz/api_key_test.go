@@ -10,12 +10,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/project"
+	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
@@ -24,14 +25,14 @@ import (
 )
 
 func TestGenerateAPIKey(t *testing.T) {
-	apiKey, err := GenerateAPIKey()
+	apiKey, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 	require.NotEmpty(t, apiKey)
 	require.True(t, len(apiKey) > 3)
 	require.Equal(t, "ah-", apiKey[:3])
 
 	// Test that multiple calls produce different keys
-	apiKey2, err := GenerateAPIKey()
+	apiKey2, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 	require.NotEqual(t, apiKey, apiKey2)
 }
@@ -42,13 +43,14 @@ func setupTestAPIKeyService(t *testing.T, cacheConfig xcache.Config) (*APIKeySer
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=1")
 
 	projectService := &ProjectService{
-		ProjectCache: xcache.NewFromConfig[ent.Project](cacheConfig),
+		ProjectCache: xcache.NewFromConfig[xcache.Entry[ent.Project]](cacheConfig),
 	}
 
 	apiKeyService := NewAPIKeyService(APIKeyServiceParams{
 		CacheConfig:    cacheConfig,
 		Ent:            client,
 		ProjectService: projectService,
+		KeyPrefix:      "ah",
 	})
 
 	return apiKeyService, client
@@ -64,7 +66,7 @@ func TestAPIKeyService_GetAPIKey(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	hashedPassword, err := HashPassword("test-password")
@@ -91,7 +93,7 @@ func TestAPIKeyService_GetAPIKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate API key
-	apiKeyString, err := GenerateAPIKey()
+	apiKeyString, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 
 	// Create API key in database
@@ -180,7 +182,7 @@ func TestAPIKeyService_GetAPIKey_WithDifferentCaches(t *testing.T) {
 
 			ctx := context.Background()
 			ctx = ent.NewContext(ctx, client)
-			ctx = privacy.DecisionContext(ctx, privacy.Allow)
+			ctx = authz.WithTestBypass(ctx)
 
 			// Create test user
 			hashedPassword, err := HashPassword("test-password")
@@ -207,7 +209,7 @@ func TestAPIKeyService_GetAPIKey_WithDifferentCaches(t *testing.T) {
 			require.NoError(t, err)
 
 			// Generate and create API key
-			apiKeyString, err := GenerateAPIKey()
+			apiKeyString, err := GenerateAPIKey("ah")
 			require.NoError(t, err)
 
 			apiKey, err := client.APIKey.Create().
@@ -234,7 +236,7 @@ func TestAPIKeyService_GetAPIKey_WithDifferentCaches(t *testing.T) {
 
 			// Update API key to invalidate cache
 			_, err = apiKeyService.UpdateAPIKey(ctx, apiKey.ID, ent.UpdateAPIKeyInput{
-				Name: stringPtr("Updated API Key"),
+				Name: new("Updated API Key"),
 			})
 			require.NoError(t, err)
 
@@ -248,10 +250,6 @@ func TestAPIKeyService_GetAPIKey_WithDifferentCaches(t *testing.T) {
 	}
 }
 
-func stringPtr(s string) *string {
-	return &s
-}
-
 func TestAPIKeyService_UpdateAPIKeyProfiles(t *testing.T) {
 	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
 	defer apiKeyService.Stop()
@@ -259,7 +257,7 @@ func TestAPIKeyService_UpdateAPIKeyProfiles(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create test user
 	hashedPassword, err := HashPassword("test-password")
@@ -441,6 +439,42 @@ func TestAPIKeyService_UpdateAPIKeyProfiles(t *testing.T) {
 		require.Contains(t, err.Error(), "does not exist in the profiles list")
 	})
 
+	t.Run("Invalid channel tags match mode", func(t *testing.T) {
+		profiles := objects.APIKeyProfiles{
+			ActiveProfile: "production",
+			Profiles: []objects.APIKeyProfile{
+				{
+					Name:                 "production",
+					ChannelTags:          []string{"official"},
+					ChannelTagsMatchMode: objects.ChannelTagsMatchMode("invalid"),
+				},
+			},
+		}
+
+		_, err := apiKeyService.UpdateAPIKeyProfiles(ctx, apiKey.ID, profiles)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "channelTagsMatchMode is invalid")
+	})
+
+	t.Run("Channel tags match mode none is valid", func(t *testing.T) {
+		profiles := objects.APIKeyProfiles{
+			ActiveProfile: "production",
+			Profiles: []objects.APIKeyProfile{
+				{
+					Name:                 "production",
+					ChannelTags:          []string{"official"},
+					ChannelTagsMatchMode: objects.ChannelTagsMatchModeNone,
+				},
+			},
+		}
+
+		updatedAPIKey, err := apiKeyService.UpdateAPIKeyProfiles(ctx, apiKey.ID, profiles)
+		require.NoError(t, err)
+		require.NotNil(t, updatedAPIKey)
+		require.NotNil(t, updatedAPIKey.Profiles)
+		require.Equal(t, objects.ChannelTagsMatchModeNone, updatedAPIKey.Profiles.Profiles[0].ChannelTagsMatchMode)
+	})
+
 	t.Run("Multiple profiles with unique names", func(t *testing.T) {
 		profiles := objects.APIKeyProfiles{
 			ActiveProfile: "staging",
@@ -482,7 +516,7 @@ func TestAPIKeyService_BulkEnableAPIKeys(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	hashedPassword, err := HashPassword("test-password")
 	require.NoError(t, err)
@@ -601,7 +635,7 @@ func TestAPIKeyService_BulkDisableAPIKeys(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	hashedPassword, err := HashPassword("test-password")
 	require.NoError(t, err)
@@ -711,7 +745,7 @@ func TestAPIKeyService_BulkArchiveAPIKeys(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	hashedPassword, err := HashPassword("test-password")
 	require.NoError(t, err)
@@ -824,7 +858,7 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	hashedPassword, err := HashPassword("test-password")
 	require.NoError(t, err)
@@ -885,6 +919,40 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 		require.Len(t, apiKey.Scopes, 2)
 	})
 
+	t.Run("non-admin cannot create project type API key", func(t *testing.T) {
+		developerRole, err := client.Role.Create().
+			SetName("Developer").
+			SetLevel(role.LevelProject).
+			SetProjectID(testProject.ID).
+			SetScopes([]string{"write_api_keys"}).
+			Save(ctx)
+		require.NoError(t, err)
+		nonAdmin, err := client.User.Create().
+			SetEmail(fmt.Sprintf("developer-%d@example.com", time.Now().UnixNano())).
+			SetPassword("password").
+			SetStatus(user.StatusActivated).
+			Save(ctx)
+		require.NoError(t, err)
+		_, err = client.UserProject.Create().SetUserID(nonAdmin.ID).SetProjectID(testProject.ID).Save(ctx)
+		require.NoError(t, err)
+		_, err = client.UserRole.Create().SetUserID(nonAdmin.ID).SetRoleID(developerRole.ID).Save(ctx)
+		require.NoError(t, err)
+
+		projectType := apikey.TypeUser
+		_, err = apiKeyService.CreateAPIKey(contexts.WithUser(ctx, nonAdmin), ent.CreateAPIKeyInput{
+			Name:      "Developer Project API Key",
+			ProjectID: testProject.ID,
+			Type:      &projectType,
+		})
+		require.ErrorContains(t, err, "project API keys require project admin permissions")
+
+		_, err = apiKeyService.CreateAPIKey(contexts.WithUser(ctx, nonAdmin), ent.CreateAPIKeyInput{
+			Name:      "Developer Default API Key",
+			ProjectID: testProject.ID,
+		})
+		require.ErrorContains(t, err, "project API keys require project admin permissions")
+	})
+
 	t.Run("Create service_account type API key without scopes", func(t *testing.T) {
 		serviceAccountType := apikey.TypeServiceAccount
 		apiKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
@@ -899,9 +967,9 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 		require.Len(t, apiKey.Scopes, 0)
 	})
 
-	t.Run("Create service_account type API key with custom scopes", func(t *testing.T) {
+	t.Run("Create service_account type API key with custom project scopes", func(t *testing.T) {
 		serviceAccountType := apikey.TypeServiceAccount
-		customScopes := []string{"read_channels", "write_channels", "read_channels"}
+		customScopes := []string{"read_requests", "write_requests", "read_api_keys"}
 		apiKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
 			Name:      "Service Account with Scopes",
 			ProjectID: testProject.ID,
@@ -911,11 +979,49 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, apiKey)
 		require.Equal(t, apikey.TypeServiceAccount, apiKey.Type)
-		require.NotNil(t, apiKey.Scopes)
-		require.Len(t, apiKey.Scopes, 3)
-		require.Contains(t, apiKey.Scopes, "read_channels")
-		require.Contains(t, apiKey.Scopes, "write_channels")
-		require.Contains(t, apiKey.Scopes, "read_channels")
+		require.Equal(t, customScopes, apiKey.Scopes)
+	})
+
+	t.Run("project owner cannot grant system-only scopes to service_account key", func(t *testing.T) {
+		serviceAccountType := apikey.TypeServiceAccount
+		_, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
+			Name:      "Service Account with System Scope",
+			ProjectID: testProject.ID,
+			Type:      &serviceAccountType,
+			Scopes:    []string{string(scopes.ScopeReadChannels)},
+		})
+		require.ErrorContains(t, err, "don't possess at system level")
+	})
+
+	t.Run("system owner can grant system-only scopes to service_account key", func(t *testing.T) {
+		systemOwner, err := client.User.Create().
+			SetEmail(fmt.Sprintf("system-owner-%d@example.com", time.Now().UnixNano())).
+			SetPassword("password").
+			SetStatus(user.StatusActivated).
+			SetIsOwner(true).
+			Save(ctx)
+		require.NoError(t, err)
+
+		serviceAccountType := apikey.TypeServiceAccount
+		apiKey, err := apiKeyService.CreateAPIKey(contexts.WithUser(ctx, systemOwner), ent.CreateAPIKeyInput{
+			Name:      "System Owner Service Account",
+			ProjectID: testProject.ID,
+			Type:      &serviceAccountType,
+			Scopes:    []string{string(scopes.ScopeReadChannels)},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{string(scopes.ScopeReadChannels)}, apiKey.Scopes)
+	})
+
+	t.Run("invalid scope is rejected", func(t *testing.T) {
+		serviceAccountType := apikey.TypeServiceAccount
+		_, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
+			Name:      "Service Account with Invalid Scope",
+			ProjectID: testProject.ID,
+			Type:      &serviceAccountType,
+			Scopes:    []string{"not_a_scope"},
+		})
+		require.ErrorContains(t, err, "invalid scope")
 	})
 
 	t.Run("Create user type API key ignores provided scopes", func(t *testing.T) {
@@ -954,12 +1060,12 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 			Name:      "Service Key",
 			ProjectID: testProject.ID,
 			Type:      &serviceAccountType,
-			Scopes:    []string{"read_channels"},
+			Scopes:    []string{"read_requests"},
 		})
 		require.NoError(t, err)
 		require.Equal(t, apikey.TypeServiceAccount, serviceAPIKey.Type)
 		require.Len(t, serviceAPIKey.Scopes, 1)
-		require.Contains(t, serviceAPIKey.Scopes, "read_channels")
+		require.Contains(t, serviceAPIKey.Scopes, "read_requests")
 	})
 
 	t.Run("Verify API key key format is correct for both types", func(t *testing.T) {
@@ -967,7 +1073,7 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 		serviceAccountType := apikey.TypeServiceAccount
 
 		userAPIKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
-			Name:      "User Key",
+			Name:      "User Key for format check",
 			ProjectID: testProject.ID,
 			Type:      &userType,
 		})
@@ -976,7 +1082,7 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 		require.Equal(t, "ah-", userAPIKey.Key[:3])
 
 		serviceAPIKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
-			Name:      "Service Key",
+			Name:      "Service Key for format check",
 			ProjectID: testProject.ID,
 			Type:      &serviceAccountType,
 		})
@@ -987,15 +1093,103 @@ func TestAPIKeyService_CreateAPIKey_Type(t *testing.T) {
 	})
 }
 
+func TestAPIKeyService_UpdateAPIKey_ServiceAccountScopeGrant(t *testing.T) {
+	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer apiKeyService.Stop()
+	defer client.Close()
+
+	setupCtx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+
+	owner, err := client.User.Create().
+		SetEmail(fmt.Sprintf("owner-%d@example.com", time.Now().UnixNano())).
+		SetPassword("password").
+		SetStatus(user.StatusActivated).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	proj, err := client.Project.Create().
+		SetName(uuid.NewString()).
+		SetStatus(project.StatusActive).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	_, err = client.UserProject.Create().
+		SetUserID(owner.ID).
+		SetProjectID(proj.ID).
+		SetIsOwner(true).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	ctx := contexts.WithUser(setupCtx, owner)
+
+	serviceAccountType := apikey.TypeServiceAccount
+	key, err := apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name:      "Service Account Update",
+		ProjectID: proj.ID,
+		Type:      &serviceAccountType,
+		Scopes:    []string{string(scopes.ScopeWriteRequests)},
+	})
+	require.NoError(t, err)
+
+	t.Run("set cannot grant system-only scope", func(t *testing.T) {
+		_, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{
+			Scopes: []string{string(scopes.ScopeReadChannels)},
+		})
+		require.ErrorContains(t, err, "don't possess at system level")
+	})
+
+	t.Run("append cannot grant system-only scope", func(t *testing.T) {
+		_, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{
+			AppendScopes: []string{string(scopes.ScopeReadChannels)},
+		})
+		require.ErrorContains(t, err, "don't possess at system level")
+	})
+
+	t.Run("combined set and append cannot grant system-only scope", func(t *testing.T) {
+		_, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{
+			Scopes:       []string{string(scopes.ScopeWriteRequests)},
+			AppendScopes: []string{string(scopes.ScopeReadChannels)},
+		})
+		require.ErrorContains(t, err, "don't possess at system level")
+	})
+
+	t.Run("append project scope is allowed", func(t *testing.T) {
+		updated, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{
+			AppendScopes: []string{string(scopes.ScopeReadRequests)},
+		})
+		require.NoError(t, err)
+		require.ElementsMatch(t, []string{
+			string(scopes.ScopeWriteRequests),
+			string(scopes.ScopeReadRequests),
+		}, updated.Scopes)
+	})
+
+	t.Run("set project scopes is allowed", func(t *testing.T) {
+		updated, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{
+			Scopes: []string{string(scopes.ScopeReadRequests), string(scopes.ScopeWriteRequests)},
+		})
+		require.NoError(t, err)
+		require.ElementsMatch(t, []string{
+			string(scopes.ScopeReadRequests),
+			string(scopes.ScopeWriteRequests),
+		}, updated.Scopes)
+	})
+
+	t.Run("clear scopes is allowed", func(t *testing.T) {
+		updated, err := apiKeyService.UpdateAPIKey(ctx, key.ID, ent.UpdateAPIKeyInput{ClearScopes: true})
+		require.NoError(t, err)
+		require.Empty(t, updated.Scopes)
+	})
+}
+
 func TestAPIKeyService_CreateLLMAPIKey(t *testing.T) {
 	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
 	defer apiKeyService.Stop()
 	defer client.Close()
 
 	// Setup context with privacy.Allow for data preparation
-	setupCtx := context.Background()
-	setupCtx = ent.NewContext(setupCtx, client)
-	setupCtx = privacy.DecisionContext(setupCtx, privacy.Allow)
+	setupCtx := ent.NewContext(context.Background(), client)
+	setupCtx = authz.WithTestBypass(setupCtx)
 
 	hashedPassword, err := HashPassword("test-password")
 	require.NoError(t, err)
@@ -1017,7 +1211,7 @@ func TestAPIKeyService_CreateLLMAPIKey(t *testing.T) {
 		Save(setupCtx)
 	require.NoError(t, err)
 
-	serviceKey, err := GenerateAPIKey()
+	serviceKey, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 
 	ownerAPIKey, err := client.APIKey.Create().
@@ -1071,4 +1265,665 @@ func TestAPIKeyService_CreateLLMAPIKey(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "deny rule")
 	})
+}
+
+// TestAPIKeyService_NameUniqueness verifies names are unique for a creator in
+// a project, reusable after soft-delete, and occupied by archived keys.
+func TestAPIKeyService_NameUniqueness(t *testing.T) {
+	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer apiKeyService.Stop()
+	defer client.Close()
+
+	setupCtx := ent.NewContext(context.Background(), client)
+	setupCtx = authz.WithTestBypass(setupCtx)
+
+	hashedPassword, err := HashPassword("test-password")
+	require.NoError(t, err)
+
+	ownerUser, err := client.User.Create().
+		SetEmail(fmt.Sprintf("test-%d@example.com", time.Now().UnixNano())).
+		SetPassword(hashedPassword).
+		SetFirstName("Test").
+		SetLastName("User").
+		SetStatus(user.StatusActivated).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	projectName := uuid.NewString()
+	ownerProject, err := client.Project.Create().
+		SetName(projectName).
+		SetDescription(projectName).
+		SetStatus(project.StatusActive).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	serviceKey, err := GenerateAPIKey("ah")
+	require.NoError(t, err)
+
+	ownerAPIKey, err := client.APIKey.Create().
+		SetName("Service Account").
+		SetKey(serviceKey).
+		SetUserID(ownerUser.ID).
+		SetProjectID(ownerProject.ID).
+		SetType(apikey.TypeServiceAccount).
+		SetScopes([]string{string(scopes.ScopeWriteAPIKeys), string(scopes.ScopeReadAPIKeys)}).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	ctx := ent.NewContext(context.Background(), client)
+	ctx = contexts.WithAPIKey(ctx, ownerAPIKey)
+
+	t.Run("allows another creator's private personal name", func(t *testing.T) {
+		otherUser, err := client.User.Create().
+			SetEmail(uuid.NewString() + "@example.com").
+			SetPassword(hashedPassword).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		_, err = client.APIKey.Create().
+			SetName("shared-name").
+			SetKey("ah-other-creator").
+			SetUserID(otherUser.ID).
+			SetProjectID(ownerProject.ID).
+			SetType(apikey.TypePersonal).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		_, err = apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "shared-name")
+		require.NoError(t, err)
+	})
+	t.Run("rejects another creator's non-personal name", func(t *testing.T) {
+		otherUser, err := client.User.Create().
+			SetEmail(uuid.NewString() + "@example.com").
+			SetPassword(hashedPassword).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		otherKeyValue, err := GenerateAPIKey("ah")
+		require.NoError(t, err)
+		otherKey, err := client.APIKey.Create().
+			SetName("Other service account").
+			SetKey(otherKeyValue).
+			SetUserID(otherUser.ID).
+			SetProjectID(ownerProject.ID).
+			SetType(apikey.TypeServiceAccount).
+			SetScopes([]string{string(scopes.ScopeWriteAPIKeys)}).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		otherCtx := contexts.WithAPIKey(ent.NewContext(context.Background(), client), otherKey)
+		_, err = apiKeyService.CreateLLMAPIKey(otherCtx, otherKey, "llm-shared")
+		require.NoError(t, err)
+
+		name := "llm-shared"
+		_, err = apiKeyService.GetForRead(ctx, nil, nil, &name)
+		require.NoError(t, err)
+
+		_, err = apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "llm-shared")
+		require.ErrorContains(t, err, "already exists")
+	})
+	t.Run("non-personal rename ignores private personal names", func(t *testing.T) {
+		otherUser, err := client.User.Create().
+			SetEmail(uuid.NewString() + "@example.com").
+			SetPassword(hashedPassword).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		_, err = client.APIKey.Create().
+			SetName("private-personal-name").
+			SetKey("ah-private-personal-name").
+			SetUserID(otherUser.ID).
+			SetProjectID(ownerProject.ID).
+			SetType(apikey.TypePersonal).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		created, err := apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "rename-source")
+		require.NoError(t, err)
+		privateName := "private-personal-name"
+		_, err = apiKeyService.UpdateAPIKey(ctx, created.ID, ent.UpdateAPIKeyInput{Name: &privateName})
+		require.NoError(t, err)
+	})
+	t.Run("rejects duplicate name for same creator", func(t *testing.T) {
+		_, err := apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "dup-name")
+		require.NoError(t, err)
+
+		_, err = apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "dup-name")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "already exists")
+
+		// Regression: CreateLLMAPIKey inserts the row, then checks the live count
+		// post-insert and returns DuplicateNameError on a collision. Because there
+		// is no DB unique constraint, correctness depends on the enclosing top-level
+		// transaction rolling that insert back. Assert exactly one live key keeps the
+		// name, i.e. the rejected attempt left no extra live row behind.
+		live, err := client.APIKey.Query().
+			Where(apikey.NameEQ("dup-name"), apikey.ProjectIDEQ(ownerProject.ID)).
+			Count(setupCtx)
+		require.NoError(t, err)
+		require.Equal(t, 1, live, "rejected duplicate create must leave no extra live row")
+	})
+
+	t.Run("name reusable after soft-delete", func(t *testing.T) {
+		created, err := apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "reusable")
+		require.NoError(t, err)
+
+		// The SoftDeleteMixin hook turns Delete into setting deleted_at != 0, so the
+		// composite index slot (..., deleted_at = 0) frees up.
+		err = client.APIKey.DeleteOneID(created.ID).Exec(setupCtx)
+		require.NoError(t, err)
+
+		recreated, err := apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "reusable")
+		require.NoError(t, err)
+		require.NotEqual(t, created.ID, recreated.ID)
+	})
+
+	t.Run("archived key still occupies the name", func(t *testing.T) {
+		created, err := apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "archived-name")
+		require.NoError(t, err)
+
+		// Archiving only changes status; deleted_at stays 0, so the name is still taken.
+		_, err = client.APIKey.UpdateOneID(created.ID).
+			SetStatus(apikey.StatusArchived).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		_, err = apiKeyService.CreateLLMAPIKey(ctx, ownerAPIKey, "archived-name")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "already exists")
+	})
+}
+
+func TestAPIKeyService_NameUniquenessForProjectOwner(t *testing.T) {
+	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer apiKeyService.Stop()
+	defer client.Close()
+
+	setupCtx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	owner, err := client.User.Create().
+		SetEmail(uuid.NewString() + "@example.com").
+		SetPassword("password").
+		SetIsOwner(true).
+		Save(setupCtx)
+	require.NoError(t, err)
+	otherUser, err := client.User.Create().
+		SetEmail(uuid.NewString() + "@example.com").
+		SetPassword("password").
+		Save(setupCtx)
+	require.NoError(t, err)
+	project, err := client.Project.Create().
+		SetName(uuid.NewString()).
+		SetStatus(project.StatusActive).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	for _, name := range []string{"codex-high", "renamed"} {
+		_, err = client.APIKey.Create().
+			SetName(name).
+			SetKey("ah-foreign-" + name).
+			SetUserID(otherUser.ID).
+			SetProjectID(project.ID).
+			SetType(apikey.TypePersonal).
+			Save(setupCtx)
+		require.NoError(t, err)
+	}
+
+	ctx := contexts.WithProjectID(ent.NewContext(context.Background(), client), project.ID)
+	ctx = contexts.WithUser(ctx, owner)
+	personal := apikey.TypePersonal
+	created, err := apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "codex-high", ProjectID: project.ID, Type: &personal,
+	})
+	require.NoError(t, err)
+	require.Equal(t, owner.ID, created.UserID)
+	name := "codex-high"
+	_, err = apiKeyService.GetForRead(ctx, nil, nil, &name)
+	require.Error(t, err)
+	byID, err := apiKeyService.GetForRead(ctx, &created.ID, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, created.ID, byID.ID)
+
+	_, err = apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "codex-high", ProjectID: project.ID, Type: &personal,
+	})
+	require.ErrorContains(t, err, "already exists")
+	serviceAccount := apikey.TypeServiceAccount
+	_, err = apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "codex-high", ProjectID: project.ID, Type: &serviceAccount,
+	})
+	require.ErrorContains(t, err, "already exists")
+
+	publicKey, err := apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "public-name", ProjectID: project.ID, Type: &serviceAccount,
+	})
+	require.NoError(t, err)
+	_, err = apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "public-name", ProjectID: project.ID, Type: &personal,
+	})
+	require.ErrorContains(t, err, "already exists")
+
+	otherCtx := contexts.WithProjectID(ent.NewContext(context.Background(), client), project.ID)
+	otherCtx = contexts.WithUser(otherCtx, otherUser)
+	_, occupiedErr := apiKeyService.CreateAPIKey(otherCtx, ent.CreateAPIKeyInput{
+		Name: "public-name", ProjectID: project.ID, Type: &serviceAccount,
+	})
+	_, freeErr := apiKeyService.CreateAPIKey(otherCtx, ent.CreateAPIKeyInput{
+		Name: "unused-name", ProjectID: project.ID, Type: &serviceAccount,
+	})
+	require.Error(t, occupiedErr)
+	require.Error(t, freeErr)
+	require.Equal(t, freeErr.Error(), occupiedErr.Error())
+	require.NotContains(t, occupiedErr.Error(), "already exists")
+
+	foreignKey, err := client.APIKey.Create().
+		SetName("foreign-original").
+		SetKey("ah-foreign-original").
+		SetUserID(otherUser.ID).
+		SetProjectID(project.ID).
+		SetType(apikey.TypePersonal).
+		Save(setupCtx)
+	require.NoError(t, err)
+	foreignDuplicateName := "renamed"
+	_, err = apiKeyService.UpdateAPIKey(ctx, foreignKey.ID, ent.UpdateAPIKeyInput{Name: &foreignDuplicateName})
+	require.ErrorContains(t, err, "already exists")
+	unchangedForeignKey, err := client.APIKey.Get(setupCtx, foreignKey.ID)
+	require.NoError(t, err)
+	require.Equal(t, "foreign-original", unchangedForeignKey.Name)
+
+	toRename, err := apiKeyService.CreateAPIKey(ctx, ent.CreateAPIKeyInput{
+		Name: "original", ProjectID: project.ID, Type: &personal,
+	})
+	require.NoError(t, err)
+	otherName := "renamed"
+	updated, err := apiKeyService.UpdateAPIKey(ctx, toRename.ID, ent.UpdateAPIKeyInput{Name: &otherName})
+	require.NoError(t, err)
+	require.Equal(t, otherName, updated.Name)
+
+	duplicateName := "codex-high"
+	_, err = apiKeyService.UpdateAPIKey(ctx, toRename.ID, ent.UpdateAPIKeyInput{Name: &duplicateName})
+	require.ErrorContains(t, err, "already exists")
+	publicName := "public-name"
+	_, err = apiKeyService.UpdateAPIKey(ctx, toRename.ID, ent.UpdateAPIKeyInput{Name: &publicName})
+	require.ErrorContains(t, err, "already exists")
+	_, err = apiKeyService.UpdateAPIKey(ctx, publicKey.ID, ent.UpdateAPIKeyInput{Name: &duplicateName})
+	require.ErrorContains(t, err, "already exists")
+	unchanged, err := client.APIKey.Get(ctx, toRename.ID)
+	require.NoError(t, err)
+	require.Equal(t, otherName, unchanged.Name)
+}
+
+func TestAPIKeyService_ProjectKeysAreSharedAndPersonalCredentialsArePrivate(t *testing.T) {
+	service, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer client.Close()
+	defer service.Stop()
+	base := ent.NewContext(t.Context(), client)
+	setup := authz.WithTestBypass(base)
+	owner := createOwnerUser(t, setup, client)
+	project := client.Project.Create().SetName("Shared project").SaveX(setup)
+	creator := client.User.Create().SetEmail("creator@test.com").SetPassword("password").SaveX(setup)
+	manager := client.User.Create().SetEmail("manager@test.com").SetPassword("password").SaveX(setup)
+	creator.Edges.ProjectUsers = []*ent.UserProject{client.UserProject.Create().
+		SetUserID(creator.ID).SetProjectID(project.ID).SetScopes([]string{"read_api_keys"}).SaveX(setup)}
+	manager.Edges.ProjectUsers = []*ent.UserProject{client.UserProject.Create().
+		SetUserID(manager.ID).SetProjectID(project.ID).SetIsOwner(true).SaveX(setup)}
+	contextFor := func(caller *ent.User) context.Context {
+		return contexts.WithProjectID(contexts.WithUser(authz.NewUserContext(base, caller.ID), caller), project.ID)
+	}
+
+	shared := client.APIKey.Create().SetUserID(owner.ID).SetProjectID(project.ID).
+		SetType(apikey.TypeUser).SetName("Shared").SetKey("test-shared-key").SaveX(setup)
+	personal := client.APIKey.Create().SetUserID(creator.ID).SetProjectID(project.ID).
+		SetType(apikey.TypePersonal).SetName("Personal").SetKey("test-personal-key").SaveX(setup)
+
+	for _, tc := range []struct {
+		name string
+		user *ent.User
+		key  *ent.APIKey
+		want string
+	}{
+		{"project reader can see shared credential", creator, shared, shared.Key},
+		{"personal creator can see credential", creator, personal, personal.Key},
+		{"project owner sees only personal metadata", manager, personal, ""},
+		{"system owner sees only personal metadata", owner, personal, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := contextFor(tc.user)
+			partial, err := client.APIKey.Query().Where(apikey.IDEQ(tc.key.ID)).Select(apikey.FieldKey).Only(ctx)
+			require.NoError(t, err)
+			got, err := service.RevealAPIKey(ctx, partial)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+
+	_, err := service.RotateAPIKey(contextFor(creator), shared.ID)
+	require.Error(t, err)
+	rotated, err := service.RotateAPIKey(contextFor(manager), shared.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, shared.Key, rotated.Key)
+	_, err = service.RotateAPIKey(contextFor(owner), personal.ID)
+	require.ErrorContains(t, err, "only the personal API key creator")
+	require.Equal(t, personal.Key, client.APIKey.GetX(setup, personal.ID).Key)
+}
+
+func TestAPIKeyService_RotateAPIKey(t *testing.T) {
+	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer apiKeyService.Stop()
+	defer client.Close()
+
+	// Setup context with privacy.Allow for data preparation
+	setupCtx := ent.NewContext(context.Background(), client)
+	setupCtx = authz.WithTestBypass(setupCtx)
+
+	hashedPassword, err := HashPassword("test-password")
+	require.NoError(t, err)
+
+	ownerUser, err := client.User.Create().
+		SetEmail(fmt.Sprintf("test-%d@example.com", time.Now().UnixNano())).
+		SetPassword(hashedPassword).
+		SetFirstName("Test").
+		SetLastName("User").
+		SetStatus(user.StatusActivated).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	projectName := uuid.NewString()
+	testProject, err := client.Project.Create().
+		SetName(projectName).
+		SetDescription(projectName).
+		SetStatus(project.StatusActive).
+		Save(setupCtx)
+	require.NoError(t, err)
+	_, err = client.UserProject.Create().
+		SetUserID(ownerUser.ID).
+		SetProjectID(testProject.ID).
+		SetIsOwner(true).
+		Save(setupCtx)
+	require.NoError(t, err)
+
+	ctxWithUser := contexts.WithUser(setupCtx, ownerUser)
+
+	t.Run("rotate user type API key successfully", func(t *testing.T) {
+		// Create an API key
+		originalKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
+			Name:      "Key to Rotate",
+			ProjectID: testProject.ID,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, originalKey)
+
+		originalKeyValue := originalKey.Key
+		originalID := originalKey.ID
+		originalName := originalKey.Name
+		originalType := originalKey.Type
+		originalScopes := originalKey.Scopes
+
+		// Rotate the API key
+		rotatedKey, err := apiKeyService.RotateAPIKey(ctxWithUser, originalID)
+		require.NoError(t, err)
+		require.NotNil(t, rotatedKey)
+
+		// Verify the key has changed
+		require.NotEqual(t, originalKeyValue, rotatedKey.Key)
+		require.NotEmpty(t, rotatedKey.Key)
+
+		// Verify ID and other properties are preserved
+		require.Equal(t, originalID, rotatedKey.ID)
+		require.Equal(t, originalName, rotatedKey.Name)
+		require.Equal(t, originalType, rotatedKey.Type)
+		require.Equal(t, originalScopes, rotatedKey.Scopes)
+		require.Equal(t, testProject.ID, rotatedKey.ProjectID)
+		require.Equal(t, ownerUser.ID, rotatedKey.UserID)
+
+		// Verify the old key is no longer valid
+		_, err = apiKeyService.GetAPIKey(ctxWithUser, originalKeyValue)
+		require.Error(t, err)
+
+		// Verify the new key is valid
+		fetchedKey, err := apiKeyService.GetAPIKey(ctxWithUser, rotatedKey.Key)
+		require.NoError(t, err)
+		require.Equal(t, rotatedKey.ID, fetchedKey.ID)
+	})
+
+	t.Run("rotate service account type API key successfully", func(t *testing.T) {
+		serviceAccountType := apikey.TypeServiceAccount
+		customScopes := []string{"read_requests", "write_requests"}
+
+		// Create a service account API key
+		originalKey, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
+			Name:      "Service Key to Rotate",
+			ProjectID: testProject.ID,
+			Type:      &serviceAccountType,
+			Scopes:    customScopes,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, originalKey)
+
+		originalKeyValue := originalKey.Key
+		originalID := originalKey.ID
+
+		// Rotate the API key
+		rotatedKey, err := apiKeyService.RotateAPIKey(ctxWithUser, originalID)
+		require.NoError(t, err)
+		require.NotNil(t, rotatedKey)
+
+		// Verify the key has changed but properties are preserved
+		require.NotEqual(t, originalKeyValue, rotatedKey.Key)
+		require.Equal(t, originalID, rotatedKey.ID)
+		require.Equal(t, apikey.TypeServiceAccount, rotatedKey.Type)
+		require.Equal(t, customScopes, rotatedKey.Scopes)
+	})
+
+	t.Run("cannot rotate a service account key carrying system scopes", func(t *testing.T) {
+		// A key minted by a system owner may carry a system-only scope. A
+		// project owner must not be able to rotate it into a usable key.
+		escalated, err := client.APIKey.Create().
+			SetName("Escalated Service Key").
+			SetKey("ah-escalated-rotate").
+			SetUserID(ownerUser.ID).
+			SetProjectID(testProject.ID).
+			SetType(apikey.TypeServiceAccount).
+			SetStatus(apikey.StatusEnabled).
+			SetScopes([]string{string(scopes.ScopeReadChannels)}).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		_, err = apiKeyService.RotateAPIKey(ctxWithUser, escalated.ID)
+		require.ErrorContains(t, err, "don't possess at system level")
+	})
+
+	t.Run("cannot rotate noauth type API key", func(t *testing.T) {
+		// Create a noauth API key directly
+		noauthKey, err := client.APIKey.Create().
+			SetName("No Auth Key").
+			SetKey("test-noauth-key-for-rotation").
+			SetUserID(ownerUser.ID).
+			SetProjectID(testProject.ID).
+			SetType(apikey.TypeNoauth).
+			SetStatus(apikey.StatusEnabled).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		// Try to rotate the noauth key
+		_, err = apiKeyService.RotateAPIKey(ctxWithUser, noauthKey.ID)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "noauth type API key cannot be rotated")
+	})
+
+	t.Run("rotate non-existent API key returns error", func(t *testing.T) {
+		_, err := apiKeyService.RotateAPIKey(ctxWithUser, 999999)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to get API key")
+	})
+
+	t.Run("cannot rotate API key from different project", func(t *testing.T) {
+		// Create another project
+		anotherProject, err := client.Project.Create().
+			SetName(uuid.NewString()).
+			SetDescription("Another Project").
+			SetStatus(project.StatusActive).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		// Create another user
+		anotherUser, err := client.User.Create().
+			SetEmail(fmt.Sprintf("another-%d@example.com", time.Now().UnixNano())).
+			SetPassword(hashedPassword).
+			SetFirstName("Another").
+			SetLastName("User").
+			SetStatus(user.StatusActivated).
+			Save(setupCtx)
+		require.NoError(t, err)
+
+		// Create an API key in the original project
+		apiKeyInProjectA, err := apiKeyService.CreateAPIKey(ctxWithUser, ent.CreateAPIKeyInput{
+			Name:      "Key in Project A",
+			ProjectID: testProject.ID,
+		})
+		require.NoError(t, err)
+
+		// Create a context for another user without test bypass
+		anotherUserCtx := ent.NewContext(context.Background(), client)
+		anotherUserCtx = contexts.WithUser(anotherUserCtx, anotherUser)
+		anotherUserCtx = contexts.WithProjectID(anotherUserCtx, anotherProject.ID)
+
+		// Try to rotate the API key from project A using project B user's context
+		_, err = apiKeyService.RotateAPIKey(anotherUserCtx, apiKeyInProjectA.ID)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to get API key")
+	})
+}
+
+func TestValidateAllowedIPs(t *testing.T) {
+	tests := []struct {
+		name    string
+		ips     []string
+		wantErr bool
+	}{
+		{
+			name:    "empty list valid",
+			ips:     []string{},
+			wantErr: false,
+		},
+		{
+			name:    "valid ipv4",
+			ips:     []string{"192.168.1.1"},
+			wantErr: false,
+		},
+		{
+			name:    "valid ipv4 cidr",
+			ips:     []string{"192.168.1.0/24"},
+			wantErr: false,
+		},
+		{
+			name:    "valid ipv6",
+			ips:     []string{"2001:db8::1"},
+			wantErr: false,
+		},
+		{
+			name:    "valid ipv6 cidr",
+			ips:     []string{"2001:db8::/32"},
+			wantErr: false,
+		},
+		{
+			name:    "valid mixed entries",
+			ips:     []string{"10.0.0.0/8", "192.168.1.1", "2001:db8::/32"},
+			wantErr: false,
+		},
+		{
+			name:    "invalid ip address",
+			ips:     []string{"not-an-ip"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid cidr prefix",
+			ips:     []string{"192.168.1.0/33"},
+			wantErr: true,
+		},
+		{
+			name:    "valid and invalid mixed",
+			ips:     []string{"192.168.1.0/24", "bad-ip"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAllowedIPs(tt.ips)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKeyProfiles_PersonalKeyGuard(t *testing.T) {
+	apiKeyService, client := setupTestAPIKeyService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer apiKeyService.Stop()
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	hashedPassword, err := HashPassword("test-password")
+	require.NoError(t, err)
+
+	newUser := func(firstName string, isOwner bool) *ent.User {
+		u, err := client.User.Create().
+			SetEmail(fmt.Sprintf("%s-%d@example.com", firstName, time.Now().UnixNano())).
+			SetPassword(hashedPassword).
+			SetFirstName(firstName).
+			SetLastName("User").
+			SetIsOwner(isOwner).
+			SetStatus(user.StatusActivated).
+			Save(ctx)
+		require.NoError(t, err)
+		return u
+	}
+
+	creator := newUser("Creator", false)
+	otherUser := newUser("Other", false)
+	ownerUser := newUser("Owner", true)
+
+	testProject, err := client.Project.Create().
+		SetName(uuid.NewString()).
+		SetDescription("test").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	apiKey, err := client.APIKey.Create().
+		SetName("personal-key").
+		SetKey(fmt.Sprintf("ah-test-%d", time.Now().UnixNano())).
+		SetUserID(creator.ID).
+		SetProjectID(testProject.ID).
+		SetType(apikey.TypePersonal).
+		Save(ctx)
+	require.NoError(t, err)
+
+	profiles := objects.APIKeyProfiles{
+		ActiveProfile: "production",
+		Profiles: []objects.APIKeyProfile{
+			{
+				Name:          "production",
+				ModelMappings: []objects.ModelMapping{{From: "gpt-4", To: "claude-3"}},
+			},
+		},
+	}
+
+	// A regular user cannot modify someone else's personal key.
+	_, err = apiKeyService.UpdateAPIKeyProfiles(contexts.WithUser(ctx, otherUser), apiKey.ID, profiles)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "personal API key can only be modified by its creator or a system owner")
+
+	// The creator can.
+	_, err = apiKeyService.UpdateAPIKeyProfiles(contexts.WithUser(ctx, creator), apiKey.ID, profiles)
+	require.NoError(t, err)
+
+	// A system owner can too.
+	_, err = apiKeyService.UpdateAPIKeyProfiles(contexts.WithUser(ctx, ownerUser), apiKey.ID, profiles)
+	require.NoError(t, err)
 }

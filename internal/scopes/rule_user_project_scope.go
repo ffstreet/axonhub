@@ -7,10 +7,42 @@ import (
 	"entgo.io/ent/entql"
 	"github.com/samber/lo"
 
+	"github.com/looplj/axonhub/internal/authz/identity"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/privacy"
+	"github.com/looplj/axonhub/internal/ent/role"
+	entuser "github.com/looplj/axonhub/internal/ent/user"
+	"github.com/looplj/axonhub/internal/ent/userproject"
 )
+
+// UserRoleReadRule protects role assignments when reached directly or via an edge.
+func UserRoleReadRule() privacy.QueryRule {
+	return privacy.FilterFunc(func(ctx context.Context, q privacy.Filter) error {
+		caller, err := getUserFromContext(ctx)
+		if err != nil {
+			return err
+		}
+		systemUsers := EffectiveSystemScope(ctx, caller, ScopeReadUsers)
+		systemRoles := EffectiveSystemScope(ctx, caller, ScopeReadRoles)
+		if systemUsers && systemRoles {
+			return privacy.Allow
+		}
+		projectID, ok := contexts.GetProjectID(ctx)
+		if !ok || projectID <= 0 ||
+			(!systemUsers && !EffectiveProjectScope(ctx, caller, projectID, ScopeReadUsers)) ||
+			(!systemRoles && !EffectiveProjectScope(ctx, caller, projectID, ScopeReadRoles)) {
+			return privacy.Denyf("role assignments require user and role read access")
+		}
+		filter, ok := q.(*ent.UserRoleFilter)
+		if !ok {
+			return privacy.Denyf("role assignment query cannot be scoped")
+		}
+		filter.WhereHasRoleWith(role.ProjectIDEQ(projectID))
+		filter.WhereHasUserWith(entuser.HasProjectUsersWith(userproject.ProjectIDEQ(projectID)))
+		return privacy.Allow
+	})
+}
 
 type ProjectOwnedFilter interface {
 	WhereProjectID(entql.IntP)
@@ -50,6 +82,81 @@ func userHasProjectScope(user *ent.User, projectID int, requiredScope ScopeSlug)
 	return false
 }
 
+// userIsProjectOwner reports whether a user owns the given project or the system.
+func userIsProjectOwner(user *ent.User, projectID int) bool {
+	if user.IsOwner {
+		return true
+	}
+
+	for _, membership := range user.Edges.ProjectUsers {
+		if membership.ProjectID == projectID && membership.IsOwner {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ProjectOwnerReadUsersRule allows project owners to view users belonging to their current project.
+func ProjectOwnerReadUsersRule() privacy.QueryRule {
+	return privacy.FilterFunc(func(ctx context.Context, q privacy.Filter) error {
+		projectID, hasProjectID := contexts.GetProjectID(ctx)
+		if !hasProjectID {
+			return privacy.Skipf("Project ID not found in context")
+		}
+
+		currentUser, err := getUserFromContext(ctx)
+		if err != nil {
+			return privacy.Skipf("User not found in context")
+		}
+
+		if identity.IsPlugin(ctx) || !userIsProjectOwner(currentUser, projectID) {
+			return privacy.Skipf("User %d is not an owner of project %d", currentUser.ID, projectID)
+		}
+
+		userFilter, ok := q.(*ent.UserFilter)
+		if !ok {
+			return privacy.Skipf("Not a user query")
+		}
+
+		userFilter.WhereHasProjectUsersWith(userproject.ProjectID(projectID))
+		return privacy.Allowf("Project owner %d can query users in project %d", currentUser.ID, projectID)
+	})
+}
+
+// ProjectMemberReadUsersRule allows project members to view users belonging to
+// their current project when they hold the required scope on that project.
+// Users with the scope at system level keep their current unrestricted view.
+func ProjectMemberReadUsersRule(requiredScope ScopeSlug) privacy.QueryRule {
+	return privacy.FilterFunc(func(ctx context.Context, q privacy.Filter) error {
+		projectID, hasProjectID := contexts.GetProjectID(ctx)
+		if !hasProjectID {
+			return privacy.Skipf("Project ID not found in context")
+		}
+
+		currentUser, err := getUserFromContext(ctx)
+		if err != nil {
+			return privacy.Skipf("User not found in context")
+		}
+
+		userFilter, ok := q.(*ent.UserFilter)
+		if !ok {
+			return privacy.Skipf("Not a user query")
+		}
+
+		if EffectiveSystemScope(ctx, currentUser, requiredScope) {
+			return privacy.Allowf("User %d has system scope %s, querying users", currentUser.ID, requiredScope)
+		}
+
+		if !EffectiveProjectScope(ctx, currentUser, projectID, requiredScope) {
+			return privacy.Skipf("User %d can not query users in project %d with scope %s", currentUser.ID, requiredScope, requiredScope)
+		}
+
+		userFilter.WhereHasProjectUsersWith(userproject.ProjectID(projectID))
+		return privacy.Allowf("User %d can query users in project %d with scope %s", currentUser.ID, projectID, requiredScope)
+	})
+}
+
 // UserProjectScopeReadRule allows users to query projects they are members of.
 // It checks:
 // 1. If user has global scope permission -> Allow all
@@ -68,13 +175,17 @@ func projectMemberQueryFilter(requiredScope ScopeSlug) func(ctx context.Context,
 
 		currentUser, err := getUserFromContext(ctx)
 		if err != nil {
-			return err
+			// Skip (not Deny) when no user is in context — mirrors
+			// UserProjectScopeWriteRule's convention so non-user principals
+			// (e.g. OpenAPI service account API keys) can fall through to
+			// APIKeyProjectScopeReadRule instead of being hard-denied here.
+			return privacy.Skipf("User not found in context")
 		}
 
 		switch q := q.(type) {
 		case ProjectOwnedFilter:
 			// Check if user has global scope permission or project scope permission.
-			if !userHasSystemScope(currentUser, requiredScope) && !userHasProjectScope(currentUser, projectID, requiredScope) {
+			if !EffectiveSystemScope(ctx, currentUser, requiredScope) && !EffectiveProjectScope(ctx, currentUser, projectID, requiredScope) {
 				return privacy.Skipf("User %d can not query project %d with scope %s", currentUser.ID, projectID, requiredScope)
 			}
 
@@ -82,7 +193,7 @@ func projectMemberQueryFilter(requiredScope ScopeSlug) func(ctx context.Context,
 
 			return privacy.Allowf("User %d can query project %d with scope %s", currentUser.ID, projectID, requiredScope)
 		case *ent.ProjectFilter:
-			if !userHasSystemScope(currentUser, requiredScope) && !userHasProjectScope(currentUser, projectID, requiredScope) {
+			if !EffectiveSystemScope(ctx, currentUser, requiredScope) && !EffectiveProjectScope(ctx, currentUser, projectID, requiredScope) {
 				return privacy.Skipf("User %d can not query project %d with scope %s", currentUser.ID, projectID, requiredScope)
 			}
 
@@ -116,6 +227,10 @@ func (r projectMemberMutationRule) EvalMutation(ctx context.Context, m ent.Mutat
 		return privacy.Skipf("User not found in context")
 	}
 
+	if EffectiveSystemScope(ctx, user, r.requiredScope) {
+		return privacy.Allowf("User %d has system scope %s, allowing mutation", user.ID, r.requiredScope)
+	}
+
 	// For mutations, check project membership
 	switch mutation := m.(type) {
 	case ProjectOwnedMutation:
@@ -124,7 +239,7 @@ func (r projectMemberMutationRule) EvalMutation(ctx context.Context, m ent.Mutat
 			return privacy.Skipf("Project ID not found in context")
 		}
 
-		if !userHasSystemScope(user, r.requiredScope) && !userHasProjectScope(user, projectID, r.requiredScope) {
+		if !EffectiveSystemScope(ctx, user, r.requiredScope) && !EffectiveProjectScope(ctx, user, projectID, r.requiredScope) {
 			return privacy.Skipf("User %d can not modify resources in project %d with scope %s", user.ID, projectID, r.requiredScope)
 		}
 
@@ -157,7 +272,7 @@ func (r projectMemberMutationRule) EvalMutation(ctx context.Context, m ent.Mutat
 		}
 	case *ent.ProjectMutation:
 		// Check if user has global scope permission
-		if userHasSystemScope(user, r.requiredScope) {
+		if EffectiveSystemScope(ctx, user, r.requiredScope) {
 			return privacy.Allowf("User %d can create project", user.ID)
 		}
 
@@ -170,7 +285,7 @@ func (r projectMemberMutationRule) EvalMutation(ctx context.Context, m ent.Mutat
 			return privacy.Skipf("Project ID not found")
 		}
 
-		if userHasProjectScope(user, mProjectID, r.requiredScope) {
+		if EffectiveProjectScope(ctx, user, mProjectID, r.requiredScope) {
 			return privacy.Allowf("User %d can modify project %d", user.ID, mProjectID)
 		}
 

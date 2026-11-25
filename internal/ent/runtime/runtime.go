@@ -7,16 +7,28 @@ import (
 	"time"
 
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/channelmodelpriceversion"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/oidcidentity"
+	"github.com/looplj/axonhub/internal/ent/plugin"
+	"github.com/looplj/axonhub/internal/ent/pluginschedule"
+	"github.com/looplj/axonhub/internal/ent/pluginschedulerun"
+	"github.com/looplj/axonhub/internal/ent/pluginstorage"
+	"github.com/looplj/axonhub/internal/ent/plugintableoperation"
+	"github.com/looplj/axonhub/internal/ent/plugintablestorage"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
+	"github.com/looplj/axonhub/internal/ent/promptprotectionrule"
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/ent/requestbodychunk"
+	"github.com/looplj/axonhub/internal/ent/requestbodychunkref"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/ent/schema"
@@ -84,6 +96,53 @@ func init() {
 	apikeyDescProfiles := apikeyFields[7].Descriptor()
 	// apikey.DefaultProfiles holds the default value on creation for the profiles field.
 	apikey.DefaultProfiles = apikeyDescProfiles.Default.(*objects.APIKeyProfiles)
+	// apikeyDescAllowedIps is the schema descriptor for allowed_ips field.
+	apikeyDescAllowedIps := apikeyFields[8].Descriptor()
+	// apikey.DefaultAllowedIps holds the default value on creation for the allowed_ips field.
+	apikey.DefaultAllowedIps = apikeyDescAllowedIps.Default.([]string)
+	apikeyprofiletemplateMixin := schema.APIKeyProfileTemplate{}.Mixin()
+	apikeyprofiletemplate.Policy = privacy.NewPolicies(schema.APIKeyProfileTemplate{})
+	apikeyprofiletemplate.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := apikeyprofiletemplate.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	apikeyprofiletemplateMixinHooks1 := apikeyprofiletemplateMixin[1].Hooks()
+
+	apikeyprofiletemplate.Hooks[1] = apikeyprofiletemplateMixinHooks1[0]
+	apikeyprofiletemplateMixinInters1 := apikeyprofiletemplateMixin[1].Interceptors()
+	apikeyprofiletemplate.Interceptors[0] = apikeyprofiletemplateMixinInters1[0]
+	apikeyprofiletemplateMixinFields0 := apikeyprofiletemplateMixin[0].Fields()
+	_ = apikeyprofiletemplateMixinFields0
+	apikeyprofiletemplateMixinFields1 := apikeyprofiletemplateMixin[1].Fields()
+	_ = apikeyprofiletemplateMixinFields1
+	apikeyprofiletemplateFields := schema.APIKeyProfileTemplate{}.Fields()
+	_ = apikeyprofiletemplateFields
+	// apikeyprofiletemplateDescCreatedAt is the schema descriptor for created_at field.
+	apikeyprofiletemplateDescCreatedAt := apikeyprofiletemplateMixinFields0[0].Descriptor()
+	// apikeyprofiletemplate.DefaultCreatedAt holds the default value on creation for the created_at field.
+	apikeyprofiletemplate.DefaultCreatedAt = apikeyprofiletemplateDescCreatedAt.Default.(func() time.Time)
+	// apikeyprofiletemplateDescUpdatedAt is the schema descriptor for updated_at field.
+	apikeyprofiletemplateDescUpdatedAt := apikeyprofiletemplateMixinFields0[1].Descriptor()
+	// apikeyprofiletemplate.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	apikeyprofiletemplate.DefaultUpdatedAt = apikeyprofiletemplateDescUpdatedAt.Default.(func() time.Time)
+	// apikeyprofiletemplate.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	apikeyprofiletemplate.UpdateDefaultUpdatedAt = apikeyprofiletemplateDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// apikeyprofiletemplateDescDeletedAt is the schema descriptor for deleted_at field.
+	apikeyprofiletemplateDescDeletedAt := apikeyprofiletemplateMixinFields1[0].Descriptor()
+	// apikeyprofiletemplate.DefaultDeletedAt holds the default value on creation for the deleted_at field.
+	apikeyprofiletemplate.DefaultDeletedAt = apikeyprofiletemplateDescDeletedAt.Default.(int)
+	// apikeyprofiletemplateDescDescription is the schema descriptor for description field.
+	apikeyprofiletemplateDescDescription := apikeyprofiletemplateFields[1].Descriptor()
+	// apikeyprofiletemplate.DefaultDescription holds the default value on creation for the description field.
+	apikeyprofiletemplate.DefaultDescription = apikeyprofiletemplateDescDescription.Default.(string)
+	// apikeyprofiletemplateDescProfile is the schema descriptor for profile field.
+	apikeyprofiletemplateDescProfile := apikeyprofiletemplateFields[3].Descriptor()
+	// apikeyprofiletemplate.DefaultProfile holds the default value on creation for the profile field.
+	apikeyprofiletemplate.DefaultProfile = apikeyprofiletemplateDescProfile.Default.(*objects.APIKeyProfile)
 	channelMixin := schema.Channel{}.Mixin()
 	channel.Policy = privacy.NewPolicies(schema.Channel{})
 	channel.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -123,26 +182,38 @@ func init() {
 	channelDescDisabledAPIKeys := channelFields[5].Descriptor()
 	// channel.DefaultDisabledAPIKeys holds the default value on creation for the disabled_api_keys field.
 	channel.DefaultDisabledAPIKeys = channelDescDisabledAPIKeys.Default.([]objects.DisabledAPIKey)
+	// channelDescManualModels is the schema descriptor for manual_models field.
+	channelDescManualModels := channelFields[7].Descriptor()
+	// channel.DefaultManualModels holds the default value on creation for the manual_models field.
+	channel.DefaultManualModels = channelDescManualModels.Default.([]string)
 	// channelDescAutoSyncSupportedModels is the schema descriptor for auto_sync_supported_models field.
-	channelDescAutoSyncSupportedModels := channelFields[7].Descriptor()
+	channelDescAutoSyncSupportedModels := channelFields[8].Descriptor()
 	// channel.DefaultAutoSyncSupportedModels holds the default value on creation for the auto_sync_supported_models field.
 	channel.DefaultAutoSyncSupportedModels = channelDescAutoSyncSupportedModels.Default.(bool)
+	// channelDescAutoSyncModelPattern is the schema descriptor for auto_sync_model_pattern field.
+	channelDescAutoSyncModelPattern := channelFields[9].Descriptor()
+	// channel.DefaultAutoSyncModelPattern holds the default value on creation for the auto_sync_model_pattern field.
+	channel.DefaultAutoSyncModelPattern = channelDescAutoSyncModelPattern.Default.(string)
 	// channelDescTags is the schema descriptor for tags field.
-	channelDescTags := channelFields[8].Descriptor()
+	channelDescTags := channelFields[10].Descriptor()
 	// channel.DefaultTags holds the default value on creation for the tags field.
 	channel.DefaultTags = channelDescTags.Default.([]string)
 	// channelDescPolicies is the schema descriptor for policies field.
-	channelDescPolicies := channelFields[10].Descriptor()
+	channelDescPolicies := channelFields[12].Descriptor()
 	// channel.DefaultPolicies holds the default value on creation for the policies field.
 	channel.DefaultPolicies = channelDescPolicies.Default.(objects.ChannelPolicies)
 	// channelDescSettings is the schema descriptor for settings field.
-	channelDescSettings := channelFields[11].Descriptor()
+	channelDescSettings := channelFields[13].Descriptor()
 	// channel.DefaultSettings holds the default value on creation for the settings field.
 	channel.DefaultSettings = channelDescSettings.Default.(*objects.ChannelSettings)
 	// channelDescOrderingWeight is the schema descriptor for ordering_weight field.
-	channelDescOrderingWeight := channelFields[12].Descriptor()
+	channelDescOrderingWeight := channelFields[14].Descriptor()
 	// channel.DefaultOrderingWeight holds the default value on creation for the ordering_weight field.
 	channel.DefaultOrderingWeight = channelDescOrderingWeight.Default.(int)
+	// channelDescEndpoints is the schema descriptor for endpoints field.
+	channelDescEndpoints := channelFields[19].Descriptor()
+	// channel.DefaultEndpoints holds the default value on creation for the endpoints field.
+	channel.DefaultEndpoints = channelDescEndpoints.Default.([]objects.ChannelEndpoint)
 	channelmodelpriceMixin := schema.ChannelModelPrice{}.Mixin()
 	channelmodelprice.Policy = privacy.NewPolicies(schema.ChannelModelPrice{})
 	channelmodelprice.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -244,7 +315,7 @@ func init() {
 	// channeloverridetemplateDescOverrideParameters is the schema descriptor for override_parameters field.
 	channeloverridetemplateDescOverrideParameters := channeloverridetemplateFields[3].Descriptor()
 	// channeloverridetemplate.DefaultOverrideParameters holds the default value on creation for the override_parameters field.
-	channeloverridetemplate.DefaultOverrideParameters = channeloverridetemplateDescOverrideParameters.Default.(string)
+	channeloverridetemplate.DefaultOverrideParameters = channeloverridetemplateDescOverrideParameters.Default.(func() string)
 	// channeloverridetemplateDescOverrideHeaders is the schema descriptor for override_headers field.
 	channeloverridetemplateDescOverrideHeaders := channeloverridetemplateFields[4].Descriptor()
 	// channeloverridetemplate.DefaultOverrideHeaders holds the default value on creation for the override_headers field.
@@ -296,6 +367,49 @@ func init() {
 	datastorageDescPrimary := datastorageFields[2].Descriptor()
 	// datastorage.DefaultPrimary holds the default value on creation for the primary field.
 	datastorage.DefaultPrimary = datastorageDescPrimary.Default.(bool)
+	invitationMixin := schema.Invitation{}.Mixin()
+	invitation.Policy = privacy.NewPolicies(schema.Invitation{})
+	invitation.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := invitation.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	invitationMixinHooks1 := invitationMixin[1].Hooks()
+
+	invitation.Hooks[1] = invitationMixinHooks1[0]
+	invitationMixinInters1 := invitationMixin[1].Interceptors()
+	invitation.Interceptors[0] = invitationMixinInters1[0]
+	invitationMixinFields0 := invitationMixin[0].Fields()
+	_ = invitationMixinFields0
+	invitationMixinFields1 := invitationMixin[1].Fields()
+	_ = invitationMixinFields1
+	invitationFields := schema.Invitation{}.Fields()
+	_ = invitationFields
+	// invitationDescCreatedAt is the schema descriptor for created_at field.
+	invitationDescCreatedAt := invitationMixinFields0[0].Descriptor()
+	// invitation.DefaultCreatedAt holds the default value on creation for the created_at field.
+	invitation.DefaultCreatedAt = invitationDescCreatedAt.Default.(func() time.Time)
+	// invitationDescUpdatedAt is the schema descriptor for updated_at field.
+	invitationDescUpdatedAt := invitationMixinFields0[1].Descriptor()
+	// invitation.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	invitation.DefaultUpdatedAt = invitationDescUpdatedAt.Default.(func() time.Time)
+	// invitation.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	invitation.UpdateDefaultUpdatedAt = invitationDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// invitationDescDeletedAt is the schema descriptor for deleted_at field.
+	invitationDescDeletedAt := invitationMixinFields1[0].Descriptor()
+	// invitation.DefaultDeletedAt holds the default value on creation for the deleted_at field.
+	invitation.DefaultDeletedAt = invitationDescDeletedAt.Default.(int)
+	// invitationDescMaxUses is the schema descriptor for max_uses field.
+	invitationDescMaxUses := invitationFields[4].Descriptor()
+	// invitation.DefaultMaxUses holds the default value on creation for the max_uses field.
+	invitation.DefaultMaxUses = invitationDescMaxUses.Default.(int)
+	// invitationDescUsedCount is the schema descriptor for used_count field.
+	invitationDescUsedCount := invitationFields[5].Descriptor()
+	// invitation.DefaultUsedCount holds the default value on creation for the used_count field.
+	invitation.DefaultUsedCount = invitationDescUsedCount.Default.(int)
 	modelMixin := schema.Model{}.Mixin()
 	model.Policy = privacy.NewPolicies(schema.Model{})
 	model.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -331,6 +445,390 @@ func init() {
 	modelDescDeletedAt := modelMixinFields1[0].Descriptor()
 	// model.DefaultDeletedAt holds the default value on creation for the deleted_at field.
 	model.DefaultDeletedAt = modelDescDeletedAt.Default.(int)
+	oidcidentityMixin := schema.OIDCIdentity{}.Mixin()
+	oidcidentity.Policy = privacy.NewPolicies(schema.OIDCIdentity{})
+	oidcidentity.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := oidcidentity.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	oidcidentityMixinHooks1 := oidcidentityMixin[1].Hooks()
+
+	oidcidentity.Hooks[1] = oidcidentityMixinHooks1[0]
+	oidcidentityMixinInters1 := oidcidentityMixin[1].Interceptors()
+	oidcidentity.Interceptors[0] = oidcidentityMixinInters1[0]
+	oidcidentityMixinFields0 := oidcidentityMixin[0].Fields()
+	_ = oidcidentityMixinFields0
+	oidcidentityMixinFields1 := oidcidentityMixin[1].Fields()
+	_ = oidcidentityMixinFields1
+	oidcidentityFields := schema.OIDCIdentity{}.Fields()
+	_ = oidcidentityFields
+	// oidcidentityDescCreatedAt is the schema descriptor for created_at field.
+	oidcidentityDescCreatedAt := oidcidentityMixinFields0[0].Descriptor()
+	// oidcidentity.DefaultCreatedAt holds the default value on creation for the created_at field.
+	oidcidentity.DefaultCreatedAt = oidcidentityDescCreatedAt.Default.(func() time.Time)
+	// oidcidentityDescUpdatedAt is the schema descriptor for updated_at field.
+	oidcidentityDescUpdatedAt := oidcidentityMixinFields0[1].Descriptor()
+	// oidcidentity.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	oidcidentity.DefaultUpdatedAt = oidcidentityDescUpdatedAt.Default.(func() time.Time)
+	// oidcidentity.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	oidcidentity.UpdateDefaultUpdatedAt = oidcidentityDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// oidcidentityDescDeletedAt is the schema descriptor for deleted_at field.
+	oidcidentityDescDeletedAt := oidcidentityMixinFields1[0].Descriptor()
+	// oidcidentity.DefaultDeletedAt holds the default value on creation for the deleted_at field.
+	oidcidentity.DefaultDeletedAt = oidcidentityDescDeletedAt.Default.(int)
+	pluginMixin := schema.Plugin{}.Mixin()
+	plugin.Policy = privacy.NewPolicies(schema.Plugin{})
+	plugin.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := plugin.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	pluginMixinHooks1 := pluginMixin[1].Hooks()
+
+	plugin.Hooks[1] = pluginMixinHooks1[0]
+	pluginMixinInters1 := pluginMixin[1].Interceptors()
+	plugin.Interceptors[0] = pluginMixinInters1[0]
+	pluginMixinFields0 := pluginMixin[0].Fields()
+	_ = pluginMixinFields0
+	pluginMixinFields1 := pluginMixin[1].Fields()
+	_ = pluginMixinFields1
+	pluginFields := schema.Plugin{}.Fields()
+	_ = pluginFields
+	// pluginDescCreatedAt is the schema descriptor for created_at field.
+	pluginDescCreatedAt := pluginMixinFields0[0].Descriptor()
+	// plugin.DefaultCreatedAt holds the default value on creation for the created_at field.
+	plugin.DefaultCreatedAt = pluginDescCreatedAt.Default.(func() time.Time)
+	// pluginDescUpdatedAt is the schema descriptor for updated_at field.
+	pluginDescUpdatedAt := pluginMixinFields0[1].Descriptor()
+	// plugin.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	plugin.DefaultUpdatedAt = pluginDescUpdatedAt.Default.(func() time.Time)
+	// plugin.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	plugin.UpdateDefaultUpdatedAt = pluginDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// pluginDescDeletedAt is the schema descriptor for deleted_at field.
+	pluginDescDeletedAt := pluginMixinFields1[0].Descriptor()
+	// plugin.DefaultDeletedAt holds the default value on creation for the deleted_at field.
+	plugin.DefaultDeletedAt = pluginDescDeletedAt.Default.(int)
+	// pluginDescPluginID is the schema descriptor for plugin_id field.
+	pluginDescPluginID := pluginFields[0].Descriptor()
+	// plugin.PluginIDValidator is a validator for the "plugin_id" field. It is called by the builders before save.
+	plugin.PluginIDValidator = func() func(string) error {
+		validators := pluginDescPluginID.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(plugin_id string) error {
+			for _, fn := range fns {
+				if err := fn(plugin_id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// pluginDescName is the schema descriptor for name field.
+	pluginDescName := pluginFields[1].Descriptor()
+	// plugin.DefaultName holds the default value on creation for the name field.
+	plugin.DefaultName = pluginDescName.Default.(string)
+	// plugin.NameValidator is a validator for the "name" field. It is called by the builders before save.
+	plugin.NameValidator = pluginDescName.Validators[0].(func(string) error)
+	// pluginDescVersion is the schema descriptor for version field.
+	pluginDescVersion := pluginFields[2].Descriptor()
+	// plugin.DefaultVersion holds the default value on creation for the version field.
+	plugin.DefaultVersion = pluginDescVersion.Default.(string)
+	// plugin.VersionValidator is a validator for the "version" field. It is called by the builders before save.
+	plugin.VersionValidator = pluginDescVersion.Validators[0].(func(string) error)
+	// pluginDescDescription is the schema descriptor for description field.
+	pluginDescDescription := pluginFields[3].Descriptor()
+	// plugin.DefaultDescription holds the default value on creation for the description field.
+	plugin.DefaultDescription = pluginDescDescription.Default.(string)
+	// plugin.DescriptionValidator is a validator for the "description" field. It is called by the builders before save.
+	plugin.DescriptionValidator = pluginDescDescription.Validators[0].(func(string) error)
+	// pluginDescManifest is the schema descriptor for manifest field.
+	pluginDescManifest := pluginFields[4].Descriptor()
+	// plugin.DefaultManifest holds the default value on creation for the manifest field.
+	plugin.DefaultManifest = pluginDescManifest.Default.(objects.PluginManifest)
+	// pluginDescPackageSha256 is the schema descriptor for package_sha256 field.
+	pluginDescPackageSha256 := pluginFields[6].Descriptor()
+	// plugin.DefaultPackageSha256 holds the default value on creation for the package_sha256 field.
+	plugin.DefaultPackageSha256 = pluginDescPackageSha256.Default.(string)
+	// plugin.PackageSha256Validator is a validator for the "package_sha256" field. It is called by the builders before save.
+	plugin.PackageSha256Validator = pluginDescPackageSha256.Validators[0].(func(string) error)
+	// pluginDescEnabled is the schema descriptor for enabled field.
+	pluginDescEnabled := pluginFields[7].Descriptor()
+	// plugin.DefaultEnabled holds the default value on creation for the enabled field.
+	plugin.DefaultEnabled = pluginDescEnabled.Default.(bool)
+	// pluginDescPriority is the schema descriptor for priority field.
+	pluginDescPriority := pluginFields[8].Descriptor()
+	// plugin.DefaultPriority holds the default value on creation for the priority field.
+	plugin.DefaultPriority = pluginDescPriority.Default.(int)
+	// pluginDescGrantedPermissions is the schema descriptor for granted_permissions field.
+	pluginDescGrantedPermissions := pluginFields[9].Descriptor()
+	// plugin.DefaultGrantedPermissions holds the default value on creation for the granted_permissions field.
+	plugin.DefaultGrantedPermissions = pluginDescGrantedPermissions.Default.([]string)
+	// pluginDescGrantedNetwork is the schema descriptor for granted_network field.
+	pluginDescGrantedNetwork := pluginFields[10].Descriptor()
+	// plugin.DefaultGrantedNetwork holds the default value on creation for the granted_network field.
+	plugin.DefaultGrantedNetwork = pluginDescGrantedNetwork.Default.([]string)
+	// pluginDescConfig is the schema descriptor for config field.
+	pluginDescConfig := pluginFields[11].Descriptor()
+	// plugin.DefaultConfig holds the default value on creation for the config field.
+	plugin.DefaultConfig = pluginDescConfig.Default.(map[string]interface{})
+	pluginschedule.Policy = privacy.NewPolicies(schema.PluginSchedule{})
+	pluginschedule.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := pluginschedule.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	pluginscheduleFields := schema.PluginSchedule{}.Fields()
+	_ = pluginscheduleFields
+	// pluginscheduleDescInstallationID is the schema descriptor for installation_id field.
+	pluginscheduleDescInstallationID := pluginscheduleFields[0].Descriptor()
+	// pluginschedule.InstallationIDValidator is a validator for the "installation_id" field. It is called by the builders before save.
+	pluginschedule.InstallationIDValidator = pluginscheduleDescInstallationID.Validators[0].(func(int) error)
+	// pluginscheduleDescKey is the schema descriptor for key field.
+	pluginscheduleDescKey := pluginscheduleFields[1].Descriptor()
+	// pluginschedule.KeyValidator is a validator for the "key" field. It is called by the builders before save.
+	pluginschedule.KeyValidator = func() func(string) error {
+		validators := pluginscheduleDescKey.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(key string) error {
+			for _, fn := range fns {
+				if err := fn(key); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// pluginscheduleDescOverrideCron is the schema descriptor for override_cron field.
+	pluginscheduleDescOverrideCron := pluginscheduleFields[2].Descriptor()
+	// pluginschedule.DefaultOverrideCron holds the default value on creation for the override_cron field.
+	pluginschedule.DefaultOverrideCron = pluginscheduleDescOverrideCron.Default.(string)
+	// pluginschedule.OverrideCronValidator is a validator for the "override_cron" field. It is called by the builders before save.
+	pluginschedule.OverrideCronValidator = pluginscheduleDescOverrideCron.Validators[0].(func(string) error)
+	// pluginscheduleDescOverrideTimezone is the schema descriptor for override_timezone field.
+	pluginscheduleDescOverrideTimezone := pluginscheduleFields[3].Descriptor()
+	// pluginschedule.DefaultOverrideTimezone holds the default value on creation for the override_timezone field.
+	pluginschedule.DefaultOverrideTimezone = pluginscheduleDescOverrideTimezone.Default.(string)
+	// pluginschedule.OverrideTimezoneValidator is a validator for the "override_timezone" field. It is called by the builders before save.
+	pluginschedule.OverrideTimezoneValidator = pluginscheduleDescOverrideTimezone.Validators[0].(func(string) error)
+	// pluginscheduleDescPaused is the schema descriptor for paused field.
+	pluginscheduleDescPaused := pluginscheduleFields[4].Descriptor()
+	// pluginschedule.DefaultPaused holds the default value on creation for the paused field.
+	pluginschedule.DefaultPaused = pluginscheduleDescPaused.Default.(bool)
+	// pluginscheduleDescLastSlot is the schema descriptor for last_slot field.
+	pluginscheduleDescLastSlot := pluginscheduleFields[5].Descriptor()
+	// pluginschedule.DefaultLastSlot holds the default value on creation for the last_slot field.
+	pluginschedule.DefaultLastSlot = pluginscheduleDescLastSlot.Default.(int64)
+	// pluginscheduleDescActiveRunID is the schema descriptor for active_run_id field.
+	pluginscheduleDescActiveRunID := pluginscheduleFields[6].Descriptor()
+	// pluginschedule.DefaultActiveRunID holds the default value on creation for the active_run_id field.
+	pluginschedule.DefaultActiveRunID = pluginscheduleDescActiveRunID.Default.(int)
+	// pluginscheduleDescLeaseUntil is the schema descriptor for lease_until field.
+	pluginscheduleDescLeaseUntil := pluginscheduleFields[7].Descriptor()
+	// pluginschedule.DefaultLeaseUntil holds the default value on creation for the lease_until field.
+	pluginschedule.DefaultLeaseUntil = pluginscheduleDescLeaseUntil.Default.(int64)
+	pluginschedulerun.Policy = privacy.NewPolicies(schema.PluginScheduleRun{})
+	pluginschedulerun.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := pluginschedulerun.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	pluginschedulerunFields := schema.PluginScheduleRun{}.Fields()
+	_ = pluginschedulerunFields
+	// pluginschedulerunDescScheduleID is the schema descriptor for schedule_id field.
+	pluginschedulerunDescScheduleID := pluginschedulerunFields[0].Descriptor()
+	// pluginschedulerun.ScheduleIDValidator is a validator for the "schedule_id" field. It is called by the builders before save.
+	pluginschedulerun.ScheduleIDValidator = pluginschedulerunDescScheduleID.Validators[0].(func(int) error)
+	// pluginschedulerunDescStatus is the schema descriptor for status field.
+	pluginschedulerunDescStatus := pluginschedulerunFields[4].Descriptor()
+	// pluginschedulerun.StatusValidator is a validator for the "status" field. It is called by the builders before save.
+	pluginschedulerun.StatusValidator = func() func(string) error {
+		validators := pluginschedulerunDescStatus.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(status string) error {
+			for _, fn := range fns {
+				if err := fn(status); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	pluginstorageMixin := schema.PluginStorage{}.Mixin()
+	pluginstorage.Policy = privacy.NewPolicies(schema.PluginStorage{})
+	pluginstorage.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := pluginstorage.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	pluginstorageMixinFields0 := pluginstorageMixin[0].Fields()
+	_ = pluginstorageMixinFields0
+	pluginstorageFields := schema.PluginStorage{}.Fields()
+	_ = pluginstorageFields
+	// pluginstorageDescCreatedAt is the schema descriptor for created_at field.
+	pluginstorageDescCreatedAt := pluginstorageMixinFields0[0].Descriptor()
+	// pluginstorage.DefaultCreatedAt holds the default value on creation for the created_at field.
+	pluginstorage.DefaultCreatedAt = pluginstorageDescCreatedAt.Default.(func() time.Time)
+	// pluginstorageDescUpdatedAt is the schema descriptor for updated_at field.
+	pluginstorageDescUpdatedAt := pluginstorageMixinFields0[1].Descriptor()
+	// pluginstorage.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	pluginstorage.DefaultUpdatedAt = pluginstorageDescUpdatedAt.Default.(func() time.Time)
+	// pluginstorage.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	pluginstorage.UpdateDefaultUpdatedAt = pluginstorageDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// pluginstorageDescInstallationID is the schema descriptor for installation_id field.
+	pluginstorageDescInstallationID := pluginstorageFields[0].Descriptor()
+	// pluginstorage.InstallationIDValidator is a validator for the "installation_id" field. It is called by the builders before save.
+	pluginstorage.InstallationIDValidator = pluginstorageDescInstallationID.Validators[0].(func(int) error)
+	// pluginstorageDescNamespace is the schema descriptor for namespace field.
+	pluginstorageDescNamespace := pluginstorageFields[1].Descriptor()
+	// pluginstorage.DefaultNamespace holds the default value on creation for the namespace field.
+	pluginstorage.DefaultNamespace = pluginstorageDescNamespace.Default.(string)
+	// pluginstorage.NamespaceValidator is a validator for the "namespace" field. It is called by the builders before save.
+	pluginstorage.NamespaceValidator = pluginstorageDescNamespace.Validators[0].(func(string) error)
+	// pluginstorageDescKey is the schema descriptor for key field.
+	pluginstorageDescKey := pluginstorageFields[2].Descriptor()
+	// pluginstorage.KeyValidator is a validator for the "key" field. It is called by the builders before save.
+	pluginstorage.KeyValidator = func() func(string) error {
+		validators := pluginstorageDescKey.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(key string) error {
+			for _, fn := range fns {
+				if err := fn(key); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	plugintableoperation.Policy = privacy.NewPolicies(schema.PluginTableOperation{})
+	plugintableoperation.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := plugintableoperation.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	plugintableoperationFields := schema.PluginTableOperation{}.Fields()
+	_ = plugintableoperationFields
+	// plugintableoperationDescStorageID is the schema descriptor for storage_id field.
+	plugintableoperationDescStorageID := plugintableoperationFields[0].Descriptor()
+	// plugintableoperation.StorageIDValidator is a validator for the "storage_id" field. It is called by the builders before save.
+	plugintableoperation.StorageIDValidator = plugintableoperationDescStorageID.Validators[0].(func(int) error)
+	// plugintableoperationDescKind is the schema descriptor for kind field.
+	plugintableoperationDescKind := plugintableoperationFields[1].Descriptor()
+	// plugintableoperation.KindValidator is a validator for the "kind" field. It is called by the builders before save.
+	plugintableoperation.KindValidator = func() func(string) error {
+		validators := plugintableoperationDescKind.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(kind string) error {
+			for _, fn := range fns {
+				if err := fn(kind); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// plugintableoperationDescTables is the schema descriptor for tables field.
+	plugintableoperationDescTables := plugintableoperationFields[2].Descriptor()
+	// plugintableoperation.DefaultTables holds the default value on creation for the tables field.
+	plugintableoperation.DefaultTables = plugintableoperationDescTables.Default.(map[string]objects.PluginTableSpec)
+	// plugintableoperationDescNames is the schema descriptor for names field.
+	plugintableoperationDescNames := plugintableoperationFields[3].Descriptor()
+	// plugintableoperation.DefaultNames holds the default value on creation for the names field.
+	plugintableoperation.DefaultNames = plugintableoperationDescNames.Default.(map[string]string)
+	// plugintableoperationDescPackageSha is the schema descriptor for package_sha field.
+	plugintableoperationDescPackageSha := plugintableoperationFields[4].Descriptor()
+	// plugintableoperation.DefaultPackageSha holds the default value on creation for the package_sha field.
+	plugintableoperation.DefaultPackageSha = plugintableoperationDescPackageSha.Default.(string)
+	// plugintableoperation.PackageShaValidator is a validator for the "package_sha" field. It is called by the builders before save.
+	plugintableoperation.PackageShaValidator = plugintableoperationDescPackageSha.Validators[0].(func(string) error)
+	// plugintableoperationDescLastError is the schema descriptor for last_error field.
+	plugintableoperationDescLastError := plugintableoperationFields[5].Descriptor()
+	// plugintableoperation.DefaultLastError holds the default value on creation for the last_error field.
+	plugintableoperation.DefaultLastError = plugintableoperationDescLastError.Default.(string)
+	// plugintableoperation.LastErrorValidator is a validator for the "last_error" field. It is called by the builders before save.
+	plugintableoperation.LastErrorValidator = plugintableoperationDescLastError.Validators[0].(func(string) error)
+	// plugintableoperationDescRetryAt is the schema descriptor for retry_at field.
+	plugintableoperationDescRetryAt := plugintableoperationFields[6].Descriptor()
+	// plugintableoperation.DefaultRetryAt holds the default value on creation for the retry_at field.
+	plugintableoperation.DefaultRetryAt = plugintableoperationDescRetryAt.Default.(int64)
+	plugintablestorage.Policy = privacy.NewPolicies(schema.PluginTableStorage{})
+	plugintablestorage.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := plugintablestorage.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	plugintablestorageFields := schema.PluginTableStorage{}.Fields()
+	_ = plugintablestorageFields
+	// plugintablestorageDescPluginID is the schema descriptor for plugin_id field.
+	plugintablestorageDescPluginID := plugintablestorageFields[0].Descriptor()
+	// plugintablestorage.PluginIDValidator is a validator for the "plugin_id" field. It is called by the builders before save.
+	plugintablestorage.PluginIDValidator = func() func(string) error {
+		validators := plugintablestorageDescPluginID.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(plugin_id string) error {
+			for _, fn := range fns {
+				if err := fn(plugin_id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// plugintablestorageDescActivePluginID is the schema descriptor for active_plugin_id field.
+	plugintablestorageDescActivePluginID := plugintablestorageFields[1].Descriptor()
+	// plugintablestorage.ActivePluginIDValidator is a validator for the "active_plugin_id" field. It is called by the builders before save.
+	plugintablestorage.ActivePluginIDValidator = plugintablestorageDescActivePluginID.Validators[0].(func(string) error)
+	// plugintablestorageDescTables is the schema descriptor for tables field.
+	plugintablestorageDescTables := plugintablestorageFields[2].Descriptor()
+	// plugintablestorage.DefaultTables holds the default value on creation for the tables field.
+	plugintablestorage.DefaultTables = plugintablestorageDescTables.Default.(map[string]objects.PluginTableSpec)
+	// plugintablestorageDescNames is the schema descriptor for names field.
+	plugintablestorageDescNames := plugintablestorageFields[3].Descriptor()
+	// plugintablestorage.DefaultNames holds the default value on creation for the names field.
+	plugintablestorage.DefaultNames = plugintablestorageDescNames.Default.(map[string]string)
+	// plugintablestorageDescRevision is the schema descriptor for revision field.
+	plugintablestorageDescRevision := plugintablestorageFields[4].Descriptor()
+	// plugintablestorage.DefaultRevision holds the default value on creation for the revision field.
+	plugintablestorage.DefaultRevision = plugintablestorageDescRevision.Default.(int)
 	projectMixin := schema.Project{}.Mixin()
 	project.Policy = privacy.NewPolicies(schema.Project{})
 	project.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -370,6 +868,10 @@ func init() {
 	projectDescDescription := projectFields[1].Descriptor()
 	// project.DefaultDescription holds the default value on creation for the description field.
 	project.DefaultDescription = projectDescDescription.Default.(string)
+	// projectDescProfiles is the schema descriptor for profiles field.
+	projectDescProfiles := projectFields[3].Descriptor()
+	// project.DefaultProfiles holds the default value on creation for the profiles field.
+	project.DefaultProfiles = projectDescProfiles.Default.(*objects.ProjectProfiles)
 	promptMixin := schema.Prompt{}.Mixin()
 	prompt.Policy = privacy.NewPolicies(schema.Prompt{})
 	prompt.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -409,6 +911,49 @@ func init() {
 	promptDescDescription := promptFields[2].Descriptor()
 	// prompt.DefaultDescription holds the default value on creation for the description field.
 	prompt.DefaultDescription = promptDescDescription.Default.(string)
+	// promptDescOrder is the schema descriptor for order field.
+	promptDescOrder := promptFields[6].Descriptor()
+	// prompt.DefaultOrder holds the default value on creation for the order field.
+	prompt.DefaultOrder = promptDescOrder.Default.(int)
+	promptprotectionruleMixin := schema.PromptProtectionRule{}.Mixin()
+	promptprotectionrule.Policy = privacy.NewPolicies(schema.PromptProtectionRule{})
+	promptprotectionrule.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := promptprotectionrule.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	promptprotectionruleMixinHooks1 := promptprotectionruleMixin[1].Hooks()
+
+	promptprotectionrule.Hooks[1] = promptprotectionruleMixinHooks1[0]
+	promptprotectionruleMixinInters1 := promptprotectionruleMixin[1].Interceptors()
+	promptprotectionrule.Interceptors[0] = promptprotectionruleMixinInters1[0]
+	promptprotectionruleMixinFields0 := promptprotectionruleMixin[0].Fields()
+	_ = promptprotectionruleMixinFields0
+	promptprotectionruleMixinFields1 := promptprotectionruleMixin[1].Fields()
+	_ = promptprotectionruleMixinFields1
+	promptprotectionruleFields := schema.PromptProtectionRule{}.Fields()
+	_ = promptprotectionruleFields
+	// promptprotectionruleDescCreatedAt is the schema descriptor for created_at field.
+	promptprotectionruleDescCreatedAt := promptprotectionruleMixinFields0[0].Descriptor()
+	// promptprotectionrule.DefaultCreatedAt holds the default value on creation for the created_at field.
+	promptprotectionrule.DefaultCreatedAt = promptprotectionruleDescCreatedAt.Default.(func() time.Time)
+	// promptprotectionruleDescUpdatedAt is the schema descriptor for updated_at field.
+	promptprotectionruleDescUpdatedAt := promptprotectionruleMixinFields0[1].Descriptor()
+	// promptprotectionrule.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	promptprotectionrule.DefaultUpdatedAt = promptprotectionruleDescUpdatedAt.Default.(func() time.Time)
+	// promptprotectionrule.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
+	promptprotectionrule.UpdateDefaultUpdatedAt = promptprotectionruleDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// promptprotectionruleDescDeletedAt is the schema descriptor for deleted_at field.
+	promptprotectionruleDescDeletedAt := promptprotectionruleMixinFields1[0].Descriptor()
+	// promptprotectionrule.DefaultDeletedAt holds the default value on creation for the deleted_at field.
+	promptprotectionrule.DefaultDeletedAt = promptprotectionruleDescDeletedAt.Default.(int)
+	// promptprotectionruleDescDescription is the schema descriptor for description field.
+	promptprotectionruleDescDescription := promptprotectionruleFields[1].Descriptor()
+	// promptprotectionrule.DefaultDescription holds the default value on creation for the description field.
+	promptprotectionrule.DefaultDescription = promptprotectionruleDescDescription.Default.(string)
 	providerquotastatusMixin := schema.ProviderQuotaStatus{}.Mixin()
 	providerquotastatusMixinHooks1 := providerquotastatusMixin[1].Hooks()
 	providerquotastatus.Hooks[0] = providerquotastatusMixinHooks1[0]
@@ -438,6 +983,10 @@ func init() {
 	providerquotastatusDescReady := providerquotastatusFields[5].Descriptor()
 	// providerquotastatus.DefaultReady holds the default value on creation for the ready field.
 	providerquotastatus.DefaultReady = providerquotastatusDescReady.Default.(bool)
+	// providerquotastatusDescAccountKey is the schema descriptor for account_key field.
+	providerquotastatusDescAccountKey := providerquotastatusFields[7].Descriptor()
+	// providerquotastatus.DefaultAccountKey holds the default value on creation for the account_key field.
+	providerquotastatus.DefaultAccountKey = providerquotastatusDescAccountKey.Default.(string)
 	requestMixin := schema.Request{}.Mixin()
 	request.Policy = privacy.NewPolicies(schema.Request{})
 	request.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -463,21 +1012,85 @@ func init() {
 	// request.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	request.UpdateDefaultUpdatedAt = requestDescUpdatedAt.UpdateDefault.(func() time.Time)
 	// requestDescProjectID is the schema descriptor for project_id field.
-	requestDescProjectID := requestFields[1].Descriptor()
+	requestDescProjectID := requestFields[2].Descriptor()
 	// request.DefaultProjectID holds the default value on creation for the project_id field.
 	request.DefaultProjectID = requestDescProjectID.Default.(int)
 	// requestDescFormat is the schema descriptor for format field.
-	requestDescFormat := requestFields[6].Descriptor()
+	requestDescFormat := requestFields[8].Descriptor()
 	// request.DefaultFormat holds the default value on creation for the format field.
 	request.DefaultFormat = requestDescFormat.Default.(string)
+	// requestDescRequestBodyChunked is the schema descriptor for request_body_chunked field.
+	requestDescRequestBodyChunked := requestFields[11].Descriptor()
+	// request.DefaultRequestBodyChunked holds the default value on creation for the request_body_chunked field.
+	request.DefaultRequestBodyChunked = requestDescRequestBodyChunked.Default.(bool)
+	// requestDescExternalID is the schema descriptor for external_id field.
+	requestDescExternalID := requestFields[16].Descriptor()
+	// request.ExternalIDValidator is a validator for the "external_id" field. It is called by the builders before save.
+	request.ExternalIDValidator = requestDescExternalID.Validators[0].(func(string) error)
 	// requestDescStream is the schema descriptor for stream field.
-	requestDescStream := requestFields[14].Descriptor()
+	requestDescStream := requestFields[18].Descriptor()
 	// request.DefaultStream holds the default value on creation for the stream field.
 	request.DefaultStream = requestDescStream.Default.(bool)
 	// requestDescClientIP is the schema descriptor for client_ip field.
-	requestDescClientIP := requestFields[15].Descriptor()
+	requestDescClientIP := requestFields[19].Descriptor()
 	// request.DefaultClientIP holds the default value on creation for the client_ip field.
 	request.DefaultClientIP = requestDescClientIP.Default.(string)
+	// requestDescUserAgent is the schema descriptor for user_agent field.
+	requestDescUserAgent := requestFields[20].Descriptor()
+	// request.DefaultUserAgent holds the default value on creation for the user_agent field.
+	request.DefaultUserAgent = requestDescUserAgent.Default.(string)
+	// requestDescContentSaved is the schema descriptor for content_saved field.
+	requestDescContentSaved := requestFields[24].Descriptor()
+	// request.DefaultContentSaved holds the default value on creation for the content_saved field.
+	request.DefaultContentSaved = requestDescContentSaved.Default.(bool)
+	requestbodychunk.Policy = privacy.NewPolicies(schema.RequestBodyChunk{})
+	requestbodychunk.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := requestbodychunk.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	requestbodychunkFields := schema.RequestBodyChunk{}.Fields()
+	_ = requestbodychunkFields
+	// requestbodychunkDescHash is the schema descriptor for hash field.
+	requestbodychunkDescHash := requestbodychunkFields[1].Descriptor()
+	// requestbodychunk.HashValidator is a validator for the "hash" field. It is called by the builders before save.
+	requestbodychunk.HashValidator = func() func(string) error {
+		validators := requestbodychunkDescHash.Validators
+		fns := [...]func(string) error{
+			validators[0].(func(string) error),
+			validators[1].(func(string) error),
+		}
+		return func(hash string) error {
+			for _, fn := range fns {
+				if err := fn(hash); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}()
+	// requestbodychunkDescCreatedAt is the schema descriptor for created_at field.
+	requestbodychunkDescCreatedAt := requestbodychunkFields[3].Descriptor()
+	// requestbodychunk.DefaultCreatedAt holds the default value on creation for the created_at field.
+	requestbodychunk.DefaultCreatedAt = requestbodychunkDescCreatedAt.Default.(func() time.Time)
+	requestbodychunkref.Policy = privacy.NewPolicies(schema.RequestBodyChunkRef{})
+	requestbodychunkref.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := requestbodychunkref.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
+	requestbodychunkrefFields := schema.RequestBodyChunkRef{}.Fields()
+	_ = requestbodychunkrefFields
+	// requestbodychunkrefDescPosition is the schema descriptor for position field.
+	requestbodychunkrefDescPosition := requestbodychunkrefFields[3].Descriptor()
+	// requestbodychunkref.PositionValidator is a validator for the "position" field. It is called by the builders before save.
+	requestbodychunkref.PositionValidator = requestbodychunkrefDescPosition.Validators[0].(func(int) error)
 	requestexecutionMixin := schema.RequestExecution{}.Mixin()
 	requestexecutionMixinFields0 := requestexecutionMixin[0].Fields()
 	_ = requestexecutionMixinFields0
@@ -497,14 +1110,30 @@ func init() {
 	requestexecutionDescProjectID := requestexecutionFields[0].Descriptor()
 	// requestexecution.DefaultProjectID holds the default value on creation for the project_id field.
 	requestexecution.DefaultProjectID = requestexecutionDescProjectID.Default.(int)
+	// requestexecutionDescExternalID is the schema descriptor for external_id field.
+	requestexecutionDescExternalID := requestexecutionFields[5].Descriptor()
+	// requestexecution.ExternalIDValidator is a validator for the "external_id" field. It is called by the builders before save.
+	requestexecution.ExternalIDValidator = requestexecutionDescExternalID.Validators[0].(func(string) error)
 	// requestexecutionDescFormat is the schema descriptor for format field.
-	requestexecutionDescFormat := requestexecutionFields[6].Descriptor()
+	requestexecutionDescFormat := requestexecutionFields[8].Descriptor()
 	// requestexecution.DefaultFormat holds the default value on creation for the format field.
 	requestexecution.DefaultFormat = requestexecutionDescFormat.Default.(string)
+	// requestexecutionDescChannelAPIKeySuffix is the schema descriptor for channel_api_key_suffix field.
+	requestexecutionDescChannelAPIKeySuffix := requestexecutionFields[10].Descriptor()
+	// requestexecution.ChannelAPIKeySuffixValidator is a validator for the "channel_api_key_suffix" field. It is called by the builders before save.
+	requestexecution.ChannelAPIKeySuffixValidator = requestexecutionDescChannelAPIKeySuffix.Validators[0].(func(string) error)
+	// requestexecutionDescRequestBodyChunked is the schema descriptor for request_body_chunked field.
+	requestexecutionDescRequestBodyChunked := requestexecutionFields[12].Descriptor()
+	// requestexecution.DefaultRequestBodyChunked holds the default value on creation for the request_body_chunked field.
+	requestexecution.DefaultRequestBodyChunked = requestexecutionDescRequestBodyChunked.Default.(bool)
 	// requestexecutionDescStream is the schema descriptor for stream field.
-	requestexecutionDescStream := requestexecutionFields[12].Descriptor()
+	requestexecutionDescStream := requestexecutionFields[19].Descriptor()
 	// requestexecution.DefaultStream holds the default value on creation for the stream field.
 	requestexecution.DefaultStream = requestexecutionDescStream.Default.(bool)
+	// requestexecutionDescPassThroughApplied is the schema descriptor for pass_through_applied field.
+	requestexecutionDescPassThroughApplied := requestexecutionFields[25].Descriptor()
+	// requestexecution.DefaultPassThroughApplied holds the default value on creation for the pass_through_applied field.
+	requestexecution.DefaultPassThroughApplied = requestexecutionDescPassThroughApplied.Default.(bool)
 	roleMixin := schema.Role{}.Mixin()
 	role.Policy = privacy.NewPolicies(schema.Role{})
 	role.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -540,6 +1169,10 @@ func init() {
 	roleDescDeletedAt := roleMixinFields1[0].Descriptor()
 	// role.DefaultDeletedAt holds the default value on creation for the deleted_at field.
 	role.DefaultDeletedAt = roleDescDeletedAt.Default.(int)
+	// roleDescProjectID is the schema descriptor for project_id field.
+	roleDescProjectID := roleFields[2].Descriptor()
+	// role.DefaultProjectID holds the default value on creation for the project_id field.
+	role.DefaultProjectID = roleDescProjectID.Default.(int)
 	// roleDescScopes is the schema descriptor for scopes field.
 	roleDescScopes := roleFields[3].Descriptor()
 	// role.DefaultScopes holds the default value on creation for the scopes field.
@@ -627,6 +1260,10 @@ func init() {
 	trace.DefaultUpdatedAt = traceDescUpdatedAt.Default.(func() time.Time)
 	// trace.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.
 	trace.UpdateDefaultUpdatedAt = traceDescUpdatedAt.UpdateDefault.(func() time.Time)
+	// traceDescLastRequestAt is the schema descriptor for last_request_at field.
+	traceDescLastRequestAt := traceFields[4].Descriptor()
+	// trace.DefaultLastRequestAt holds the default value on creation for the last_request_at field.
+	trace.DefaultLastRequestAt = traceDescLastRequestAt.Default.(func() time.Time)
 	usagelogMixin := schema.UsageLog{}.Mixin()
 	usagelog.Policy = privacy.NewPolicies(schema.UsageLog{})
 	usagelog.Hooks[0] = func(next ent.Mutator) ent.Mutator {
@@ -798,6 +1435,15 @@ func init() {
 	userprojectDescScopes := userprojectFields[3].Descriptor()
 	// userproject.DefaultScopes holds the default value on creation for the scopes field.
 	userproject.DefaultScopes = userprojectDescScopes.Default.([]string)
+	userrole.Policy = privacy.NewPolicies(schema.UserRole{})
+	userrole.Hooks[0] = func(next ent.Mutator) ent.Mutator {
+		return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+			if err := userrole.Policy.EvalMutation(ctx, m); err != nil {
+				return nil, err
+			}
+			return next.Mutate(ctx, m)
+		})
+	}
 	userroleFields := schema.UserRole{}.Fields()
 	_ = userroleFields
 	// userroleDescCreatedAt is the schema descriptor for created_at field.
@@ -813,6 +1459,6 @@ func init() {
 }
 
 const (
-	Version = "v0.14.5"                                         // Version of ent codegen.
-	Sum     = "h1:Rj2WOYJtCkWyFo6a+5wB3EfBRP0rnx1fMk6gGA0UUe4=" // Sum of ent codegen.
+	Version = "v0.14.6"                                         // Version of ent codegen.
+	Sum     = "h1:/f2696BpwuWAEEG6PVGWflg6+Inrpq4pRWuNlWz/Skk=" // Sum of ent codegen.
 )

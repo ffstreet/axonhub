@@ -9,21 +9,46 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/99designs/gqlgen/graphql"
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/model"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/scopes"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/samber/lo"
 )
 
+// EditVersion is the resolver for the editVersion field.
+func (r *modelResolver) EditVersion(ctx context.Context, obj *ent.Model) (string, error) {
+	// Ent creates return the input timestamp, which may be more precise than the stored value.
+	if root := graphql.GetRootFieldContext(ctx); root != nil && (root.Field.Name == "createModel" || root.Field.Name == "bulkCreateModels") {
+		err := r.modelService.RunInTransaction(ctx, func(ctx context.Context) error {
+			var err error
+			obj, err = ent.FromContext(ctx).Model.Get(ctx, obj.ID)
+			return err
+		})
+		if err != nil {
+			return "", err
+		}
+	}
+	return biz.ModelEditVersion(obj)
+}
+
+// MissingReferencePrices is the resolver for the missingReferencePrices field.
+func (r *modelResolver) MissingReferencePrices(ctx context.Context, obj *ent.Model) ([]string, error) {
+	return biz.MissingReferencePrices(obj.ModelCard), nil
+}
+
 // AssociatedChannelCount is the resolver for the associatedChannelCount field.
 func (r *modelResolver) AssociatedChannelCount(ctx context.Context, obj *ent.Model) (int, error) {
-	return r.modelService.CountAssociatedChannels(ctx, obj.Settings.Associations)
+	return r.modelService.CountModelAssociatedChannels(ctx, obj)
 }
 
 // CreateModel is the resolver for the createModel field.
-func (r *mutationResolver) CreateModel(ctx context.Context, input ent.CreateModelInput) (*ent.Model, error) {
-	return r.modelService.CreateModel(ctx, input)
+func (r *mutationResolver) CreateModel(ctx context.Context, input ent.CreateModelInput, editedPrices []*biz.ManualPriceEdit) (*ent.Model, error) {
+	return r.modelService.CreateModelWithPriceEdits(ctx, input, lo.FromSlicePtr(editedPrices))
 }
 
 // BulkCreateModels is the resolver for the bulkCreateModels field.
@@ -32,8 +57,8 @@ func (r *mutationResolver) BulkCreateModels(ctx context.Context, inputs []*ent.C
 }
 
 // UpdateModel is the resolver for the updateModel field.
-func (r *mutationResolver) UpdateModel(ctx context.Context, id objects.GUID, input ent.UpdateModelInput) (*ent.Model, error) {
-	return r.modelService.UpdateModel(ctx, id.ID, &input)
+func (r *mutationResolver) UpdateModel(ctx context.Context, id objects.GUID, input ent.UpdateModelInput, editedPrices []*biz.ManualPriceEdit, expectedVersion *string) (*ent.Model, error) {
+	return r.modelService.UpdateModelWithPriceEdits(ctx, id.ID, &input, lo.FromSlicePtr(editedPrices), expectedVersion)
 }
 
 // DeleteModel is the resolver for the deleteModel field.
@@ -99,8 +124,36 @@ func (r *mutationResolver) BulkDeleteModels(ctx context.Context, ids []*objects.
 	return true, nil
 }
 
+// ApplyCatalogImport is the resolver for the applyCatalogImport field.
+func (r *mutationResolver) ApplyCatalogImport(ctx context.Context, scope biz.CatalogImportScope, revision string, selections []*biz.CatalogImportSelection) ([]*biz.CatalogImportOutcome, error) {
+	if err := authz.RequireSystemUserScope(ctx, scopes.ScopeWriteChannels); err != nil {
+		return nil, err
+	}
+	results, err := r.modelService.ApplyCatalogImport(authz.WithScopeDecision(ctx, scopes.ScopeWriteChannels), scope, revision, lo.FromSlicePtr(selections))
+	return lo.ToSlicePtr(results), err
+}
+
+// PreviewChannelModelEntries is the resolver for the previewChannelModelEntries field.
+func (r *queryResolver) PreviewChannelModelEntries(ctx context.Context, input ChannelModelPreviewInput) ([]*biz.ChannelModelEntry, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadChannels); err != nil {
+		return nil, err
+	}
+
+	// Resolve an ephemeral channel so previews use the same rules as routing,
+	// without writing settings or touching a cached channel instance.
+	ch := biz.Channel{Channel: &ent.Channel{
+		SupportedModels: input.SupportedModels,
+		Settings:        input.Settings,
+	}}
+	return lo.ToSlicePtr(sortChannelModelEntries(lo.Values(ch.GetModelEntries()))), nil
+}
+
 // FetchModels is the resolver for the fetchModels field.
 func (r *queryResolver) FetchModels(ctx context.Context, input biz.FetchModelsInput) (*FetchModelsPayload, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeWriteChannels); err != nil {
+		return nil, err
+	}
+
 	// Call the model fetcher service
 	result, err := r.modelFetcher.FetchModels(ctx, input)
 	if err != nil {
@@ -114,8 +167,12 @@ func (r *queryResolver) FetchModels(ctx context.Context, input biz.FetchModelsIn
 	}
 
 	return &FetchModelsPayload{
-		Models: models,
-		Error:  result.Error,
+		Models:                    models,
+		Error:                     result.Error,
+		Fallback:                  result.Fallback,
+		FallbackReason:            result.FallbackReason,
+		CodexCatalogVersion:       result.CodexCatalogVersion,
+		CodexCatalogSkippedReason: result.CodexCatalogSkippedReason,
 	}, nil
 }
 
@@ -125,6 +182,18 @@ func (r *queryResolver) FetchModels(ctx context.Context, input biz.FetchModelsIn
 func (r *queryResolver) QueryModels(ctx context.Context, input QueryModelsInput) ([]*biz.ModelIdentityWithStatus, error) {
 	// Check the QueryAllChannelModels setting
 	settings := r.systemService.ModelSettingsOrDefault(ctx)
+	listModels := func(list func(context.Context) ([]*biz.ModelIdentityWithStatus, error)) ([]*biz.ModelIdentityWithStatus, error) {
+		if authz.HasScope(ctx, scopes.ScopeReadChannels) {
+			return list(ctx)
+		}
+
+		if _, ok := contexts.GetProjectID(ctx); !ok ||
+			(!authz.HasScope(ctx, scopes.ScopeWriteAPIKeys) && !authz.HasScope(ctx, scopes.ScopeWriteRequests)) {
+			return nil, authz.RequireScope(ctx, scopes.ScopeReadChannels)
+		}
+
+		return authz.RunAsHost(ctx, r.client, "project-model-metadata", list)
+	}
 
 	if settings.QueryAllChannelModels || lo.FromPtrOr(input.IncludeAllChannelModels, false) {
 		// Convert GraphQL input to biz layer input
@@ -136,7 +205,14 @@ func (r *queryResolver) QueryModels(ctx context.Context, input QueryModelsInput)
 		}
 
 		// Return all models from channels
-		return r.channelService.ListModels(ctx, bizInput)
+		models, err := listModels(func(ctx context.Context) ([]*biz.ModelIdentityWithStatus, error) {
+			return r.channelService.ListModels(ctx, bizInput)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return models, nil
 	}
 
 	// Return only configured models
@@ -149,7 +225,14 @@ func (r *queryResolver) QueryModels(ctx context.Context, input QueryModelsInput)
 		}
 	}
 
-	return r.modelService.ListModels(ctx, modelStatusIn)
+	models, err := listModels(func(ctx context.Context) ([]*biz.ModelIdentityWithStatus, error) {
+		return r.modelService.ListModels(ctx, modelStatusIn)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return models, nil
 }
 
 // QueryModelChannelConnections is the resolver for the queryModelChannelConnections field.
@@ -160,4 +243,12 @@ func (r *queryResolver) QueryModelChannelConnections(ctx context.Context, associ
 // QueryUnassociatedChannels is the resolver for the queryUnassociatedChannels field.
 func (r *queryResolver) QueryUnassociatedChannels(ctx context.Context) ([]*biz.UnassociatedChannel, error) {
 	return r.modelService.QueryUnassociatedChannels(ctx)
+}
+
+// CatalogImportPreview is the resolver for the catalogImportPreview field.
+func (r *queryResolver) CatalogImportPreview(ctx context.Context, scope biz.CatalogImportScope) (*biz.CatalogImportPreview, error) {
+	if err := authz.RequireSystemUserScope(ctx, scopes.ScopeWriteChannels); err != nil {
+		return nil, err
+	}
+	return r.modelService.CatalogImportPreview(authz.WithScopeDecision(ctx, scopes.ScopeWriteChannels), scope)
 }

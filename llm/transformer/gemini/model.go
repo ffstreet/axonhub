@@ -29,6 +29,23 @@ type GenerateContentRequest struct {
 	CachedContent string `json:"cachedContent,omitempty"`
 }
 
+// UnmarshalJSON accepts system_instruction as a fallback for systemInstruction.
+func (r *GenerateContentRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias GenerateContentRequest
+	var decoded struct {
+		requestAlias
+		SystemInstructionSnake *Content `json:"system_instruction"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = GenerateContentRequest(decoded.requestAlias)
+	if r.SystemInstruction == nil {
+		r.SystemInstruction = decoded.SystemInstructionSnake
+	}
+	return nil
+}
+
 // Content represents the multi-part content of a message.
 type Content struct {
 	// Parts is the ordered Parts that constitute a single message.
@@ -62,6 +79,41 @@ type Part struct {
 	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
+func (p Part) isSignatureOnly() bool {
+	return p.ThoughtSignature != "" && p.Text == "" && p.InlineData == nil &&
+		p.FileData == nil && p.FunctionCall == nil && p.FunctionResponse == nil
+}
+
+// MarshalJSON keeps the empty text payload of a standalone thought signature.
+// Gemini streaming can return this part in the final chunk of a text response.
+func (p Part) MarshalJSON() ([]byte, error) {
+	type partAlias Part
+	if p.isSignatureOnly() {
+		return json.Marshal(struct {
+			partAlias
+			Text string `json:"text"`
+		}{partAlias: partAlias(p)})
+	}
+	return json.Marshal(partAlias(p))
+}
+
+// UnmarshalJSON accepts inline_data as a fallback for inlineData.
+func (p *Part) UnmarshalJSON(data []byte) error {
+	type partAlias Part
+	var decoded struct {
+		partAlias
+		InlineDataSnake *Blob `json:"inline_data"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*p = Part(decoded.partAlias)
+	if p.InlineData == nil {
+		p.InlineData = decoded.InlineDataSnake
+	}
+	return nil
+}
+
 // Blob represents raw media bytes.
 type Blob struct {
 	// MIMEType is the IANA standard MIME type of the source data.
@@ -71,6 +123,23 @@ type Blob struct {
 	Data string `json:"data,omitempty"`
 }
 
+// UnmarshalJSON accepts mime_type as a fallback when mimeType is empty.
+func (b *Blob) UnmarshalJSON(data []byte) error {
+	type blobAlias Blob
+	var decoded struct {
+		blobAlias
+		MIMETypeSnake string `json:"mime_type"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*b = Blob(decoded.blobAlias)
+	if b.MIMEType == "" {
+		b.MIMEType = decoded.MIMETypeSnake
+	}
+	return nil
+}
+
 // FileData represents URI based data.
 type FileData struct {
 	// MIMEType is the IANA standard MIME type of the source data.
@@ -78,6 +147,23 @@ type FileData struct {
 
 	// FileURI is the URI.
 	FileURI string `json:"fileUri,omitempty"`
+}
+
+// UnmarshalJSON accepts mime_type as a fallback when mimeType is empty.
+func (f *FileData) UnmarshalJSON(data []byte) error {
+	type fileDataAlias FileData
+	var decoded struct {
+		fileDataAlias
+		MIMETypeSnake string `json:"mime_type"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*f = FileData(decoded.fileDataAlias)
+	if f.MIMEType == "" {
+		f.MIMEType = decoded.MIMETypeSnake
+	}
+	return nil
 }
 
 // FunctionCall represents a predicted function call.
@@ -121,6 +207,46 @@ type Tool struct {
 	// UrlContext enables URL context grounding for Gemini 2.0+.
 	// This allows the model to fetch and process content from specified URLs.
 	UrlContext *UrlContext `json:"urlContext,omitempty"`
+}
+
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	type toolAlias struct {
+		FunctionDeclarations      []*FunctionDeclaration `json:"functionDeclarations,omitempty"`
+		FunctionDeclarationsSnake []*FunctionDeclaration `json:"function_declarations,omitempty"`
+		CodeExecution             *CodeExecution         `json:"codeExecution,omitempty"`
+		CodeExecutionSnake        *CodeExecution         `json:"code_execution,omitempty"`
+		GoogleSearch              *GoogleSearch          `json:"googleSearch,omitempty"`
+		GoogleSearchSnake         *GoogleSearch          `json:"google_search,omitempty"`
+		UrlContext                *UrlContext            `json:"urlContext,omitempty"`
+		UrlContextSnake           *UrlContext            `json:"url_context,omitempty"`
+	}
+
+	var alias toolAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	t.FunctionDeclarations = alias.FunctionDeclarations
+	if len(t.FunctionDeclarations) == 0 {
+		t.FunctionDeclarations = alias.FunctionDeclarationsSnake
+	}
+
+	t.CodeExecution = alias.CodeExecution
+	if t.CodeExecution == nil {
+		t.CodeExecution = alias.CodeExecutionSnake
+	}
+
+	t.GoogleSearch = alias.GoogleSearch
+	if t.GoogleSearch == nil {
+		t.GoogleSearch = alias.GoogleSearchSnake
+	}
+
+	t.UrlContext = alias.UrlContext
+	if t.UrlContext == nil {
+		t.UrlContext = alias.UrlContextSnake
+	}
+
+	return nil
 }
 
 // FunctionDeclaration represents a function declaration.
@@ -179,7 +305,7 @@ type ToolConfig struct {
 
 // FunctionCallingConfig is the function calling config.
 type FunctionCallingConfig struct {
-	// Mode is the function calling mode. One of: AUTO, ANY, NONE.
+	// Mode is the function calling mode. One of: AUTO, ANY, NONE, VALIDATED.
 	Mode string `json:"mode,omitempty"`
 
 	// AllowedFunctionNames is the function names to call.
@@ -199,7 +325,12 @@ type GenerationConfig struct {
 	ResponseMIMEType string `json:"responseMimeType,omitempty"`
 
 	// ResponseSchema is the output schema of the generated candidate text.
+	// Uses the Gemini SDK's structured Schema type (OpenAPI 3.0 subset).
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
+
+	// ResponseJsonSchema accepts a raw JSON Schema directly.
+	// When set, ResponseSchema must be omitted, but ResponseMIMEType is required.
+	ResponseJsonSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 
 	// CandidateCount is the number of generated responses to return.
 	CandidateCount int64 `json:"candidateCount,omitempty"`
@@ -402,6 +533,10 @@ type UsageMetadata struct {
 	// When cachedContent is set, this is still the total effective prompt size meaning this includes the number of tokens in the cached content.
 	PromptTokenCount int64 `json:"promptTokenCount,omitempty"`
 
+	// ToolUsePromptTokenCount is the number of tokens in the results of tool-use
+	// (e.g. Google Search, URL context) that were fed back into the prompt.
+	ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount,omitempty"`
+
 	// CandidatesTokenCount is the total number of tokens across all generated candidates.
 	// The CandidatesTokenCount does not include the ThoughtsTokenCount.
 	CandidatesTokenCount int64 `json:"candidatesTokenCount,omitempty"`
@@ -420,6 +555,10 @@ type UsageMetadata struct {
 
 	// Output only. A detailed breakdown of the token count for each modality in the prompt.
 	PromptTokensDetails []*ModalityTokenCount `json:"promptTokensDetails,omitempty"`
+
+	// Cost is the request cost calculated by AxonHub from channel model prices.
+	// This is an AxonHub extension; official Gemini responses do not include it.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 type ModalityTokenCount struct {

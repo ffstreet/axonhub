@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 
-	"github.com/looplj/axonhub/internal/pkg/xerrors"
-	"github.com/looplj/axonhub/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/streams"
 	transformer "github.com/looplj/axonhub/llm/transformer"
 )
@@ -22,10 +22,6 @@ type InboundTransformer struct{}
 // NewInboundTransformer creates a new OpenAI InboundTransformer.
 func NewInboundTransformer() *InboundTransformer {
 	return &InboundTransformer{}
-}
-
-func (t *InboundTransformer) APIFormat() llm.APIFormat {
-	return llm.APIFormatOpenAIChatCompletion
 }
 
 // TransformRequest transforms HTTP request to ChatCompletionRequest.
@@ -109,6 +105,7 @@ func (t *InboundTransformer) TransformStream(
 	ctx context.Context,
 	stream streams.Stream[*llm.Response],
 ) (streams.Stream[*httpclient.StreamEvent], error) {
+	stream = newOpenAIInboundStream(stream, ctx)
 	return streams.NoNil(streams.MapErr(stream, func(chunk *llm.Response) (*httpclient.StreamEvent, error) {
 		return t.TransformStreamChunk(ctx, chunk)
 	})), nil
@@ -145,31 +142,47 @@ func (t *InboundTransformer) TransformStreamChunk(
 	}
 
 	return &httpclient.StreamEvent{
-		Type: "",
-		Data: eventData,
+		Type:                       "",
+		Data:                       eventData,
+		CleanEOFCompletionEvidence: chatResp.StreamCompletionEvidence == llm.StreamCompletionEvidenceOpenAIChatEOF,
 	}, nil
 }
 
-// isReasoningSignatureEvent checks if the response contains ReasoningSignature.
-// This is a help func to adapt the Anthropic thinking signature to OpenAI format.
-// In the real world, the signature will use a separate event, so if the response contains
-// ReasoningSignature, it means the event is for signature_delta, we should ignore it.
+// isReasoningSignatureEvent checks if the response contains ONLY ReasoningSignature.
+// This is a helper function to filter out reasoning signature events when transforming
+// to OpenAI format, since OpenAI format doesn't support ReasoningSignature in streaming.
+// If the response contains ONLY ReasoningSignature (pure signature event), we skip it.
+// Chunks that also carry text, tool calls, a finish reason, or usage stay, because
+// those fields have no other carrier. The signature itself is not written back.
 func isReasoningSignatureEvent(resp *llm.Response) bool {
 	if len(resp.Choices) != 1 {
 		return false
 	}
 
-	delta := resp.Choices[0].Delta
-	if delta == nil {
+	choice := resp.Choices[0]
+	delta := choice.Delta
+	if delta == nil || delta.ReasoningSignature == nil || *delta.ReasoningSignature == "" {
 		return false
 	}
 
-	// Check if ReasoningSignature is set
-	if delta.ReasoningSignature != nil && *delta.ReasoningSignature != "" {
-		return true
+	// Gemini and Copilot can carry signatures on the terminal chunk.
+	if finish := choice.FinishReason; finish != nil && *finish != "" {
+		return false
+	}
+	// Keep usage that can be returned to the client. An all-zero placeholder
+	// adds nothing to a signature-only chunk.
+	if usage := UsageFromLLM(resp.Usage); usage != nil && *usage != (Usage{}) {
+		return false
 	}
 
-	return false
+	// Check if there's any other content besides the signature
+	hasContent := delta.Content.Content != nil || len(delta.Content.MultipleContent) > 0
+	hasReasoningContent := delta.ReasoningContent != nil && *delta.ReasoningContent != ""
+	hasToolCalls := len(delta.ToolCalls) > 0
+	hasRefusal := delta.Refusal != ""
+
+	// Only skip if ONLY ReasoningSignature is present (pure signature event)
+	return !hasContent && !hasReasoningContent && !hasToolCalls && !hasRefusal
 }
 
 func (t *InboundTransformer) AggregateStreamChunks(
@@ -181,7 +194,16 @@ func (t *InboundTransformer) AggregateStreamChunks(
 
 // TransformError transforms LLM error response to HTTP error response.
 func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *httpclient.Error {
-	if rawErr == nil {
+	if rawErr == nil || (reflect.ValueOf(rawErr).Kind() == reflect.Ptr && reflect.ValueOf(rawErr).IsNil()) {
+		return &httpclient.Error{
+			StatusCode: http.StatusInternalServerError,
+			Status:     http.StatusText(http.StatusInternalServerError),
+			Body:       xjson.MustMarshal(&OpenAIError{Detail: llm.ErrorDetail{Message: "An unexpected error occurred", Type: "unexpected_error"}}),
+		}
+	}
+
+	llmErr, isLLMError := errors.AsType[*llm.ResponseError](rawErr)
+	if isLLMError && llmErr == nil {
 		return &httpclient.Error{
 			StatusCode: http.StatusInternalServerError,
 			Status:     http.StatusText(http.StatusInternalServerError),
@@ -197,8 +219,16 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		}
 	}
 
-	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
-		return httpErr
+	if httpErr, ok := errors.AsType[*httpclient.Error](rawErr); ok {
+		if httpErr == nil {
+			return &httpclient.Error{
+				StatusCode: http.StatusInternalServerError,
+				Status:     http.StatusText(http.StatusInternalServerError),
+				Body:       xjson.MustMarshal(&OpenAIError{Detail: llm.ErrorDetail{Message: "An unexpected error occurred", Type: "unexpected_error"}}),
+			}
+		}
+
+		return normalizeHTTPErrorStatus(httpErr)
 	}
 
 	// Handle validation errors
@@ -210,10 +240,17 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		}
 	}
 
-	if llmErr, ok := xerrors.As[*llm.ResponseError](rawErr); ok {
+	if isLLMError {
+		statusCode := llmErr.StatusCode
+		if statusCode == 0 && llmErr.Detail.Code == "context_length_exceeded" {
+			statusCode = http.StatusBadRequest
+		} else if statusCode < http.StatusBadRequest || statusCode > 599 {
+			statusCode = http.StatusBadGateway
+		}
+
 		return &httpclient.Error{
-			StatusCode: llmErr.StatusCode,
-			Status:     http.StatusText(llmErr.StatusCode),
+			StatusCode: statusCode,
+			Status:     http.StatusText(statusCode),
 			Body:       xjson.MustMarshal(&OpenAIError{Detail: llmErr.Detail}),
 		}
 	}
@@ -223,4 +260,17 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		Status:     http.StatusText(http.StatusInternalServerError),
 		Body:       xjson.MustMarshal(&OpenAIError{Detail: llm.ErrorDetail{Message: rawErr.Error(), Type: "internal_server_error"}}),
 	}
+}
+
+// normalizeHTTPErrorStatus maps invalid error statuses to an upstream failure.
+func normalizeHTTPErrorStatus(httpErr *httpclient.Error) *httpclient.Error {
+	if httpErr.StatusCode >= http.StatusBadRequest && httpErr.StatusCode <= 599 {
+		return httpErr
+	}
+
+	normalized := *httpErr
+	normalized.StatusCode = http.StatusBadGateway
+	normalized.Status = http.StatusText(http.StatusBadGateway)
+
+	return &normalized
 }

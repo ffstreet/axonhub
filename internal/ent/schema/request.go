@@ -3,6 +3,7 @@ package schema
 import (
 	"entgo.io/contrib/entgql"
 	"entgo.io/ent"
+	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
@@ -28,10 +29,14 @@ func (Request) Indexes() []ent.Index {
 			StorageKey("requests_by_api_key_id_created_at"),
 		index.Fields("project_id", "created_at").
 			StorageKey("requests_by_project_id_created_at"),
+		index.Fields("project_id", "user_id", "created_at").
+			StorageKey("requests_by_project_id_user_id_created_at"),
 		index.Fields("channel_id", "created_at").
 			StorageKey("requests_by_channel_id_created_at"),
 		index.Fields("trace_id", "created_at").
 			StorageKey("requests_by_trace_id_created_at"),
+		index.Fields("external_id", "api_key_id", "status", "created_at").
+			StorageKey("requests_by_external_id_api_key_id_status_created_at"),
 		// Performance indexes for dashboard queries
 		index.Fields("created_at").
 			StorageKey("requests_by_created_at"),
@@ -44,6 +49,17 @@ func (Request) Fields() []ent.Field {
 			Optional().
 			Immutable().
 			Comment("API Key ID of the request, null for the request from the Admin."),
+		field.Int("user_id").
+			Optional().
+			Nillable().
+			Immutable().
+			Annotations(entgql.Skip(
+				entgql.SkipType,
+				entgql.SkipWhereInput,
+				entgql.SkipMutationCreateInput,
+				entgql.SkipMutationUpdateInput,
+			)).
+			Comment("User ID of the Playground request creator"),
 		field.Int("project_id").
 			Immutable().
 			Default(1).
@@ -58,6 +74,10 @@ func (Request) Fields() []ent.Field {
 			Comment("Data Storage ID that this request belongs to"),
 		field.Enum("source").Values("api", "playground", "test").Default("api").Immutable(),
 		field.String("model_id").Immutable(),
+		field.String("reasoning_effort").
+			Optional().
+			Immutable().
+			Comment("Reasoning effort used for reasoning models"),
 		// The format of the request, e.g: openai/chat_completions, claude/messages, openai/response.
 		field.String("format").Immutable().Default("openai/chat_completions"),
 		// Request headers
@@ -71,7 +91,14 @@ func (Request) Fields() []ent.Field {
 			Annotations(
 				entgql.Directives(forceResolver()),
 			),
+		field.Bool("request_body_chunked").
+			Default(false).
+			Annotations(entgql.Skip()).
+			Comment("Request body is a manifest referencing project-scoped content chunks"),
 		// The final response to the user.
+		field.JSON("response_headers", objects.JSONRawMessage{}).
+			Optional().
+			Comment("Response headers sent to the client, with sensitive values masked"),
 		// e.g: the provider response with Claude format, but the user expects the response with OpenAI format, the response_body is the OpenAI response format.
 		field.JSON("response_body", objects.JSONRawMessage{}).Optional().Annotations(
 			entgql.Directives(forceResolver()),
@@ -82,21 +109,49 @@ func (Request) Fields() []ent.Field {
 		),
 		field.Int("channel_id").Optional(),
 		// External ID for tracking requests in external systems
-		field.String("external_id").Optional(),
+		field.String("external_id").
+			Optional().
+			MaxLen(512),
 		// The status of the request.
 		field.Enum("status").Values("pending", "processing", "completed", "failed", "canceled"),
 		// Whether the request is a streaming request
 		field.Bool("stream").Default(false).Immutable(),
 		field.String("client_ip").Default("").Immutable(),
+		// User-Agent header of the client that initiated the request.
+		field.String("user_agent").Default("").Immutable(),
 		// Total latency in milliseconds from request start to completion
 		field.Int64("metrics_latency_ms").Optional().Nillable(),
 		// First token latency in milliseconds (only for streaming requests)
 		field.Int64("metrics_first_token_latency_ms").Optional().Nillable(),
+		// Reasoning/thinking duration in milliseconds
+		field.Int64("metrics_reasoning_duration_ms").Optional().Nillable().Comment("Reasoning/thinking duration in milliseconds"),
+
+		// ContentSaved indicates whether the generated content (e.g. video, audio) has been downloaded and saved to external storage.
+		field.Bool("content_saved").
+			Default(false).
+			Comment("whether the generated content has been saved to external storage"),
+		// ContentStorageID is the data storage ID used to save the generated content file.
+		field.Int("content_storage_id").
+			Optional().
+			Nillable().
+			Comment("data storage id used to save the content file"),
+		// ContentStorageKey is the object key/path of the saved content in the data storage.
+		field.String("content_storage_key").
+			Optional().
+			Nillable().
+			Comment("storage key/path of the saved content file"),
+		// ContentSavedAt is the timestamp when the content file is saved.
+		field.Time("content_saved_at").
+			Optional().
+			Nillable().
+			Comment("when the content file was saved"),
 	}
 }
 
 func (Request) Edges() []ent.Edge {
 	return []ent.Edge{
+		edge.To("request_body_chunks", RequestBodyChunkRef.Type).
+			Annotations(entgql.Skip(), entsql.OnDelete(entsql.Cascade)),
 		edge.From("api_key", APIKey.Type).Ref("requests").Field("api_key_id").Immutable().Unique(),
 		edge.From("project", Project.Type).
 			Ref("requests").
@@ -146,13 +201,15 @@ func (Request) Annotations() []schema.Annotation {
 func (Request) Policy() ent.Policy {
 	return scopes.Policy{
 		Query: scopes.QueryPolicy{
-			scopes.APIKeyScopeQueryRule(scopes.ScopeWriteRequests),
-			scopes.UserProjectScopeReadRule(scopes.ScopeReadRequests),
+			// API key principals stay inside the key's project: a project-level
+			// write_requests grant must not become a system-wide read.
+			scopes.APIKeyProjectScopeReadRule(scopes.ScopeWriteRequests),
+			scopes.UserProjectScopeReadRequestsRule(scopes.ScopeReadRequests),
 			scopes.OwnerRule(),
 			scopes.UserReadScopeRule(scopes.ScopeReadRequests),
 		},
 		Mutation: scopes.MutationPolicy{
-			scopes.APIKeyScopeMutationRule(scopes.ScopeWriteRequests),
+			scopes.APIKeyProjectScopeWriteRule(scopes.ScopeWriteRequests),
 			scopes.UserProjectScopeWriteRule(scopes.ScopeWriteRequests),
 			scopes.OwnerRule(),
 			scopes.UserWriteScopeRule(scopes.ScopeWriteRequests),

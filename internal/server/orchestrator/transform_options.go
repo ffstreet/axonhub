@@ -1,12 +1,14 @@
 package orchestrator
 
 import (
+	"maps"
 	"strings"
 
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 // applyTransformOptions applies channel transform options to create a new llm.Request.
@@ -20,6 +22,7 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 
 	if !transformOptions.ForceArrayInstructions &&
 		!transformOptions.ForceArrayInputs &&
+		!transformOptions.ForceArrayStop &&
 		!transformOptions.ReplaceDeveloperRoleWithSystem {
 		return req
 	}
@@ -34,11 +37,109 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 		newReq.TransformOptions.ArrayInputs = lo.ToPtr(true)
 	}
 
+	if transformOptions.ForceArrayStop {
+		newReq.Stop = forceArrayStop(newReq.Stop)
+
+		// Legacy /v1/completions requests keep their stop value in Completion.Stop,
+		// which the outbound completion transformer reads instead of req.Stop.
+		if newReq.Completion != nil {
+			completion := *newReq.Completion
+			completion.Stop = forceArrayStop(completion.Stop)
+			newReq.Completion = &completion
+		}
+	}
+
 	if transformOptions.ReplaceDeveloperRoleWithSystem {
 		newReq.Messages = replaceDeveloperRoleWithSystem(newReq.Messages)
 	}
 
 	return &newReq
+}
+
+// applyModelDefaultMaxTokens copies the catalog model output limit onto the
+// request so Anthropic outbound conversion can use it as max_tokens when the
+// client omitted an output cap. Other outbound formats leave max_tokens unset.
+func applyModelDefaultMaxTokens(req *llm.Request, candidate *ChannelModelsCandidate, outboundFormat llm.APIFormat) *llm.Request {
+	if req == nil || candidate == nil || candidate.DefaultMaxTokens <= 0 {
+		return req
+	}
+
+	if outboundFormat != llm.APIFormatAnthropicMessage {
+		return req
+	}
+
+	if req.MaxTokens != nil || req.MaxCompletionTokens != nil {
+		return req
+	}
+
+	if req.TransformOptions.DefaultMaxTokens != nil {
+		return req
+	}
+
+	newReq := *req
+	newReq.TransformOptions.DefaultMaxTokens = lo.ToPtr(candidate.DefaultMaxTokens)
+
+	return &newReq
+}
+
+// applyReasoningEffortMapping applies the channel's reasoning effort mapping to the
+// unified request before the outbound transformer runs, so the mapping affects every
+// outbound protocol (chat completions, responses, messages) uniformly, regardless of
+// which client the request came from.
+func applyReasoningEffortMapping(req *llm.Request, channelSettings *objects.ChannelSettings) *llm.Request {
+	if req == nil || channelSettings == nil {
+		return req
+	}
+
+	// With thinking.type=between_tools the Anthropic inbound keeps the unified effort at
+	// "none" (thinking is off for other protocols) and records the native effort only in
+	// TransformerMetadata, so map that value instead and leave ReasoningEffort as is.
+	source := req.ReasoningEffort
+	nativeOnly := false
+	if source == llm.ReasoningEffortNone && req.TransformerMetadata != nil {
+		thinkingType, _ := req.TransformerMetadata[anthropic.TransformerMetadataKeyThinkingType].(string)
+		if effort, ok := req.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort].(string); ok && thinkingType == "between_tools" && effort != "" {
+			source = effort
+			nativeOnly = true
+		}
+	}
+
+	mapped := llm.ApplyReasoningEffortMapping(source, channelSettings.TransformOptions.ReasoningEffortMapping)
+	if mapped == source {
+		return req
+	}
+
+	newReq := *req
+
+	// The Anthropic inbound records the client's native output_config.effort in
+	// TransformerMetadata and the outbound transformer rebuilds the upstream request
+	// from that marker, so it must follow the mapped value or the mapping would never
+	// reach messages-protocol channels. Clone the map first: the shallow request copy
+	// still shares it with the original request.
+	if _, ok := newReq.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort]; ok {
+		metadata := make(map[string]any, len(newReq.TransformerMetadata))
+		maps.Copy(metadata, newReq.TransformerMetadata)
+
+		metadata[anthropic.TransformerMetadataKeyOutputConfigEffort] = mapped
+		newReq.TransformerMetadata = metadata
+	}
+
+	if !nativeOnly {
+		newReq.ReasoningEffort = mapped
+	}
+
+	return &newReq
+}
+
+// forceArrayStop rewrites a single stop sequence into the array form.
+// OpenAI accepts both forms, but strict OpenAI-compatible upstreams reject the
+// string form with HTTP 400, so such channels can opt into the array form.
+func forceArrayStop(stop *llm.Stop) *llm.Stop {
+	if stop == nil || stop.Stop == nil {
+		return stop
+	}
+
+	return &llm.Stop{MultipleStop: []string{*stop.Stop}}
 }
 
 // replaceDeveloperRoleWithSystem replaces developer role with system in messages.

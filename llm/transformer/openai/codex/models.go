@@ -1,0 +1,112 @@
+package codex
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/oauth"
+)
+
+// SupportsModelCatalog reports whether the base URL uses the official Codex catalog.
+func SupportsModelCatalog(baseURL string) bool {
+	if baseURL == "" || baseURL == "https://api.openai.com/v1" {
+		return true
+	}
+	parsed, err := url.Parse(strings.TrimRight(baseURL, "#"))
+	return err == nil && parsed.Scheme == "https" && parsed.Host == "chatgpt.com" &&
+		strings.TrimRight(parsed.Path, "/") == "/backend-api/codex"
+}
+
+// ModelsRequest uses the same OAuth provider and client version as inference.
+func ModelsRequest(ctx context.Context, tokens oauth.TokenGetter, baseURL, clientVersion string) (*httpclient.Request, error) {
+	creds, err := tokens.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if baseURL == "" || baseURL == "https://api.openai.com/v1" {
+		baseURL = codexBaseURL
+	}
+	endpoint, err := url.Parse(strings.TrimRight(baseURL, "#"))
+	if err != nil {
+		return nil, fmt.Errorf("parse Codex model catalog URL: %w", err)
+	}
+	endpoint = endpoint.JoinPath("models")
+	query := endpoint.Query()
+	query.Set("client_version", clientVersion)
+	endpoint.RawQuery = query.Encode()
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+creds.AccessToken)
+	headers.Set("Accept", "application/json")
+	headers.Set("Version", clientVersion)
+	headers.Set("Originator", AxonHubOriginator)
+	headers.Set(BetaFeaturesHeader, fabricatedBetaFeatures)
+	if accountID := ExtractChatGPTAccountIDFromJWT(creds.AccessToken); accountID != "" {
+		headers.Set("Chatgpt-Account-Id", accountID)
+	}
+	return &httpclient.Request{
+		Method:  http.MethodGet,
+		URL:     endpoint.String(),
+		Headers: headers,
+	}, nil
+}
+
+// ParseThirdPartyModelCatalog returns only models explicitly listed by a third-party catalog.
+func ParseThirdPartyModelCatalog(body []byte) ([]string, error) {
+	return parseModelCatalog(body, false, false)
+}
+
+// ParseModelCatalog returns only picker-visible models in upstream priority order.
+func ParseModelCatalog(body []byte) ([]string, error) {
+	return parseModelCatalog(body, true, true)
+}
+
+func parseModelCatalog(body []byte, supplementImageModel, requireListVisibility bool) ([]string, error) {
+	var response struct {
+		Models []struct {
+			Slug       string `json:"slug"`
+			Visibility string `json:"visibility"`
+			Priority   int    `json:"priority"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(response.Models, func(i, j int) bool {
+		return response.Models[i].Priority < response.Models[j].Priority
+	})
+	models := make([]string, 0, len(response.Models))
+	imageModelsIncluded := make(map[string]bool, len(codexImageModels))
+	for _, model := range response.Models {
+		if (!requireListVisibility || model.Visibility == "list") && strings.TrimSpace(model.Slug) != "" {
+			if isCodexImageModel(model.Slug) {
+				if imageModelsIncluded[model.Slug] {
+					continue
+				}
+				imageModelsIncluded[model.Slug] = true
+			}
+			models = append(models, model.Slug)
+		}
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("Codex catalog has no visible models")
+	}
+	if supplementImageModel {
+		for _, imageModel := range codexImageModels {
+			if !imageModelsIncluded[imageModel] {
+				models = append(models, imageModel)
+			}
+		}
+	}
+	return models, nil
+}
+
+func isCodexImageModel(model string) bool {
+	return slices.Contains(codexImageModels, model)
+}

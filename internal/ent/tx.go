@@ -14,6 +14,8 @@ type Tx struct {
 	config
 	// APIKey is the client for interacting with the APIKey builders.
 	APIKey *APIKeyClient
+	// APIKeyProfileTemplate is the client for interacting with the APIKeyProfileTemplate builders.
+	APIKeyProfileTemplate *APIKeyProfileTemplateClient
 	// Channel is the client for interacting with the Channel builders.
 	Channel *ChannelClient
 	// ChannelModelPrice is the client for interacting with the ChannelModelPrice builders.
@@ -26,16 +28,38 @@ type Tx struct {
 	ChannelProbe *ChannelProbeClient
 	// DataStorage is the client for interacting with the DataStorage builders.
 	DataStorage *DataStorageClient
+	// Invitation is the client for interacting with the Invitation builders.
+	Invitation *InvitationClient
 	// Model is the client for interacting with the Model builders.
 	Model *ModelClient
+	// OIDCIdentity is the client for interacting with the OIDCIdentity builders.
+	OIDCIdentity *OIDCIdentityClient
+	// Plugin is the client for interacting with the Plugin builders.
+	Plugin *PluginClient
+	// PluginSchedule is the client for interacting with the PluginSchedule builders.
+	PluginSchedule *PluginScheduleClient
+	// PluginScheduleRun is the client for interacting with the PluginScheduleRun builders.
+	PluginScheduleRun *PluginScheduleRunClient
+	// PluginStorage is the client for interacting with the PluginStorage builders.
+	PluginStorage *PluginStorageClient
+	// PluginTableOperation is the client for interacting with the PluginTableOperation builders.
+	PluginTableOperation *PluginTableOperationClient
+	// PluginTableStorage is the client for interacting with the PluginTableStorage builders.
+	PluginTableStorage *PluginTableStorageClient
 	// Project is the client for interacting with the Project builders.
 	Project *ProjectClient
 	// Prompt is the client for interacting with the Prompt builders.
 	Prompt *PromptClient
+	// PromptProtectionRule is the client for interacting with the PromptProtectionRule builders.
+	PromptProtectionRule *PromptProtectionRuleClient
 	// ProviderQuotaStatus is the client for interacting with the ProviderQuotaStatus builders.
 	ProviderQuotaStatus *ProviderQuotaStatusClient
 	// Request is the client for interacting with the Request builders.
 	Request *RequestClient
+	// RequestBodyChunk is the client for interacting with the RequestBodyChunk builders.
+	RequestBodyChunk *RequestBodyChunkClient
+	// RequestBodyChunkRef is the client for interacting with the RequestBodyChunkRef builders.
+	RequestBodyChunkRef *RequestBodyChunkRefClient
 	// RequestExecution is the client for interacting with the RequestExecution builders.
 	RequestExecution *RequestExecutionClient
 	// Role is the client for interacting with the Role builders.
@@ -186,17 +210,29 @@ func (tx *Tx) Client() *Client {
 
 func (tx *Tx) init() {
 	tx.APIKey = NewAPIKeyClient(tx.config)
+	tx.APIKeyProfileTemplate = NewAPIKeyProfileTemplateClient(tx.config)
 	tx.Channel = NewChannelClient(tx.config)
 	tx.ChannelModelPrice = NewChannelModelPriceClient(tx.config)
 	tx.ChannelModelPriceVersion = NewChannelModelPriceVersionClient(tx.config)
 	tx.ChannelOverrideTemplate = NewChannelOverrideTemplateClient(tx.config)
 	tx.ChannelProbe = NewChannelProbeClient(tx.config)
 	tx.DataStorage = NewDataStorageClient(tx.config)
+	tx.Invitation = NewInvitationClient(tx.config)
 	tx.Model = NewModelClient(tx.config)
+	tx.OIDCIdentity = NewOIDCIdentityClient(tx.config)
+	tx.Plugin = NewPluginClient(tx.config)
+	tx.PluginSchedule = NewPluginScheduleClient(tx.config)
+	tx.PluginScheduleRun = NewPluginScheduleRunClient(tx.config)
+	tx.PluginStorage = NewPluginStorageClient(tx.config)
+	tx.PluginTableOperation = NewPluginTableOperationClient(tx.config)
+	tx.PluginTableStorage = NewPluginTableStorageClient(tx.config)
 	tx.Project = NewProjectClient(tx.config)
 	tx.Prompt = NewPromptClient(tx.config)
+	tx.PromptProtectionRule = NewPromptProtectionRuleClient(tx.config)
 	tx.ProviderQuotaStatus = NewProviderQuotaStatusClient(tx.config)
 	tx.Request = NewRequestClient(tx.config)
+	tx.RequestBodyChunk = NewRequestBodyChunkClient(tx.config)
+	tx.RequestBodyChunkRef = NewRequestBodyChunkRefClient(tx.config)
 	tx.RequestExecution = NewRequestExecutionClient(tx.config)
 	tx.Role = NewRoleClient(tx.config)
 	tx.System = NewSystemClient(tx.config)

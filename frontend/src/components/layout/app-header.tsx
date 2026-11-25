@@ -3,24 +3,29 @@ import { Link } from '@tanstack/react-router';
 import { IconSettings } from '@tabler/icons-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
 import { Button } from '@/components/ui/button';
-import { SidebarTrigger } from '@/components/ui/sidebar';
 import { LanguageSwitch } from '@/components/language-switch';
-import { PermissionGuard } from '@/components/permission-guard';
-import { ProfileDropdown } from '@/components/profile-dropdown';
 import { ThemeSwitch } from '@/components/theme-switch';
+import { PluginHeaderActions } from '@/features/plugins/components/plugin-header-actions';
 import { QuotaBadges } from '@/components/quota-badges';
+import { PermissionGuard } from '@/components/permission-guard';
 import { checkProviderQuotas } from '@/features/system/data/quotas';
 import { useBrandSettings } from '@/features/system/data/system';
+import { BrandLogo } from './brand-logo';
+import { NavModuleTabs } from './nav-module-tabs';
 import { ProjectSwitcher } from './project-switcher';
+import { type SidebarData } from './types';
 import { toast } from 'sonner';
 
-export function AppHeader() {
+export function AppHeader({ sidebarData }: { sidebarData: SidebarData }) {
   const { data: brandSettings } = useBrandSettings();
   const { t } = useTranslation();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const queryClient = useQueryClient();
+  const { isMobile } = useSidebar();
   const displayName = brandSettings?.brandName || 'AxonHub';
+  const showProjectSwitcher = sidebarData.activeModuleId === 'project';
 
   const refreshMutation = useMutation({
     mutationFn: async () => {
@@ -28,6 +33,8 @@ export function AppHeader() {
     },
     onSuccess: () => {
       void queryClient.refetchQueries({ queryKey: ['provider-quotas'] });
+      void queryClient.invalidateQueries({ queryKey: ['channels'] });
+      void queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys'] });
       toast.success(t('system.providerQuota.refresh.success'));
     },
     onError: (error: any) => {
@@ -53,46 +60,49 @@ export function AppHeader() {
           {/* Logo */}
           <div className='flex items-center gap-2'>
             <div className='flex size-8 shrink-0 items-center justify-center overflow-hidden rounded'>
-              {brandSettings?.brandLogo ? (
-                <img
-                  src={brandSettings.brandLogo}
-                  alt='Brand Logo'
-                  width={24}
-                  height={24}
-                  className='size-8 object-cover'
-                  onError={(e) => {
-                    e.currentTarget.src = '/logo.jpg';
-                  }}
-                />
-              ) : (
-                <img src='/logo.jpg' alt='Default Logo' width={24} height={24} className='size-8 object-cover' />
-              )}
+              <BrandLogo brandLogo={brandSettings?.brandLogo} />
             </div>
             <span className='text-sm leading-none font-semibold'>{displayName}</span>
           </div>
 
-          {/* Separator */}
-          <div className='bg-border mx-0.5 h-3.5 w-px' />
+          {/* Module tabs - desktop only, the mobile sidebar has its own switcher */}
+          {!isMobile && (
+            <NavModuleTabs modules={sidebarData.modules} activeModuleId={sidebarData.activeModuleId} className='ml-4' />
+          )}
 
-          {/* Project Switcher */}
-          <ProjectSwitcher />
+          {/* Project Switcher - only meaningful for project-scoped pages. Placed after
+              the tabs so toggling it never shifts them. */}
+          {showProjectSwitcher && (
+            <>
+              <span className='text-muted-foreground/60 mx-0.5 text-sm select-none'>/</span>
+              <ProjectSwitcher />
+            </>
+          )}
         </div>
 
         {/* 右侧控件 */}
         <div className='flex items-center gap-2 pr-6'>
-          {/* Quota Badges */}
-          <QuotaBadges onRefresh={handleRefresh} isRefreshing={isRefreshing} />
-
-          <PermissionGuard requiredSystemScope='read_system'>
-            <Link to='/system'>
-              <Button variant='ghost' size='icon' className='size-8'>
-                <IconSettings className='h-4 w-4' />
-              </Button>
-            </Link>
+          {/* Quota Badges - only visible to users with channel read permission */}
+          <PermissionGuard requiredSystemScope='read_channels'>
+            <QuotaBadges onRefresh={handleRefresh} isRefreshing={isRefreshing} />
           </PermissionGuard>
-          <LanguageSwitch />
-          <ThemeSwitch />
-          <ProfileDropdown />
+
+          <PluginHeaderActions isMobile={isMobile} />
+
+          {/* Desktop-only controls - hidden on mobile */}
+          {!isMobile && (
+            <>
+              <PermissionGuard requiredSystemScope='read_settings'>
+                <Link to='/system'>
+                  <Button variant='ghost' size='icon' className='size-8'>
+                    <IconSettings className='h-4 w-4' />
+                  </Button>
+                </Link>
+              </PermissionGuard>
+              <LanguageSwitch />
+              <ThemeSwitch />
+            </>
+          )}
         </div>
       </div>
     </header>

@@ -14,7 +14,9 @@ import (
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/middleware"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer"
@@ -32,14 +34,20 @@ type PlaygroundResponseError struct {
 type PlaygroundHandlersParams struct {
 	fx.In
 
-	ChannelService  *biz.ChannelService
-	ModelService    *biz.ModelService
-	RequestService  *biz.RequestService
-	SystemService   *biz.SystemService
-	UsageLogService *biz.UsageLogService
-	PromptService   *biz.PromptService
-	QuotaService    *biz.QuotaService
-	HttpClient      *httpclient.HttpClient
+	ChannelService              *biz.ChannelService
+	ModelService                *biz.ModelService
+	DefaultSelector             *orchestrator.DefaultSelector
+	RequestService              *biz.RequestService
+	SystemService               *biz.SystemService
+	UsageLogService             *biz.UsageLogService
+	PromptService               *biz.PromptService
+	PromptProtectionRuleService *biz.PromptProtectionRuleService
+	QuotaService                *biz.QuotaService
+	HttpClient                  *httpclient.HttpClient
+	LiveStreamRegistry          *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
+	PluginManager               *plugin.Manager
 }
 
 type PlaygroundHandlers struct {
@@ -52,7 +60,7 @@ func NewPlaygroundHandlers(params PlaygroundHandlersParams) *PlaygroundHandlers 
 		ChannelService: params.ChannelService,
 		ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 			params.ChannelService,
-			params.ModelService,
+			params.DefaultSelector,
 			params.RequestService,
 			params.HttpClient,
 			aisdk.NewDataStreamTransformer(),
@@ -60,7 +68,11 @@ func NewPlaygroundHandlers(params PlaygroundHandlersParams) *PlaygroundHandlers 
 			params.UsageLogService,
 			params.PromptService,
 			params.QuotaService,
-		),
+			params.PromptProtectionRuleService,
+			params.LiveStreamRegistry,
+			params.ChannelLimiterManager,
+			params.ProviderQuotaStatusProvider,
+			orchestratorPlugins(params.PluginManager)),
 	}
 }
 
@@ -110,6 +122,20 @@ func tryExtractUpstreamErrorMessage(body []byte) string {
 
 // HandleError handles raw errors and returns a PlaygroundResponseError.
 func (handlers *PlaygroundHandlers) HandleError(rawErr error) *PlaygroundResponseError {
+	var quotaErr *orchestrator.QuotaExhaustedError
+	if errors.As(rawErr, &quotaErr) {
+		return &PlaygroundResponseError{
+			Status: http.StatusServiceUnavailable,
+			Error: struct {
+				Code    int    `json:"code,omitempty"`
+				Message string `json:"message"`
+			}{
+				Code:    http.StatusServiceUnavailable,
+				Message: quotaErr.Error(),
+			},
+		}
+	}
+
 	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
 		// Prefer upstream error message when available
 		msg := tryExtractUpstreamErrorMessage(httpErr.Body)
@@ -188,6 +214,8 @@ func (handlers *PlaygroundHandlers) HandleError(rawErr error) *PlaygroundRespons
 }
 
 func (handlers *PlaygroundHandlers) ChatCompletion(c *gin.Context) {
+	cancel := middleware.SelectLLMTimeout(c, true)
+	defer cancel()
 	ctx := c.Request.Context()
 
 	genericReq, err := httpclient.ReadHTTPRequest(c.Request)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/jina"
 )
@@ -13,14 +14,20 @@ import (
 type JinaHandlersParams struct {
 	fx.In
 
-	ChannelService  *biz.ChannelService
-	ModelService    *biz.ModelService
-	RequestService  *biz.RequestService
-	SystemService   *biz.SystemService
-	UsageLogService *biz.UsageLogService
-	PromptService   *biz.PromptService
-	QuotaService    *biz.QuotaService
-	HttpClient      *httpclient.HttpClient
+	ChannelService              *biz.ChannelService
+	ModelService                *biz.ModelService
+	DefaultSelector             *orchestrator.DefaultSelector
+	RequestService              *biz.RequestService
+	SystemService               *biz.SystemService
+	UsageLogService             *biz.UsageLogService
+	PromptService               *biz.PromptService
+	PromptProtectionRuleService *biz.PromptProtectionRuleService
+	QuotaService                *biz.QuotaService
+	HttpClient                  *httpclient.HttpClient
+	LiveStreamRegistry          *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
+	PluginManager               *plugin.Manager
 }
 
 func NewJinaHandlers(params JinaHandlersParams) *JinaHandlers {
@@ -28,7 +35,7 @@ func NewJinaHandlers(params JinaHandlersParams) *JinaHandlers {
 		RerankHandlers: &ChatCompletionHandlers{
 			ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 				params.ChannelService,
-				params.ModelService,
+				params.DefaultSelector,
 				params.RequestService,
 				params.HttpClient,
 				jina.NewRerankInboundTransformer(),
@@ -36,12 +43,16 @@ func NewJinaHandlers(params JinaHandlersParams) *JinaHandlers {
 				params.UsageLogService,
 				params.PromptService,
 				params.QuotaService,
-			),
+				params.PromptProtectionRuleService,
+				params.LiveStreamRegistry,
+				params.ChannelLimiterManager,
+				params.ProviderQuotaStatusProvider,
+				orchestratorPlugins(params.PluginManager)),
 		},
 		EmbeddingHandlers: &ChatCompletionHandlers{
 			ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 				params.ChannelService,
-				params.ModelService,
+				params.DefaultSelector,
 				params.RequestService,
 				params.HttpClient,
 				jina.NewEmbeddingInboundTransformer(),
@@ -49,7 +60,11 @@ func NewJinaHandlers(params JinaHandlersParams) *JinaHandlers {
 				params.UsageLogService,
 				params.PromptService,
 				params.QuotaService,
-			),
+				params.PromptProtectionRuleService,
+				params.LiveStreamRegistry,
+				params.ChannelLimiterManager,
+				params.ProviderQuotaStatusProvider,
+				orchestratorPlugins(params.PluginManager)),
 		},
 	}
 }

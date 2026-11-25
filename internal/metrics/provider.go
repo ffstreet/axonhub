@@ -17,9 +17,22 @@ import (
 // Meter is the global meter for the application.
 var Meter metric.Meter
 
+// enabled reports whether metrics collection is enabled.
+var enabled bool
+
+// Enabled reports whether metrics collection is enabled. Callers can use it
+// to skip metric-only work (e.g. channel label lookups) when nothing will be
+// exported.
+func Enabled() bool {
+	return enabled
+}
+
 // NewProvider initializes the OpenTelemetry metrics provider.
 func NewProvider(config Config) (*sdk.MeterProvider, error) {
 	ctx := context.Background()
+
+	enabled = config.Enabled
+
 	// If metrics are disabled, create a no-op meter provider
 	if !config.Enabled {
 		meterProvider := sdk.NewMeterProvider()
@@ -64,6 +77,8 @@ func NewProvider(config Config) (*sdk.MeterProvider, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create otlphttp exporter: %w", err)
 		}
+	default:
+		return nil, fmt.Errorf("unsupported metrics exporter type: %q", config.Exporter.Type)
 	}
 
 	// Create meter provider

@@ -2,20 +2,25 @@ package gql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"entgo.io/contrib/entgql"
+	"entgo.io/ent/privacy"
+	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/99designs/gqlgen/graphql/handler/extension"
 	"github.com/99designs/gqlgen/graphql/handler/lru"
 	"github.com/99designs/gqlgen/graphql/handler/transport"
-	"github.com/99designs/gqlgen/graphql/playground"
 	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/gqlerror"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
@@ -26,15 +31,21 @@ import (
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/ent/role"
-	"github.com/looplj/axonhub/internal/ent/system"
 	"github.com/looplj/axonhub/internal/ent/thread"
 	"github.com/looplj/axonhub/internal/ent/trace"
 	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/ent/userproject"
 	"github.com/looplj/axonhub/internal/ent/userrole"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/server/backup"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/gc"
+	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
+	"github.com/looplj/axonhub/internal/server/scheduler"
+	"github.com/looplj/axonhub/internal/server/video_storage"
+	"github.com/looplj/axonhub/llm/httpclient"
 )
 
 type Dependencies struct {
@@ -47,6 +58,7 @@ type Dependencies struct {
 	SystemService                  *biz.SystemService
 	ChannelService                 *biz.ChannelService
 	RequestService                 *biz.RequestService
+	QuotaService                   *biz.QuotaService
 	ProjectService                 *biz.ProjectService
 	DataStorageService             *biz.DataStorageService
 	RoleService                    *biz.RoleService
@@ -54,47 +66,65 @@ type Dependencies struct {
 	ThreadService                  *biz.ThreadService
 	UsageLogService                *biz.UsageLogService
 	ChannelOverrideTemplateService *biz.ChannelOverrideTemplateService
+	APIKeyProfileTemplateService   *biz.APIKeyProfileTemplateService
 	ModelService                   *biz.ModelService
 	BackupService                  *backup.BackupService
 	ChannelProbeService            *biz.ChannelProbeService
 	PromptService                  *biz.PromptService
+	PromptProtectionRuleService    *biz.PromptProtectionRuleService
 	ProviderQuotaService           *biz.ProviderQuotaService
+	Scheduler                      *scheduler.Scheduler
+	DefaultSelector                *orchestrator.DefaultSelector
+	CandidateSelectorDiagnostics   *orchestrator.CandidateSelectorDiagnostics
+	ChannelLimiterManager          *orchestrator.ChannelLimiterManager
+	HttpClient                     *httpclient.HttpClient
+	GCWorker                       *gc.Worker
+	VideoWorker                    *video_storage.Worker
+	CatalogService                 *biz.CatalogService
+	PluginManager                  *plugin.Manager
 }
 
 type GraphqlHandler struct {
-	Graphql    http.Handler
-	Playground http.Handler
+	Graphql       http.Handler
+	PluginGraphql http.Handler
+	PluginFetch   http.Handler
+
+	executable graphql.ExecutableSchema
 }
 
+// maxBackupUploadSize bounds what the restore mutation accepts through the
+// multipart transport. gqlgen defaults MaxUploadSize to 32 MiB, but a real
+// backup exceeds that as soon as the instance has history: the request and
+// response bodies live in external storage, yet usage rows alone run to tens of
+// MiB (2026-10-05: a 108 MiB production backup was rejected with "failed to
+// parse multipart form, request body too large").
+//
+// It bounds the input, not memory safety. Restore decodes the whole backup into
+// memory-backed structures and then writes it back, and the measured peak is
+// 6-7x the file size (decoding alone is already 3-3.7x, which the upload reader
+// does not remove). 128 MiB is the size that still keeps a restore inside the
+// 1 GiB container limit docker-compose and the default Helm values ship with;
+// a cap equal to that limit would only trade the clean "request body too large"
+// error for an OOM kill. Raising it further needs a streaming Restore, not a
+// bigger constant.
+//
+// Restores that approach this cap may take longer than the default 30s
+// server.request_timeout, which /admin and therefore this endpoint run under;
+// raise AXONHUB_SERVER_REQUEST_TIMEOUT (or the config file value) before
+// uploading one.
+const maxBackupUploadSize = 128 << 20 // 128 MiB
+
 func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
-	gqlSrv := handler.New(
-		NewSchema(
-			deps.Ent,
-			deps.AuthService,
-			deps.APIKeyService,
-			deps.UserService,
-			deps.SystemService,
-			deps.ChannelService,
-			deps.RequestService,
-			deps.ProjectService,
-			deps.DataStorageService,
-			deps.RoleService,
-			deps.TraceService,
-			deps.ThreadService,
-			deps.UsageLogService,
-			deps.ChannelOverrideTemplateService,
-			deps.ModelService,
-			deps.BackupService,
-			deps.ChannelProbeService,
-			deps.PromptService,
-			deps.ProviderQuotaService,
-		),
-	)
+	schema := newSchemaFromDeps(deps)
+	gqlSrv := handler.New(schema)
 
 	gqlSrv.AddTransport(transport.Options{})
 	gqlSrv.AddTransport(transport.GET{})
 	gqlSrv.AddTransport(transport.POST{})
-	gqlSrv.AddTransport(transport.MultipartForm{})
+	// The restore mutation uploads a whole backup file here; MaxMemory keeps the
+	// default so the body spools to disk instead of being held in memory by the
+	// transport.
+	gqlSrv.AddTransport(transport.MultipartForm{MaxUploadSize: maxBackupUploadSize})
 
 	gqlSrv.SetQueryCache(lru.New[*ast.QueryDocument](1024))
 
@@ -103,24 +133,174 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 		Cache: lru.New[string](1024),
 	})
 	gqlSrv.Use(&loggingTracer{})
-	gqlSrv.Use(entgql.Transactioner{
-		TxOpener: deps.Ent,
-		// Skip transaction for TestChannel mutation to avoid transaction conflicts
-		// when multiple test requests are sent in parallel from the frontend.
-		// TestChannel performs LLM API calls which can be long-running, and the
-		// database operations within don't require transactional consistency.
-		SkipTxFunc: entgql.SkipOperations("TestChannel"),
-	})
+	gqlSrv.AroundOperations(apiKeyReadOnly)
+	gqlSrv.Use(graphqlTransactions(deps.Ent))
+	gqlSrv.SetErrorPresenter(presentGraphqlError)
 
 	return &GraphqlHandler{
-		Graphql:    gqlSrv,
-		Playground: playground.Handler("AxonHub", "/admin/graphql"),
+		Graphql:       gqlSrv,
+		PluginGraphql: newPluginGraphqlHandler(schema, deps.Ent, deps.PluginManager),
+		PluginFetch:   newPluginFetchHandler(deps.PluginManager),
+		executable:    schema,
 	}
+}
+
+func newSchemaFromDeps(deps Dependencies) graphql.ExecutableSchema {
+	return NewSchema(
+		deps.Ent,
+		deps.AuthService,
+		deps.APIKeyService,
+		deps.UserService,
+		deps.SystemService,
+		deps.ChannelService,
+		deps.RequestService,
+		deps.QuotaService,
+		deps.ProjectService,
+		deps.DataStorageService,
+		deps.RoleService,
+		deps.TraceService,
+		deps.ThreadService,
+		deps.UsageLogService,
+		deps.ChannelOverrideTemplateService,
+		deps.APIKeyProfileTemplateService,
+		deps.ModelService,
+		deps.BackupService,
+		deps.ChannelProbeService,
+		deps.PromptService,
+		deps.PromptProtectionRuleService,
+		deps.ProviderQuotaService,
+		deps.Scheduler,
+		deps.DefaultSelector,
+		deps.CandidateSelectorDiagnostics,
+		deps.ChannelLimiterManager,
+		deps.HttpClient,
+		deps.GCWorker,
+		deps.VideoWorker,
+		deps.CatalogService,
+		deps.PluginManager,
+	)
+}
+
+// entgql's field skipper inspects only direct selections. Both transaction hooks
+// must use the same active root fields, including fragments and variable directives.
+type operationTransactions struct{ entgql.Transactioner }
+
+func graphqlTransactions(db *ent.Client) operationTransactions {
+	return operationTransactions{entgql.Transactioner{TxOpener: db}}
+}
+
+func skipGraphqlTransaction(oc *graphql.OperationContext) bool {
+	op := oc.Operation
+	if op == nil || op.Operation != ast.Mutation {
+		return true
+	}
+	if op.Name == "TestChannel" || op.Name == "TestChannelAPIKeys" {
+		return true
+	}
+	for _, f := range graphql.CollectFields(oc, op.SelectionSet, []string{"Mutation"}) {
+		switch f.Name {
+		case "bulkImportChannels", "applyCatalogImport", "checkProviderQuotas", "resetChannelQuotaNow":
+			return true
+		case "runPluginTask", "enablePlugin", "installPlugin", "installPluginFromMarket", "pluginTableOperation":
+			// Plugin tasks and storage operations manage their own transactions.
+			return true
+		}
+	}
+	return false
+}
+
+func (t operationTransactions) MutateOperationContext(ctx context.Context, oc *graphql.OperationContext) *gqlerror.Error {
+	if skipGraphqlTransaction(oc) {
+		return nil
+	}
+	return t.Transactioner.MutateOperationContext(ctx, oc)
+}
+
+func (t operationTransactions) InterceptResponse(ctx context.Context, next graphql.ResponseHandler) *graphql.Response {
+	if skipGraphqlTransaction(graphql.GetOperationContext(ctx)) {
+		return next(ctx)
+	}
+	return t.Transactioner.InterceptResponse(ctx, next)
+}
+
+func presentGraphqlError(ctx context.Context, err error) *gqlerror.Error {
+	if errors.Is(err, authz.ErrPluginSystemBypass) {
+		return &gqlerror.Error{
+			Message:    "this operation is not available to plugin callers",
+			Extensions: map[string]any{"code": xerrors.ErrCodeForbidden},
+		}
+	}
+	if codedErr, ok := errors.AsType[*xerrors.CodedError](err); ok {
+		return &gqlerror.Error{
+			Message: codedErr.Message,
+			Extensions: map[string]any{
+				"code":     codedErr.Code,
+				"resource": codedErr.Extensions["resource"],
+				"field":    codedErr.Extensions["field"],
+				"value":    codedErr.Extensions["value"],
+			},
+		}
+	}
+	if errors.Is(err, privacy.Deny) {
+		return &gqlerror.Error{
+			Message: "permission denied",
+			Extensions: map[string]any{
+				"code": xerrors.ErrCodeForbidden,
+			},
+		}
+	}
+	return graphql.DefaultErrorPresenter(ctx, err)
+}
+
+func rejectPluginGraphqlOperation(ctx context.Context, next graphql.OperationHandler) graphql.ResponseHandler {
+	opCtx := graphql.GetOperationContext(ctx)
+	if opCtx == nil || opCtx.Operation == nil {
+		return next(ctx)
+	}
+	if opCtx.Operation.Operation == ast.Subscription {
+		return graphql.OneShot(graphql.ErrorResponse(ctx, "subscriptions are not supported"))
+	}
+	return next(ctx)
+}
+
+func newPluginGraphqlHandler(schema graphql.ExecutableSchema, client *ent.Client, manager *plugin.Manager) http.Handler {
+	srv := handler.New(schema)
+	srv.AddTransport(transport.POST{})
+	srv.SetQueryCache(lru.New[*ast.QueryDocument](1024))
+	srv.Use(extension.FixedComplexityLimit(pluginGraphqlComplexityLimit))
+	srv.Use(&loggingTracer{})
+	srv.AroundOperations(rejectPluginGraphqlOperation)
+	srv.Use(graphqlTransactions(client))
+	srv.SetErrorPresenter(presentGraphqlError)
+	return &pluginGraphqlHTTPHandler{
+		handler: srv,
+		manager: manager,
+	}
+}
+
+// apiKeyReadOnly keeps service-account API keys read-only on the admin GraphQL
+// surface. Admin mutations are normally gated by ent privacy and authz scopes,
+// but several custom mutations have side effects — outbound provider requests,
+// cache and storage maintenance — without an ent mutation for the privacy layer
+// to gate, so the whole mutation class is refused for API-key principals.
+func apiKeyReadOnly(ctx context.Context, next graphql.OperationHandler) graphql.ResponseHandler {
+	principal, ok := authz.GetPrincipal(ctx)
+	if !ok || principal.Type != authz.PrincipalTypeAPIKey {
+		return next(ctx)
+	}
+
+	opCtx := graphql.GetOperationContext(ctx)
+	if opCtx == nil || opCtx.Operation == nil || opCtx.Operation.Operation == ast.Query {
+		return next(ctx)
+	}
+
+	return graphql.OneShot(graphql.ErrorResponse(ctx, "service account API keys are read-only"))
 }
 
 var guidTypeToNodeType = map[string]string{
 	ent.TypeUser:                    user.Table,
 	ent.TypeAPIKey:                  apikey.Table,
+	ent.TypeAPIKeyProfileTemplate:   apikeyprofiletemplate.Table,
 	ent.TypeModel:                   model.Table,
 	ent.TypeChannel:                 channel.Table,
 	ent.TypeChannelProbe:            channelprobe.Table,
@@ -128,7 +308,6 @@ var guidTypeToNodeType = map[string]string{
 	ent.TypeRequest:                 request.Table,
 	ent.TypeRequestExecution:        requestexecution.Table,
 	ent.TypeRole:                    role.Table,
-	ent.TypeSystem:                  system.Table,
 	ent.TypeUsageLog:                usagelog.Table,
 	ent.TypeProject:                 project.Table,
 	ent.TypeUserProject:             userproject.Table,
@@ -150,8 +329,33 @@ func getNilableChannel(ctx context.Context, client *ent.Client, channelID int) (
 			return nil, nil
 		}
 
+		if errors.Is(err, privacy.Deny) {
+			return nil, nil
+		}
+
 		return nil, fmt.Errorf("failed to load channel: %w", err)
 	}
 
 	return ch, nil
+}
+
+func getNilableUser(ctx context.Context, client *ent.Client, userID int) (*ent.User, error) {
+	if userID == 0 {
+		return nil, nil
+	}
+
+	u, err := client.User.Query().Where(user.ID(userID)).First(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, nil
+		}
+
+		if errors.Is(err, privacy.Deny) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to load user: %w", err)
+	}
+
+	return u, nil
 }

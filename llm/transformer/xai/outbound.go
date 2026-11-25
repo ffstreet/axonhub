@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
@@ -59,6 +60,7 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 		PlatformType:   openai.PlatformOpenAI,
 		BaseURL:        config.BaseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		ReasoningField: openai.ReasoningFieldContent,
 	}
 
 	outbound, err := openai.NewOutboundTransformerWithConfig(openaiConfig)
@@ -107,21 +109,37 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: messages are required", transformer.ErrInvalidRequest)
 	}
 
-	switch chatReq.Model {
-	case "grok-4":
+	switch {
+	case chatReq.Model == "grok-4":
 		chatReq.ReasoningEffort = ""
-		chatReq.PresencePenalty = nil
-		chatReq.FrequencyPenalty = nil
-		chatReq.Stop = nil
-	case "grok-3", "grok-3-mini":
-		chatReq.PresencePenalty = nil
-		chatReq.FrequencyPenalty = nil
-		chatReq.Stop = nil
+		stripUnsupportedReasoningParams(chatReq)
+	case isReasoningOnlyModel(chatReq.Model):
+		stripUnsupportedReasoningParams(chatReq)
 	default:
 		// Do nothing
 	}
 
 	return t.Outbound.TransformRequest(ctx, chatReq)
+}
+
+// isReasoningOnlyModel reports whether the model rejects presence_penalty,
+// frequency_penalty and stop. It covers grok-3, grok-3-mini and every grok-4.x
+// variant except the explicit non-reasoning ones.
+func isReasoningOnlyModel(model string) bool {
+	switch {
+	case model == "grok-3", model == "grok-3-mini":
+		return true
+	case strings.HasPrefix(model, "grok-4"):
+		return !strings.Contains(model, "non-reasoning")
+	default:
+		return false
+	}
+}
+
+func stripUnsupportedReasoningParams(chatReq *llm.Request) {
+	chatReq.PresencePenalty = nil
+	chatReq.FrequencyPenalty = nil
+	chatReq.Stop = nil
 }
 
 func IsValidResponse(event *llm.Response) bool {
@@ -184,9 +202,10 @@ func IsValidResponse(event *llm.Response) bool {
 
 func (t *OutboundTransformer) TransformStream(
 	ctx context.Context,
+	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
-	originStream, err := t.Outbound.TransformStream(ctx, stream)
+	originStream, err := t.Outbound.TransformStream(ctx, req, stream)
 	if err != nil {
 		return nil, err
 	}

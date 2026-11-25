@@ -1,7 +1,10 @@
-.PHONY: generate build backend frontend cleanup-db \
+.PHONY: generate build backend frontend build-desktop cleanup-db \
+	test-backend-all \
 	e2e-test e2e-backend-start e2e-backend-stop e2e-backend-status e2e-backend-restart e2e-backend-clean \
 	migration-test migration-test-all migration-test-all-dbs \
-	sync-faq sync-models filter-logs
+	sync-faq sync-models filter-logs \
+	lint lint-privacy \
+	generate-schema
 
 # Generate GraphQL and Ent code
 generate:
@@ -35,6 +38,32 @@ build-frontend:
 build: build-frontend build-backend
 	@echo "Full build completed!"
 
+# Package the menu-bar app. The panel is native, so mygo writes no
+# TypeScript client. The browser admin is the frontend embedded in the
+# server, built here before packaging. cmd/axonhub-desktop is its own
+# module. mygo packages the current platform unless MYGO_FLAGS says
+# otherwise. -skip-build-command matches a config with no buildCommand.
+# SKIP_FRONTEND_BUILD=1 reuses internal/server/static/dist. Release CI
+# builds that tree once and passes it to the server archives and every
+# desktop installer.
+# Examples:
+#   make build-desktop
+#   make build-desktop MYGO_FLAGS="-platform darwin/arm64,windows/amd64"
+#   make build-desktop MYGO_FLAGS="-platform linux/amd64 -upload"
+#   SKIP_FRONTEND_BUILD=1 make build-desktop
+build-desktop:
+ifeq ($(SKIP_FRONTEND_BUILD),1)
+	@test -f internal/server/static/dist/index.html || { \
+		echo "Frontend dist is missing. Run make build-frontend or unset SKIP_FRONTEND_BUILD."; \
+		exit 1; \
+	}
+else
+	$(MAKE) build-frontend
+endif
+	@echo "Building axonhub desktop..."
+	cd cmd/axonhub-desktop && go tool mygo build -skip-build-command $(MYGO_FLAGS)
+	@echo "Desktop build completed!"
+
 # Cleanup test database - remove all playwright test data
 cleanup-db:
 	@echo "Cleaning up playwright test data from database..."
@@ -51,6 +80,21 @@ cleanup-db:
 	@sqlite3 axonhub.db "DELETE FROM users WHERE email LIKE 'pw-test-%' OR first_name LIKE 'pw-test%';"
 	@sqlite3 axonhub.db "DELETE FROM projects WHERE slug LIKE 'pw-test-%' OR name LIKE 'pw-test-%';"
 	@echo "Cleanup completed!"
+
+# --- Testing ---
+
+# Run all backend tests across all Go modules
+test-backend-all:
+	@echo "Running all backend tests..."
+	@echo ""
+	@echo "=== Testing root module ==="
+	go test ./...
+	@echo "=== Testing llm module ==="
+	cd llm && go test ./...
+	@echo "=== Testing desktop module ==="
+	cd cmd/axonhub-desktop && go test ./...
+	@echo ""
+	@echo "All backend tests completed!"
 
 # --- E2E Testing ---
 
@@ -122,3 +166,38 @@ sync-models:
 filter-logs:
 	@echo "Filtering load balance logs..."
 	@./scripts/utils/filter-load-balance-logs.sh
+
+# --- Linting ---
+
+GO_LINT_CMD = golangci-lint run --timeout 10m --max-same-issues 50 --new --fix ./...
+
+GO_MODULES := . llm cmd/axonhub-desktop
+
+lint-all:
+	@echo "Running golangci-lint (checking and fixing new code) across all Go modules..."
+	@for module in $(GO_MODULES); do \
+		echo ""; \
+		echo "=== Linting $$module module ==="; \
+		if [ -f "$$module/go.mod" ]; then \
+			cd $$module && $(GO_LINT_CMD) && cd - > /dev/null; \
+		else \
+			$(GO_LINT_CMD); \
+		fi; \
+	done
+	@echo ""
+	@echo "All lint checks passed!"
+
+# Generate JSON schema for configuration
+generate-schema:
+	@echo "Generating JSON schema for configuration..."
+	@cd cmd/schema && go run . > ../../config.schema.json
+	@echo "JSON schema generated at config.schema.json"
+
+# Run all lint checks
+lint: lint-all lint-privacy
+	@echo "All lint checks passed!"
+
+# Check for illegal privacy.DecisionContext(...Allow) usage
+lint-privacy:
+	@echo "Checking for illegal privacy.DecisionContext(...Allow) usage..."
+	@./scripts/lint/check-privacy-allow.sh

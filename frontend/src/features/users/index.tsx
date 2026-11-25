@@ -3,8 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { useDebounce } from '@/hooks/use-debounce';
 import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { usePermissions } from '@/hooks/usePermissions';
-import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
+import { PageHeader } from '@/components/layout/page-header';
 import { createColumns } from './components/users-columns';
 import { UsersDialogs } from './components/users-dialogs';
 import { UsersPrimaryButtons } from './components/users-primary-buttons';
@@ -14,7 +14,8 @@ import { useUsers } from './data/users';
 
 function UsersContent() {
   const { t } = useTranslation();
-  const { userPermissions } = usePermissions();
+  const { userPermissions, hasSystemScope } = usePermissions();
+  const canReadRoles = hasSystemScope('read_roles');
   const { pageSize, setCursors, setPageSize, resetCursor, paginationArgs } = usePaginationSearch({
     defaultPageSize: 20,
     pageSizeStorageKey: 'users-table-page-size',
@@ -28,7 +29,7 @@ function UsersContent() {
   const debouncedNameFilter = useDebounce(nameFilter, 300);
 
   // Memoize columns to prevent infinite re-renders
-  const columns = useMemo(() => createColumns(t, userPermissions.canWrite), [t, userPermissions.canWrite]);
+  const columns = useMemo(() => createColumns(t, userPermissions.canWrite, canReadRoles), [t, userPermissions.canWrite, canReadRoles]);
 
   // Build where clause for API filtering
   const whereClause = (() => {
@@ -104,15 +105,7 @@ export default function UsersManagement() {
 
   return (
     <UsersProvider>
-      <Header fixed>
-        <div className='flex flex-1 items-center justify-between'>
-          <div>
-            <h2 className='text-xl font-bold tracking-tight'>{t('users.title')}</h2>
-            <p className='text-sm text-muted-foreground'>{t('users.description')}</p>
-          </div>
-          <UsersPrimaryButtons />
-        </div>
-      </Header>
+      <PageHeader title={t('users.title')} description={t('users.description')} actions={<UsersPrimaryButtons />} />
 
       <Main fixed>
         <UsersContent />

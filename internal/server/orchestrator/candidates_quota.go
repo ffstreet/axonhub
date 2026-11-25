@@ -1,0 +1,269 @@
+package orchestrator
+
+import (
+	"context"
+	"time"
+
+	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/biz/provider_quota"
+	"github.com/looplj/axonhub/llm"
+)
+
+// QuotaRoutingGate applies the quota routing policy for one request.
+type QuotaRoutingGate struct {
+	provider     ProviderQuotaStatusProvider
+	defaultMode  objects.QuotaRoutingMode
+	droppedCount int
+}
+
+func NewQuotaRoutingGate(provider ProviderQuotaStatusProvider, settings biz.QuotaRoutingSettings) *QuotaRoutingGate {
+	return &QuotaRoutingGate{
+		provider:    provider,
+		defaultMode: settings.DefaultMode,
+	}
+}
+
+// DroppedCount reports how many candidates were removed from the preferred
+// routing list by the last Filter call. Reserved last-resort candidates count
+// as dropped for this metric: they are not routed to while the preferred list
+// is usable, they are only retried after it is exhausted.
+func (g *QuotaRoutingGate) DroppedCount() int {
+	if g == nil {
+		return 0
+	}
+
+	return g.droppedCount
+}
+
+// Filter evaluates every candidate before applying the two-phase routing rule.
+// It returns the candidates eligible for the preferred routing list plus the
+// pressured (sticky-only) candidates that backpressure removed only because an
+// open candidate exists. The caller appends those after the preferred
+// candidates, so a request whose preferred candidates all fail can still fall
+// back to a channel that is close to its quota but not exhausted. Exhausted
+// candidates are never returned as fallbacks: retrying them cannot succeed
+// before the quota window resets.
+func (g *QuotaRoutingGate) Filter(
+	ctx context.Context,
+	candidates []*ChannelModelsCandidate,
+	req *llm.Request,
+	stickyID int,
+) (preferred, lastResort []*ChannelModelsCandidate) {
+	if g != nil {
+		g.droppedCount = 0
+	}
+	if g == nil || g.provider == nil || len(candidates) == 0 {
+		return candidates, nil
+	}
+
+	limitType := provider_quota.RequestModality(req.Image != nil)
+	decisions := make([]quotaRoutingDecision, 0, len(candidates))
+	phaseOne := make([]*ChannelModelsCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		decision := g.evaluate(ctx, candidate, limitType, stickyID)
+		decisions = append(decisions, decision)
+		if decision.keepPhaseOne {
+			phaseOne = append(phaseOne, candidate)
+		}
+		g.logDecision(ctx, candidate, decision, false)
+	}
+
+	filtered := phaseOne
+	if len(phaseOne) == 0 {
+		if log.DebugEnabled(ctx) {
+			log.Debug(ctx, "quota routing phase two fallback",
+				log.Int("candidate_count", len(decisions)),
+			)
+		}
+		for _, decision := range decisions {
+			if decision.keepPhaseTwo {
+				filtered = append(filtered, decision.candidate)
+				g.logDecision(ctx, decision.candidate, decision, true)
+			}
+		}
+	} else {
+		// Phase one had open candidates, so pressured candidates were left out.
+		// Keep them as reserved fallbacks instead of discarding them outright.
+		for _, decision := range decisions {
+			if decision.keepPhaseTwo && !decision.keepPhaseOne {
+				lastResort = append(lastResort, decision.candidate)
+			}
+		}
+	}
+
+	g.droppedCount = len(candidates) - len(filtered)
+	return filtered, lastResort
+}
+
+type quotaRoutingDecision struct {
+	candidate    *ChannelModelsCandidate
+	mode         objects.QuotaRoutingMode
+	state        provider_quota.RoutingState
+	reason       string
+	keepPhaseOne bool
+	keepPhaseTwo bool
+}
+
+func (g *QuotaRoutingGate) evaluate(
+	ctx context.Context,
+	candidate *ChannelModelsCandidate,
+	limitType provider_quota.QuotaLimitType,
+	stickyID int,
+) quotaRoutingDecision {
+	mode := g.defaultMode
+	if candidate.Channel.Settings != nil && candidate.Channel.Settings.QuotaRoutingMode != "" {
+		mode = candidate.Channel.Settings.QuotaRoutingMode
+	}
+	if mode != objects.QuotaRoutingModeRemoveOnExhausted &&
+		mode != objects.QuotaRoutingModeBackpressure &&
+		mode != objects.QuotaRoutingModeIgnoreQuota {
+		mode = objects.QuotaRoutingModeRemoveOnExhausted
+	}
+
+	decision := quotaRoutingDecision{
+		candidate: candidate,
+		mode:      mode,
+		state:     provider_quota.RoutingUnknown,
+	}
+	if mode == objects.QuotaRoutingModeIgnoreQuota {
+		decision.keepPhaseOne = true
+		decision.keepPhaseTwo = true
+		decision.reason = "ignore_quota"
+		return decision
+	}
+
+	status := g.provider.GetQuotaStatus(ctx, candidate.Channel.ID)
+	if status == nil {
+		decision.keepPhaseOne = true
+		decision.keepPhaseTwo = true
+		decision.reason = "quota_status_unknown"
+		return decision
+	}
+
+	now := time.Now()
+	if len(candidate.Models) > 0 {
+		usableModels := make([]biz.ChannelModelEntry, 0, len(candidate.Models))
+		usableStates := make([]provider_quota.RoutingState, 0, len(candidate.Models))
+		usableReasons := make([]string, 0, len(candidate.Models))
+		var usableFormats []string
+		hasFormats := len(candidate.modelAPIFormats) == len(candidate.Models)
+
+		for i, entry := range candidate.Models {
+			limits := provider_quota.FilterLimitsForModel(status.Limits, entry.ActualModel)
+			state, reason := provider_quota.EvaluateQuotaRouting(
+				limits,
+				string(status.Status),
+				limitType,
+				now,
+			)
+			if state != provider_quota.RoutingExhausted {
+				usableModels = append(usableModels, entry)
+				usableStates = append(usableStates, state)
+				usableReasons = append(usableReasons, reason)
+				if hasFormats {
+					usableFormats = append(usableFormats, candidate.modelAPIFormats[i])
+				}
+			}
+		}
+
+		if len(usableModels) == 0 {
+			decision.state = provider_quota.RoutingExhausted
+			decision.reason = "exhausted"
+			return decision
+		}
+
+		candidate.Models = usableModels
+		if hasFormats {
+			candidate.modelAPIFormats = usableFormats
+		}
+		decision.state = usableStates[0]
+		decision.reason = usableReasons[0]
+	} else {
+		decision.state, decision.reason = provider_quota.EvaluateQuotaRouting(
+			status.Limits,
+			string(status.Status),
+			limitType,
+			now,
+		)
+		if decision.state == provider_quota.RoutingExhausted {
+			decision.reason = "exhausted"
+			return decision
+		}
+	}
+
+	switch mode {
+	case objects.QuotaRoutingModeRemoveOnExhausted:
+		decision.keepPhaseOne = true
+		decision.keepPhaseTwo = true
+	case objects.QuotaRoutingModeBackpressure:
+		decision.keepPhaseOne = decision.state == provider_quota.RoutingOpen ||
+			decision.state == provider_quota.RoutingUnknown ||
+			(decision.state == provider_quota.RoutingStickyOnly && candidate.Channel.ID == stickyID && stickyID != 0)
+		decision.keepPhaseTwo = decision.state == provider_quota.RoutingStickyOnly
+	default:
+		decision.keepPhaseOne = true
+		decision.keepPhaseTwo = true
+	}
+
+	return decision
+}
+
+func (g *QuotaRoutingGate) logDecision(
+	ctx context.Context,
+	candidate *ChannelModelsCandidate,
+	decision quotaRoutingDecision,
+	phaseTwo bool,
+) {
+	if !log.DebugEnabled(ctx) {
+		return
+	}
+
+	reason := decision.reason
+	if phaseTwo {
+		reason = "no_alternative_fallback"
+	}
+	log.Debug(ctx, "quota routing candidate decision",
+		log.Int("channel_id", candidate.Channel.ID),
+		log.String("mode", string(decision.mode)),
+		log.String("state", string(decision.state)),
+		log.String("reason", reason),
+		log.Bool("phase_two", phaseTwo),
+	)
+}
+
+// QuotaRoutingSelector keeps quota routing enabled when no load balancer is configured.
+type QuotaRoutingSelector struct {
+	wrapped CandidateSelector
+	gate    *QuotaRoutingGate
+}
+
+// WithQuotaRoutingSelector keeps quota routing enabled when no load balancer is
+// configured.
+func WithQuotaRoutingSelector(wrapped CandidateSelector, gate *QuotaRoutingGate) *QuotaRoutingSelector {
+	return &QuotaRoutingSelector{wrapped: wrapped, gate: gate}
+}
+
+func (s *QuotaRoutingSelector) Select(ctx context.Context, req *llm.Request) ([]*ChannelModelsCandidate, error) {
+	candidates, err := s.wrapped.Select(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	preferred, lastResort := s.gate.Filter(ctx, candidates, req, 0)
+	if pinned, remaining := extractStickyCandidate(preferred, guardianReviewParentChannelID(ctx)); pinned != nil {
+		preferred = append([]*ChannelModelsCandidate{pinned}, remaining...)
+	}
+	if len(lastResort) == 0 {
+		return preferred, nil
+	}
+
+	// This selector has no retry policy to bound the appended candidates; the
+	// pipeline stops switching at the configured channel retry budget anyway.
+	result := make([]*ChannelModelsCandidate, 0, len(preferred)+len(lastResort))
+	result = append(result, preferred...)
+	result = append(result, lastResort...)
+
+	return result, nil
+}

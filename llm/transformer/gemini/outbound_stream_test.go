@@ -244,7 +244,7 @@ func TestOutboundTransformer_TransformStream(t *testing.T) {
 	inputStream := streams.SliceStream(events)
 
 	// Transform the stream
-	outputStream, err := transformer.TransformStream(context.Background(), inputStream)
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
 	require.NoError(t, err)
 	require.NotNil(t, outputStream)
 
@@ -262,6 +262,235 @@ func TestOutboundTransformer_TransformStream(t *testing.T) {
 	require.Equal(t, "Hello", *results[0].Choices[0].Delta.Content.Content)
 	require.NotNil(t, results[1].Choices[0].Delta)
 	require.Equal(t, ", world!", *results[1].Choices[0].Delta.Content.Content)
+}
+
+func TestOutboundTransformer_TransformStream_AllowsMissingResponseID(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	events := []*httpclient.StreamEvent{
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ModelVersion: "gemini-2.5-flash",
+				Candidates: []*Candidate{{
+					Index: 0,
+					Content: &Content{
+						Role:  "model",
+						Parts: []*Part{{Text: "第一段"}},
+					},
+				}},
+			}),
+		},
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ModelVersion: "gemini-2.5-flash",
+				Candidates: []*Candidate{{
+					Index: 0,
+					Content: &Content{
+						Role:  "model",
+						Parts: []*Part{{Text: "第二段"}},
+					},
+					FinishReason: "STOP",
+				}},
+			}),
+		},
+	}
+
+	stream, err := transformer.TransformStream(context.Background(), nil, streams.SliceStream(events))
+	require.NoError(t, err)
+
+	var responses []*llm.Response
+	for stream.Next() {
+		if response := stream.Current(); response != nil && response.Object != "[DONE]" {
+			responses = append(responses, response)
+		}
+	}
+
+	require.NoError(t, stream.Err())
+	require.Len(t, responses, 2)
+	require.NotEmpty(t, responses[0].ID)
+	require.Equal(t, responses[0].ID, responses[1].ID)
+}
+
+func TestOutboundTransformer_TransformStream_ToolCallIndexAccumulation(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	// Create test stream events with tool calls across multiple events
+	// This tests that tool call index accumulates across the entire stream
+	events := []*httpclient.StreamEvent{
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ResponseID:   "resp-tool-stream-1",
+				ModelVersion: "gemini-2.0-flash",
+				Candidates: []*Candidate{
+					{
+						Index: 0,
+						Content: &Content{
+							Role: "model",
+							Parts: []*Part{
+								{
+									FunctionCall: &FunctionCall{
+										ID:   "call-1",
+										Name: "get_weather",
+										Args: map[string]any{"location": "Tokyo"},
+									},
+								},
+							},
+						},
+					},
+				},
+			}),
+		},
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ResponseID:   "resp-tool-stream-1",
+				ModelVersion: "gemini-2.0-flash",
+				Candidates: []*Candidate{
+					{
+						Index: 0,
+						Content: &Content{
+							Role: "model",
+							Parts: []*Part{
+								{
+									FunctionCall: &FunctionCall{
+										ID:   "call-2",
+										Name: "get_time",
+										Args: map[string]any{"timezone": "JST"},
+									},
+								},
+							},
+						},
+						FinishReason: "STOP",
+					},
+				},
+			}),
+		},
+	}
+
+	// Create a stream from the events
+	inputStream := streams.SliceStream(events)
+
+	// Transform the stream
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
+	require.NoError(t, err)
+	require.NotNil(t, outputStream)
+
+	// Collect results
+	var results []*llm.Response
+
+	for outputStream.Next() {
+		resp := outputStream.Current()
+		if resp != nil {
+			results = append(results, resp)
+		}
+	}
+
+	require.NoError(t, outputStream.Err())
+
+	// Filter out [DONE] response
+	var toolCallResults []*llm.Response
+
+	for _, r := range results {
+		if r.Object != "[DONE]" {
+			toolCallResults = append(toolCallResults, r)
+		}
+	}
+
+	// Verify we have 2 tool call responses
+	require.Len(t, toolCallResults, 2)
+
+	// First event: tool call with index 0
+	require.Len(t, toolCallResults[0].Choices[0].Delta.ToolCalls, 1)
+	require.Equal(t, 0, toolCallResults[0].Choices[0].Delta.ToolCalls[0].Index)
+	require.Equal(t, "call-1", toolCallResults[0].Choices[0].Delta.ToolCalls[0].ID)
+	require.Equal(t, "get_weather", toolCallResults[0].Choices[0].Delta.ToolCalls[0].Function.Name)
+
+	// Second event: tool call with index 1 (accumulated from previous event)
+	require.Len(t, toolCallResults[1].Choices[0].Delta.ToolCalls, 1)
+	require.Equal(t, 1, toolCallResults[1].Choices[0].Delta.ToolCalls[0].Index)
+	require.Equal(t, "call-2", toolCallResults[1].Choices[0].Delta.ToolCalls[0].ID)
+	require.Equal(t, "get_time", toolCallResults[1].Choices[0].Delta.ToolCalls[0].Function.Name)
+}
+
+func TestOutboundTransformer_TransformStream_MultipleToolCallsInSingleEvent(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	// Create test stream event with multiple tool calls in a single event
+	events := []*httpclient.StreamEvent{
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ResponseID:   "resp-multi-tool-1",
+				ModelVersion: "gemini-2.0-flash",
+				Candidates: []*Candidate{
+					{
+						Index: 0,
+						Content: &Content{
+							Role: "model",
+							Parts: []*Part{
+								{
+									FunctionCall: &FunctionCall{
+										ID:   "call-a",
+										Name: "func_a",
+										Args: map[string]any{"param": "value_a"},
+									},
+								},
+								{
+									FunctionCall: &FunctionCall{
+										ID:   "call-b",
+										Name: "func_b",
+										Args: map[string]any{"param": "value_b"},
+									},
+								},
+							},
+						},
+						FinishReason: "STOP",
+					},
+				},
+			}),
+		},
+	}
+
+	// Create a stream from the events
+	inputStream := streams.SliceStream(events)
+
+	// Transform the stream
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
+	require.NoError(t, err)
+	require.NotNil(t, outputStream)
+
+	// Collect results
+	var results []*llm.Response
+
+	for outputStream.Next() {
+		resp := outputStream.Current()
+		if resp != nil && resp.Object != "[DONE]" {
+			results = append(results, resp)
+		}
+	}
+
+	require.NoError(t, outputStream.Err())
+	require.Len(t, results, 1)
+
+	// Verify both tool calls have correct indices within the same event
+	require.Len(t, results[0].Choices[0].Delta.ToolCalls, 2)
+	require.Equal(t, 0, results[0].Choices[0].Delta.ToolCalls[0].Index)
+	require.Equal(t, "call-a", results[0].Choices[0].Delta.ToolCalls[0].ID)
+	require.Equal(t, 1, results[0].Choices[0].Delta.ToolCalls[1].Index)
+	require.Equal(t, "call-b", results[0].Choices[0].Delta.ToolCalls[1].ID)
 }
 
 func TestOutboundTransformer_AggregateStreamChunks(t *testing.T) {
@@ -520,7 +749,7 @@ func TestOutboundTransformer_AggregateStreamChunks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data, meta, err := transformer.AggregateStreamChunks(context.Background(), tt.chunks)
+			data, meta, err := transformer.AggregateStreamChunks(context.Background(), nil, tt.chunks)
 
 			if tt.expectedErr {
 				require.Error(t, err)
@@ -553,6 +782,13 @@ func TestOutboundTransformer_TransformStreamChunk_FinishReasons(t *testing.T) {
 		{"MAX_TOKENS to length", "MAX_TOKENS", "length"},
 		{"SAFETY to content_filter", "SAFETY", "content_filter"},
 		{"RECITATION to content_filter", "RECITATION", "content_filter"},
+		{"LANGUAGE to content_filter", "LANGUAGE", "content_filter"},
+		{"BLOCKLIST to content_filter", "BLOCKLIST", "content_filter"},
+		{"PROHIBITED_CONTENT to content_filter", "PROHIBITED_CONTENT", "content_filter"},
+		{"SPII to content_filter", "SPII", "content_filter"},
+		{"IMAGE_SAFETY to content_filter", "IMAGE_SAFETY", "content_filter"},
+		{"IMAGE_PROHIBITED_CONTENT to content_filter", "IMAGE_PROHIBITED_CONTENT", "content_filter"},
+		{"IMAGE_RECITATION to content_filter", "IMAGE_RECITATION", "content_filter"},
 		{"unknown to stop", "UNKNOWN", "stop"},
 	}
 
@@ -579,6 +815,86 @@ func TestOutboundTransformer_TransformStreamChunk_FinishReasons(t *testing.T) {
 			require.NotNil(t, resp)
 			require.NotNil(t, resp.Choices[0].FinishReason)
 			require.Equal(t, tt.expectedFinishReason, *resp.Choices[0].FinishReason)
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformStream_FinishReasonAfterEarlierToolCall(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	functionCall := func(name string) *Content {
+		return &Content{
+			Role:  "model",
+			Parts: []*Part{{FunctionCall: &FunctionCall{ID: "call-" + name, Name: name, Args: map[string]any{}}}},
+		}
+	}
+	text := &Content{Role: "model", Parts: []*Part{{Text: "Hello"}}}
+
+	tests := []struct {
+		name     string
+		chunks   [][]*Candidate
+		expected map[int]string
+	}{
+		{
+			// Shape of testdata/gemini-tool2.stream.jsonl: STOP arrives in a chunk without parts.
+			name: "STOP in a later chunk than the function call",
+			chunks: [][]*Candidate{
+				{{Index: 0, Content: functionCall("get_weather")}},
+				{{Index: 0, FinishReason: "STOP"}},
+			},
+			expected: map[int]string{0: "tool_calls"},
+		},
+		{
+			name: "each candidate keeps its own finish reason",
+			chunks: [][]*Candidate{
+				{{Index: 0, Content: functionCall("get_weather")}, {Index: 1, Content: text}},
+				{{Index: 0, FinishReason: "STOP"}, {Index: 1, FinishReason: "STOP"}},
+			},
+			expected: map[int]string{0: "tool_calls", 1: "stop"},
+		},
+		{
+			name: "MAX_TOKENS after a function call stays length",
+			chunks: [][]*Candidate{
+				{{Index: 0, Content: functionCall("get_weather")}},
+				{{Index: 0, FinishReason: "MAX_TOKENS"}},
+			},
+			expected: map[int]string{0: "length"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := make([]*httpclient.StreamEvent, 0, len(tt.chunks))
+			for _, candidates := range tt.chunks {
+				events = append(events, &httpclient.StreamEvent{
+					Data: mustMarshal(&GenerateContentResponse{ResponseID: "resp-split-finish", Candidates: candidates}),
+				})
+			}
+
+			stream, err := transformer.TransformStream(context.Background(), nil, streams.SliceStream(events))
+			require.NoError(t, err)
+
+			finishReasons := map[int]string{}
+			for stream.Next() {
+				resp := stream.Current()
+				if resp == nil {
+					continue
+				}
+
+				for _, choice := range resp.Choices {
+					if choice.FinishReason != nil {
+						finishReasons[choice.Index] = *choice.FinishReason
+					}
+				}
+			}
+
+			require.NoError(t, stream.Err())
+			require.Equal(t, tt.expected, finishReasons)
 		})
 	}
 }
@@ -667,9 +983,11 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 				require.Equal(t, "resp-gemini-parallel-1", result.ID)
 				require.Len(t, result.Choices, 1)
 
-				// Should have 2 tool calls
+				// Should have 2 tool calls with correct indices
 				require.Len(t, result.Choices[0].Message.ToolCalls, 2)
+				require.Equal(t, 0, result.Choices[0].Message.ToolCalls[0].Index)
 				require.Equal(t, "get_weather", result.Choices[0].Message.ToolCalls[0].Function.Name)
+				require.Equal(t, 1, result.Choices[0].Message.ToolCalls[1].Index)
 				require.Equal(t, "get_time", result.Choices[0].Message.ToolCalls[1].Function.Name)
 
 				require.NotNil(t, result.Choices[0].FinishReason)
@@ -688,7 +1006,7 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 			mockStream := streams.SliceStream(geminiEvents)
 
 			// Transform the stream (Gemini -> LLM)
-			transformedStream, err := transformer.TransformStream(t.Context(), mockStream)
+			transformedStream, err := transformer.TransformStream(t.Context(), nil, mockStream)
 			require.NoError(t, err)
 
 			// Collect all transformed responses
@@ -704,7 +1022,7 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 			require.NoError(t, transformedStream.Err())
 
 			// Test aggregation
-			aggregatedBytes, meta, err := transformer.AggregateStreamChunks(t.Context(), geminiEvents)
+			aggregatedBytes, meta, err := transformer.AggregateStreamChunks(t.Context(), nil, geminiEvents)
 			require.NoError(t, err)
 			require.NotEmpty(t, meta.ID)
 
@@ -776,3 +1094,124 @@ func mustMarshal(v any) []byte {
 
 // Ensure lo is used to satisfy linter.
 var _ = lo.ToPtr[string]
+
+func TestOutboundTransformer_PreservesMultipartThoughts(t *testing.T) {
+	body := []byte(`{
+		"responseId":"multipart-thoughts",
+		"modelVersion":"gemini-2.5-pro",
+		"candidates":[
+			{"index":0,"content":{"role":"model","parts":[
+				{"thought":true,"text":"First step.\n"},
+				{"text":"The answer is 42."},
+				{"thought":true,"text":"第二步。"},
+				{"thought":true,"text":""}
+			]},"finishReason":"STOP"},
+			{"index":1,"content":{"role":"model","parts":[
+				{"text":"Alternative answer."}
+			]},"finishReason":"STOP"}
+		],
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":3,"totalTokenCount":18}
+	}`)
+
+	for _, mode := range []string{"response", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			transformer, err := NewOutboundTransformer("", "")
+			require.NoError(t, err)
+
+			var resp *llm.Response
+			if mode == "response" {
+				resp, err = transformer.TransformResponse(context.Background(), &httpclient.Response{
+					StatusCode: 200,
+					Body:       body,
+				})
+				require.NoError(t, err)
+			} else {
+				input := streams.SliceStream([]*httpclient.StreamEvent{
+					{Data: body},
+					{Data: []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Next chunk."}]}}]}`)},
+				})
+				output, err := transformer.TransformStream(context.Background(), nil, input)
+				require.NoError(t, err)
+				defer output.Close()
+
+				var responses []*llm.Response
+				for output.Next() {
+					responses = append(responses, output.Current())
+				}
+				require.NoError(t, output.Err())
+				require.Len(t, responses, 3)
+				require.NotNil(t, responses[1].Choices[0].Delta.ReasoningContent)
+				require.Equal(t, "Next chunk.", *responses[1].Choices[0].Delta.ReasoningContent)
+				require.Equal(t, llm.DoneResponse, responses[2])
+				resp = responses[0]
+			}
+
+			require.Len(t, resp.Choices, 2)
+			message := resp.Choices[0].Message
+			alternative := resp.Choices[1].Message
+			if mode == "stream" {
+				message = resp.Choices[0].Delta
+				alternative = resp.Choices[1].Delta
+			}
+			require.NotNil(t, message)
+			require.NotNil(t, message.ReasoningContent)
+			require.Equal(t, "First step.\n第二步。", *message.ReasoningContent)
+			require.Equal(t, lo.ToPtr("The answer is 42."), message.Content.Content)
+			require.NotNil(t, alternative)
+			require.Nil(t, alternative.ReasoningContent)
+			require.Equal(t, lo.ToPtr("Alternative answer."), alternative.Content.Content)
+			require.Equal(t, lo.ToPtr("stop"), resp.Choices[0].FinishReason)
+			require.NotNil(t, resp.Usage)
+			require.Equal(t, int64(10), resp.Usage.PromptTokens)
+			require.Equal(t, int64(8), resp.Usage.CompletionTokens)
+			require.Equal(t, int64(18), resp.Usage.TotalTokens)
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformStream_ErrorChunk(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	events := []*httpclient.StreamEvent{
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ResponseID: "resp-stream-err",
+				Candidates: []*Candidate{
+					{
+						Index: 0,
+						Content: &Content{
+							Role:  "model",
+							Parts: []*Part{{Text: "Hello"}},
+						},
+					},
+				},
+			}),
+		},
+		{
+			Data: []byte(`{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}`),
+		},
+	}
+
+	outputStream, err := transformer.TransformStream(context.Background(), nil, streams.SliceStream(events))
+	require.NoError(t, err)
+
+	var results []*llm.Response
+	for outputStream.Next() {
+		results = append(results, outputStream.Current())
+	}
+
+	require.Len(t, results, 1)
+	require.Equal(t, "Hello", *results[0].Choices[0].Delta.Content.Content)
+
+	var respErr *llm.ResponseError
+	require.ErrorAs(t, outputStream.Err(), &respErr)
+	require.Equal(t, 503, respErr.StatusCode)
+	require.Equal(t, "The model is overloaded.", respErr.Detail.Message)
+	require.Equal(t, "UNAVAILABLE", respErr.Detail.Type)
+	require.Equal(t, "503", respErr.Detail.Code)
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/predicate"
 	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/ent/requestbodychunkref"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/objects"
@@ -55,6 +56,38 @@ func (_u *RequestUpdate) AppendRequestHeaders(v objects.JSONRawMessage) *Request
 // ClearRequestHeaders clears the value of the "request_headers" field.
 func (_u *RequestUpdate) ClearRequestHeaders() *RequestUpdate {
 	_u.mutation.ClearRequestHeaders()
+	return _u
+}
+
+// SetRequestBodyChunked sets the "request_body_chunked" field.
+func (_u *RequestUpdate) SetRequestBodyChunked(v bool) *RequestUpdate {
+	_u.mutation.SetRequestBodyChunked(v)
+	return _u
+}
+
+// SetNillableRequestBodyChunked sets the "request_body_chunked" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableRequestBodyChunked(v *bool) *RequestUpdate {
+	if v != nil {
+		_u.SetRequestBodyChunked(*v)
+	}
+	return _u
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (_u *RequestUpdate) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpdate {
+	_u.mutation.SetResponseHeaders(v)
+	return _u
+}
+
+// AppendResponseHeaders appends value to the "response_headers" field.
+func (_u *RequestUpdate) AppendResponseHeaders(v objects.JSONRawMessage) *RequestUpdate {
+	_u.mutation.AppendResponseHeaders(v)
+	return _u
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (_u *RequestUpdate) ClearResponseHeaders() *RequestUpdate {
+	_u.mutation.ClearResponseHeaders()
 	return _u
 }
 
@@ -202,6 +235,129 @@ func (_u *RequestUpdate) ClearMetricsFirstTokenLatencyMs() *RequestUpdate {
 	return _u
 }
 
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdate) SetMetricsReasoningDurationMs(v int64) *RequestUpdate {
+	_u.mutation.ResetMetricsReasoningDurationMs()
+	_u.mutation.SetMetricsReasoningDurationMs(v)
+	return _u
+}
+
+// SetNillableMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableMetricsReasoningDurationMs(v *int64) *RequestUpdate {
+	if v != nil {
+		_u.SetMetricsReasoningDurationMs(*v)
+	}
+	return _u
+}
+
+// AddMetricsReasoningDurationMs adds value to the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdate) AddMetricsReasoningDurationMs(v int64) *RequestUpdate {
+	_u.mutation.AddMetricsReasoningDurationMs(v)
+	return _u
+}
+
+// ClearMetricsReasoningDurationMs clears the value of the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdate) ClearMetricsReasoningDurationMs() *RequestUpdate {
+	_u.mutation.ClearMetricsReasoningDurationMs()
+	return _u
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (_u *RequestUpdate) SetContentSaved(v bool) *RequestUpdate {
+	_u.mutation.SetContentSaved(v)
+	return _u
+}
+
+// SetNillableContentSaved sets the "content_saved" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableContentSaved(v *bool) *RequestUpdate {
+	if v != nil {
+		_u.SetContentSaved(*v)
+	}
+	return _u
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (_u *RequestUpdate) SetContentStorageID(v int) *RequestUpdate {
+	_u.mutation.ResetContentStorageID()
+	_u.mutation.SetContentStorageID(v)
+	return _u
+}
+
+// SetNillableContentStorageID sets the "content_storage_id" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableContentStorageID(v *int) *RequestUpdate {
+	if v != nil {
+		_u.SetContentStorageID(*v)
+	}
+	return _u
+}
+
+// AddContentStorageID adds value to the "content_storage_id" field.
+func (_u *RequestUpdate) AddContentStorageID(v int) *RequestUpdate {
+	_u.mutation.AddContentStorageID(v)
+	return _u
+}
+
+// ClearContentStorageID clears the value of the "content_storage_id" field.
+func (_u *RequestUpdate) ClearContentStorageID() *RequestUpdate {
+	_u.mutation.ClearContentStorageID()
+	return _u
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (_u *RequestUpdate) SetContentStorageKey(v string) *RequestUpdate {
+	_u.mutation.SetContentStorageKey(v)
+	return _u
+}
+
+// SetNillableContentStorageKey sets the "content_storage_key" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableContentStorageKey(v *string) *RequestUpdate {
+	if v != nil {
+		_u.SetContentStorageKey(*v)
+	}
+	return _u
+}
+
+// ClearContentStorageKey clears the value of the "content_storage_key" field.
+func (_u *RequestUpdate) ClearContentStorageKey() *RequestUpdate {
+	_u.mutation.ClearContentStorageKey()
+	return _u
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (_u *RequestUpdate) SetContentSavedAt(v time.Time) *RequestUpdate {
+	_u.mutation.SetContentSavedAt(v)
+	return _u
+}
+
+// SetNillableContentSavedAt sets the "content_saved_at" field if the given value is not nil.
+func (_u *RequestUpdate) SetNillableContentSavedAt(v *time.Time) *RequestUpdate {
+	if v != nil {
+		_u.SetContentSavedAt(*v)
+	}
+	return _u
+}
+
+// ClearContentSavedAt clears the value of the "content_saved_at" field.
+func (_u *RequestUpdate) ClearContentSavedAt() *RequestUpdate {
+	_u.mutation.ClearContentSavedAt()
+	return _u
+}
+
+// AddRequestBodyChunkIDs adds the "request_body_chunks" edge to the RequestBodyChunkRef entity by IDs.
+func (_u *RequestUpdate) AddRequestBodyChunkIDs(ids ...int) *RequestUpdate {
+	_u.mutation.AddRequestBodyChunkIDs(ids...)
+	return _u
+}
+
+// AddRequestBodyChunks adds the "request_body_chunks" edges to the RequestBodyChunkRef entity.
+func (_u *RequestUpdate) AddRequestBodyChunks(v ...*RequestBodyChunkRef) *RequestUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddRequestBodyChunkIDs(ids...)
+}
+
 // AddExecutionIDs adds the "executions" edge to the RequestExecution entity by IDs.
 func (_u *RequestUpdate) AddExecutionIDs(ids ...int) *RequestUpdate {
 	_u.mutation.AddExecutionIDs(ids...)
@@ -240,6 +396,27 @@ func (_u *RequestUpdate) AddUsageLogs(v ...*UsageLog) *RequestUpdate {
 // Mutation returns the RequestMutation object of the builder.
 func (_u *RequestUpdate) Mutation() *RequestMutation {
 	return _u.mutation
+}
+
+// ClearRequestBodyChunks clears all "request_body_chunks" edges to the RequestBodyChunkRef entity.
+func (_u *RequestUpdate) ClearRequestBodyChunks() *RequestUpdate {
+	_u.mutation.ClearRequestBodyChunks()
+	return _u
+}
+
+// RemoveRequestBodyChunkIDs removes the "request_body_chunks" edge to RequestBodyChunkRef entities by IDs.
+func (_u *RequestUpdate) RemoveRequestBodyChunkIDs(ids ...int) *RequestUpdate {
+	_u.mutation.RemoveRequestBodyChunkIDs(ids...)
+	return _u
+}
+
+// RemoveRequestBodyChunks removes "request_body_chunks" edges to RequestBodyChunkRef entities.
+func (_u *RequestUpdate) RemoveRequestBodyChunks(v ...*RequestBodyChunkRef) *RequestUpdate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveRequestBodyChunkIDs(ids...)
 }
 
 // ClearExecutions clears all "executions" edges to the RequestExecution entity.
@@ -334,6 +511,11 @@ func (_u *RequestUpdate) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestUpdate) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := request.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Request.status": %w`, err)}
@@ -366,6 +548,12 @@ func (_u *RequestUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(request.FieldUpdatedAt, field.TypeTime, value)
 	}
+	if _u.mutation.UserIDCleared() {
+		_spec.ClearField(request.FieldUserID, field.TypeInt)
+	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(request.FieldReasoningEffort, field.TypeString)
+	}
 	if value, ok := _u.mutation.RequestHeaders(); ok {
 		_spec.SetField(request.FieldRequestHeaders, field.TypeJSON, value)
 	}
@@ -376,6 +564,20 @@ func (_u *RequestUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(request.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.RequestBodyChunked(); ok {
+		_spec.SetField(request.FieldRequestBodyChunked, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.ResponseHeaders(); ok {
+		_spec.SetField(request.FieldResponseHeaders, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedResponseHeaders(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, request.FieldResponseHeaders, value)
+		})
+	}
+	if _u.mutation.ResponseHeadersCleared() {
+		_spec.ClearField(request.FieldResponseHeaders, field.TypeJSON)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(request.FieldResponseBody, field.TypeJSON, value)
@@ -425,6 +627,84 @@ func (_u *RequestUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.MetricsFirstTokenLatencyMsCleared() {
 		_spec.ClearField(request.FieldMetricsFirstTokenLatencyMs, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.MetricsReasoningDurationMs(); ok {
+		_spec.SetField(request.FieldMetricsReasoningDurationMs, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedMetricsReasoningDurationMs(); ok {
+		_spec.AddField(request.FieldMetricsReasoningDurationMs, field.TypeInt64, value)
+	}
+	if _u.mutation.MetricsReasoningDurationMsCleared() {
+		_spec.ClearField(request.FieldMetricsReasoningDurationMs, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.ContentSaved(); ok {
+		_spec.SetField(request.FieldContentSaved, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.ContentStorageID(); ok {
+		_spec.SetField(request.FieldContentStorageID, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedContentStorageID(); ok {
+		_spec.AddField(request.FieldContentStorageID, field.TypeInt, value)
+	}
+	if _u.mutation.ContentStorageIDCleared() {
+		_spec.ClearField(request.FieldContentStorageID, field.TypeInt)
+	}
+	if value, ok := _u.mutation.ContentStorageKey(); ok {
+		_spec.SetField(request.FieldContentStorageKey, field.TypeString, value)
+	}
+	if _u.mutation.ContentStorageKeyCleared() {
+		_spec.ClearField(request.FieldContentStorageKey, field.TypeString)
+	}
+	if value, ok := _u.mutation.ContentSavedAt(); ok {
+		_spec.SetField(request.FieldContentSavedAt, field.TypeTime, value)
+	}
+	if _u.mutation.ContentSavedAtCleared() {
+		_spec.ClearField(request.FieldContentSavedAt, field.TypeTime)
+	}
+	if _u.mutation.RequestBodyChunksCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedRequestBodyChunksIDs(); len(nodes) > 0 && !_u.mutation.RequestBodyChunksCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RequestBodyChunksIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.ExecutionsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -591,6 +871,38 @@ func (_u *RequestUpdateOne) ClearRequestHeaders() *RequestUpdateOne {
 	return _u
 }
 
+// SetRequestBodyChunked sets the "request_body_chunked" field.
+func (_u *RequestUpdateOne) SetRequestBodyChunked(v bool) *RequestUpdateOne {
+	_u.mutation.SetRequestBodyChunked(v)
+	return _u
+}
+
+// SetNillableRequestBodyChunked sets the "request_body_chunked" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableRequestBodyChunked(v *bool) *RequestUpdateOne {
+	if v != nil {
+		_u.SetRequestBodyChunked(*v)
+	}
+	return _u
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (_u *RequestUpdateOne) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpdateOne {
+	_u.mutation.SetResponseHeaders(v)
+	return _u
+}
+
+// AppendResponseHeaders appends value to the "response_headers" field.
+func (_u *RequestUpdateOne) AppendResponseHeaders(v objects.JSONRawMessage) *RequestUpdateOne {
+	_u.mutation.AppendResponseHeaders(v)
+	return _u
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (_u *RequestUpdateOne) ClearResponseHeaders() *RequestUpdateOne {
+	_u.mutation.ClearResponseHeaders()
+	return _u
+}
+
 // SetResponseBody sets the "response_body" field.
 func (_u *RequestUpdateOne) SetResponseBody(v objects.JSONRawMessage) *RequestUpdateOne {
 	_u.mutation.SetResponseBody(v)
@@ -735,6 +1047,129 @@ func (_u *RequestUpdateOne) ClearMetricsFirstTokenLatencyMs() *RequestUpdateOne 
 	return _u
 }
 
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdateOne) SetMetricsReasoningDurationMs(v int64) *RequestUpdateOne {
+	_u.mutation.ResetMetricsReasoningDurationMs()
+	_u.mutation.SetMetricsReasoningDurationMs(v)
+	return _u
+}
+
+// SetNillableMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableMetricsReasoningDurationMs(v *int64) *RequestUpdateOne {
+	if v != nil {
+		_u.SetMetricsReasoningDurationMs(*v)
+	}
+	return _u
+}
+
+// AddMetricsReasoningDurationMs adds value to the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdateOne) AddMetricsReasoningDurationMs(v int64) *RequestUpdateOne {
+	_u.mutation.AddMetricsReasoningDurationMs(v)
+	return _u
+}
+
+// ClearMetricsReasoningDurationMs clears the value of the "metrics_reasoning_duration_ms" field.
+func (_u *RequestUpdateOne) ClearMetricsReasoningDurationMs() *RequestUpdateOne {
+	_u.mutation.ClearMetricsReasoningDurationMs()
+	return _u
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (_u *RequestUpdateOne) SetContentSaved(v bool) *RequestUpdateOne {
+	_u.mutation.SetContentSaved(v)
+	return _u
+}
+
+// SetNillableContentSaved sets the "content_saved" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableContentSaved(v *bool) *RequestUpdateOne {
+	if v != nil {
+		_u.SetContentSaved(*v)
+	}
+	return _u
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (_u *RequestUpdateOne) SetContentStorageID(v int) *RequestUpdateOne {
+	_u.mutation.ResetContentStorageID()
+	_u.mutation.SetContentStorageID(v)
+	return _u
+}
+
+// SetNillableContentStorageID sets the "content_storage_id" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableContentStorageID(v *int) *RequestUpdateOne {
+	if v != nil {
+		_u.SetContentStorageID(*v)
+	}
+	return _u
+}
+
+// AddContentStorageID adds value to the "content_storage_id" field.
+func (_u *RequestUpdateOne) AddContentStorageID(v int) *RequestUpdateOne {
+	_u.mutation.AddContentStorageID(v)
+	return _u
+}
+
+// ClearContentStorageID clears the value of the "content_storage_id" field.
+func (_u *RequestUpdateOne) ClearContentStorageID() *RequestUpdateOne {
+	_u.mutation.ClearContentStorageID()
+	return _u
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (_u *RequestUpdateOne) SetContentStorageKey(v string) *RequestUpdateOne {
+	_u.mutation.SetContentStorageKey(v)
+	return _u
+}
+
+// SetNillableContentStorageKey sets the "content_storage_key" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableContentStorageKey(v *string) *RequestUpdateOne {
+	if v != nil {
+		_u.SetContentStorageKey(*v)
+	}
+	return _u
+}
+
+// ClearContentStorageKey clears the value of the "content_storage_key" field.
+func (_u *RequestUpdateOne) ClearContentStorageKey() *RequestUpdateOne {
+	_u.mutation.ClearContentStorageKey()
+	return _u
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (_u *RequestUpdateOne) SetContentSavedAt(v time.Time) *RequestUpdateOne {
+	_u.mutation.SetContentSavedAt(v)
+	return _u
+}
+
+// SetNillableContentSavedAt sets the "content_saved_at" field if the given value is not nil.
+func (_u *RequestUpdateOne) SetNillableContentSavedAt(v *time.Time) *RequestUpdateOne {
+	if v != nil {
+		_u.SetContentSavedAt(*v)
+	}
+	return _u
+}
+
+// ClearContentSavedAt clears the value of the "content_saved_at" field.
+func (_u *RequestUpdateOne) ClearContentSavedAt() *RequestUpdateOne {
+	_u.mutation.ClearContentSavedAt()
+	return _u
+}
+
+// AddRequestBodyChunkIDs adds the "request_body_chunks" edge to the RequestBodyChunkRef entity by IDs.
+func (_u *RequestUpdateOne) AddRequestBodyChunkIDs(ids ...int) *RequestUpdateOne {
+	_u.mutation.AddRequestBodyChunkIDs(ids...)
+	return _u
+}
+
+// AddRequestBodyChunks adds the "request_body_chunks" edges to the RequestBodyChunkRef entity.
+func (_u *RequestUpdateOne) AddRequestBodyChunks(v ...*RequestBodyChunkRef) *RequestUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.AddRequestBodyChunkIDs(ids...)
+}
+
 // AddExecutionIDs adds the "executions" edge to the RequestExecution entity by IDs.
 func (_u *RequestUpdateOne) AddExecutionIDs(ids ...int) *RequestUpdateOne {
 	_u.mutation.AddExecutionIDs(ids...)
@@ -773,6 +1208,27 @@ func (_u *RequestUpdateOne) AddUsageLogs(v ...*UsageLog) *RequestUpdateOne {
 // Mutation returns the RequestMutation object of the builder.
 func (_u *RequestUpdateOne) Mutation() *RequestMutation {
 	return _u.mutation
+}
+
+// ClearRequestBodyChunks clears all "request_body_chunks" edges to the RequestBodyChunkRef entity.
+func (_u *RequestUpdateOne) ClearRequestBodyChunks() *RequestUpdateOne {
+	_u.mutation.ClearRequestBodyChunks()
+	return _u
+}
+
+// RemoveRequestBodyChunkIDs removes the "request_body_chunks" edge to RequestBodyChunkRef entities by IDs.
+func (_u *RequestUpdateOne) RemoveRequestBodyChunkIDs(ids ...int) *RequestUpdateOne {
+	_u.mutation.RemoveRequestBodyChunkIDs(ids...)
+	return _u
+}
+
+// RemoveRequestBodyChunks removes "request_body_chunks" edges to RequestBodyChunkRef entities.
+func (_u *RequestUpdateOne) RemoveRequestBodyChunks(v ...*RequestBodyChunkRef) *RequestUpdateOne {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _u.RemoveRequestBodyChunkIDs(ids...)
 }
 
 // ClearExecutions clears all "executions" edges to the RequestExecution entity.
@@ -880,6 +1336,11 @@ func (_u *RequestUpdateOne) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *RequestUpdateOne) check() error {
+	if v, ok := _u.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := request.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Request.status": %w`, err)}
@@ -929,6 +1390,12 @@ func (_u *RequestUpdateOne) sqlSave(ctx context.Context) (_node *Request, err er
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(request.FieldUpdatedAt, field.TypeTime, value)
 	}
+	if _u.mutation.UserIDCleared() {
+		_spec.ClearField(request.FieldUserID, field.TypeInt)
+	}
+	if _u.mutation.ReasoningEffortCleared() {
+		_spec.ClearField(request.FieldReasoningEffort, field.TypeString)
+	}
 	if value, ok := _u.mutation.RequestHeaders(); ok {
 		_spec.SetField(request.FieldRequestHeaders, field.TypeJSON, value)
 	}
@@ -939,6 +1406,20 @@ func (_u *RequestUpdateOne) sqlSave(ctx context.Context) (_node *Request, err er
 	}
 	if _u.mutation.RequestHeadersCleared() {
 		_spec.ClearField(request.FieldRequestHeaders, field.TypeJSON)
+	}
+	if value, ok := _u.mutation.RequestBodyChunked(); ok {
+		_spec.SetField(request.FieldRequestBodyChunked, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.ResponseHeaders(); ok {
+		_spec.SetField(request.FieldResponseHeaders, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedResponseHeaders(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, request.FieldResponseHeaders, value)
+		})
+	}
+	if _u.mutation.ResponseHeadersCleared() {
+		_spec.ClearField(request.FieldResponseHeaders, field.TypeJSON)
 	}
 	if value, ok := _u.mutation.ResponseBody(); ok {
 		_spec.SetField(request.FieldResponseBody, field.TypeJSON, value)
@@ -988,6 +1469,84 @@ func (_u *RequestUpdateOne) sqlSave(ctx context.Context) (_node *Request, err er
 	}
 	if _u.mutation.MetricsFirstTokenLatencyMsCleared() {
 		_spec.ClearField(request.FieldMetricsFirstTokenLatencyMs, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.MetricsReasoningDurationMs(); ok {
+		_spec.SetField(request.FieldMetricsReasoningDurationMs, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedMetricsReasoningDurationMs(); ok {
+		_spec.AddField(request.FieldMetricsReasoningDurationMs, field.TypeInt64, value)
+	}
+	if _u.mutation.MetricsReasoningDurationMsCleared() {
+		_spec.ClearField(request.FieldMetricsReasoningDurationMs, field.TypeInt64)
+	}
+	if value, ok := _u.mutation.ContentSaved(); ok {
+		_spec.SetField(request.FieldContentSaved, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.ContentStorageID(); ok {
+		_spec.SetField(request.FieldContentStorageID, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedContentStorageID(); ok {
+		_spec.AddField(request.FieldContentStorageID, field.TypeInt, value)
+	}
+	if _u.mutation.ContentStorageIDCleared() {
+		_spec.ClearField(request.FieldContentStorageID, field.TypeInt)
+	}
+	if value, ok := _u.mutation.ContentStorageKey(); ok {
+		_spec.SetField(request.FieldContentStorageKey, field.TypeString, value)
+	}
+	if _u.mutation.ContentStorageKeyCleared() {
+		_spec.ClearField(request.FieldContentStorageKey, field.TypeString)
+	}
+	if value, ok := _u.mutation.ContentSavedAt(); ok {
+		_spec.SetField(request.FieldContentSavedAt, field.TypeTime, value)
+	}
+	if _u.mutation.ContentSavedAtCleared() {
+		_spec.ClearField(request.FieldContentSavedAt, field.TypeTime)
+	}
+	if _u.mutation.RequestBodyChunksCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RemovedRequestBodyChunksIDs(); len(nodes) > 0 && !_u.mutation.RequestBodyChunksCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.RequestBodyChunksIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   request.RequestBodyChunksTable,
+			Columns: []string{request.RequestBodyChunksColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(requestbodychunkref.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
 	}
 	if _u.mutation.ExecutionsCleared() {
 		edge := &sqlgraph.EdgeSpec{

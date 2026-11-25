@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 
+	"github.com/looplj/axonhub/internal/authz/identity"
 	"github.com/looplj/axonhub/internal/ent"
 )
 
@@ -13,7 +14,25 @@ type ContextKey string
 const (
 	// containerContextKey is used to store the context container in the context.
 	containerContextKey ContextKey = "context_container"
+	basePathContextKey  ContextKey = "base_path"
 )
+
+// WithBasePath stores the configured public mount path for this request.
+func WithBasePath(ctx context.Context, basePath string) context.Context {
+	return context.WithValue(ctx, basePathContextKey, basePath)
+}
+
+// GetBasePath returns the public mount path, or an empty string for a root mount.
+func GetBasePath(ctx context.Context) string {
+	basePath, _ := ctx.Value(basePathContextKey).(string)
+	return basePath
+}
+
+// EnsureContainer installs the mutable request-scoped value container when a
+// caller may need to update it through an interface that cannot return context.
+func EnsureContainer(ctx context.Context) context.Context {
+	return withContainer(ctx, getContainer(ctx))
+}
 
 // WithAPIKey stores the API key entity in the context.
 func WithAPIKey(ctx context.Context, apiKey *ent.APIKey) context.Context {
@@ -48,7 +67,14 @@ func WithUser(ctx context.Context, user *ent.User) context.Context {
 }
 
 // GetUser retrieves the user entity from the context.
+// A delegated (plugin) context always returns the restricted view pinned at delegation,
+// even if the container user was replaced afterwards.
 func GetUser(ctx context.Context) (*ent.User, bool) {
+	if view, ok := identity.DelegatedUserView(ctx); ok {
+		user, _ := view.(*ent.User)
+		return user, user != nil
+	}
+
 	container := getContainer(ctx)
 	return container.User, container.User != nil
 }
@@ -110,7 +136,9 @@ func GetRequestID(ctx context.Context) (string, bool) {
 // WithChannelAPIKey stores the channel API key in the context.
 func WithChannelAPIKey(ctx context.Context, apiKey string) context.Context {
 	container := getContainer(ctx)
+	container.mu.Lock()
 	container.ChannelAPIKey = &apiKey
+	container.mu.Unlock()
 
 	return withContainer(ctx, container)
 }
@@ -118,6 +146,9 @@ func WithChannelAPIKey(ctx context.Context, apiKey string) context.Context {
 // GetChannelAPIKey retrieves the channel API key from the context.
 func GetChannelAPIKey(ctx context.Context) (string, bool) {
 	container := getContainer(ctx)
+	container.mu.RLock()
+	defer container.mu.RUnlock()
+
 	if container.ChannelAPIKey != nil {
 		return *container.ChannelAPIKey, true
 	}
@@ -131,6 +162,56 @@ func WithProjectID(ctx context.Context, projectID int) context.Context {
 	container.ProjectID = &projectID
 
 	return withContainer(ctx, container)
+}
+
+// AttemptChannel is the selected channel for one outbound attempt.
+// Request hooks read it to build ctx.attempt. It does not include credentials.
+type AttemptChannel struct {
+	ID   int
+	Name string
+	Type string
+}
+
+type attemptChannelKey struct{}
+
+// WithAttemptChannel attaches the channel selected for the current attempt.
+func WithAttemptChannel(ctx context.Context, channel AttemptChannel) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, attemptChannelKey{}, channel)
+}
+
+// GetAttemptChannel returns the channel attached by WithAttemptChannel.
+func GetAttemptChannel(ctx context.Context) (AttemptChannel, bool) {
+	if ctx == nil {
+		return AttemptChannel{}, false
+	}
+	channel, ok := ctx.Value(attemptChannelKey{}).(AttemptChannel)
+	return channel, ok
+}
+
+// SetRequestHookState stores plugin request-hook bookkeeping on the request container.
+// The context must already carry a container; EnsureContainer does that.
+func SetRequestHookState(ctx context.Context, state any) {
+	if ctx == nil {
+		return
+	}
+	container := getContainer(ctx)
+	container.mu.Lock()
+	container.RequestHookState = state
+	container.mu.Unlock()
+}
+
+// GetRequestHookState returns the value stored by SetRequestHookState.
+func GetRequestHookState(ctx context.Context) any {
+	if ctx == nil {
+		return nil
+	}
+	container := getContainer(ctx)
+	container.mu.RLock()
+	defer container.mu.RUnlock()
+	return container.RequestHookState
 }
 
 // GetProjectID retrieves the project ID from the context.

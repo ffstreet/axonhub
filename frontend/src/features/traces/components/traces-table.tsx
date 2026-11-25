@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ColumnFiltersState,
   RowData,
@@ -9,22 +9,34 @@ import {
   getFacetedRowModel,
   getFacetedUniqueValues,
   getFilteredRowModel,
-  getSortedRowModel,
   useReactTable,
 } from '@tanstack/react-table';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
+import type { DateRangeField, DateTimeRangeValue } from '@/utils/date-range';
+import type { AutoRefreshInterval } from '@/hooks/use-auto-refresh-interval';
 import { useAnimatedList } from '@/hooks/useAnimatedList';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { TableSkeleton } from '@/components/ui/table-skeleton';
 import { ServerSidePagination } from '@/components/server-side-pagination';
-import type { DateTimeRangeValue } from '@/utils/date-range';
 import { Trace, TraceConnection } from '../data/schema';
 import { DataTableToolbar } from './data-table-toolbar';
-import { useTracesColumns } from './traces-columns';
+import { DEFAULT_TRACES_COLUMN_VISIBILITY, parseTracesColumnVisibility, useTracesColumns } from './traces-columns';
 
 const MotionTableRow = motion.create(TableRow);
 const MotionExpandedRow = motion.create(TableRow);
+
+const COLUMN_VISIBILITY_STORAGE_KEY = 'traces-table-column-visibility';
+
+function readColumnVisibility(): VisibilityState {
+  try {
+    const stored = localStorage.getItem(COLUMN_VISIBILITY_STORAGE_KEY);
+    if (!stored) return DEFAULT_TRACES_COLUMN_VISIBILITY;
+    return parseTracesColumnVisibility(JSON.parse(stored));
+  } catch {
+    return DEFAULT_TRACES_COLUMN_VISIBILITY;
+  }
+}
 
 declare module '@tanstack/react-table' {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -40,16 +52,24 @@ interface TracesTableProps {
   pageSize: number;
   totalCount?: number;
   dateRange?: DateTimeRangeValue;
+  dateRangeField?: DateRangeField;
   traceIdFilter: string;
+  statusFilter?: string[];
+  sorting: SortingState;
   onNextPage: () => void;
   onPreviousPage: () => void;
   onPageSizeChange: (pageSize: number) => void;
   onDateRangeChange: (range: DateTimeRangeValue | undefined) => void;
+  onDateRangeFieldChange?: (field: DateRangeField) => void;
+  onDateRangeOpenChange?: (open: boolean) => void;
   onTraceIdFilterChange: (traceId: string) => void;
+  onStatusFilterChange?: (statuses: string[]) => void;
+  onSortingChange: (updater: SortingState | ((previous: SortingState) => SortingState)) => void;
   onRefresh: () => void;
   showRefresh: boolean;
-  autoRefresh?: boolean;
-  onAutoRefreshChange?: (enabled: boolean) => void;
+  autoRefreshInterval?: AutoRefreshInterval;
+  autoRefreshResumeKey?: number;
+  onAutoRefreshIntervalChange?: (interval: AutoRefreshInterval) => void;
 }
 
 export function TracesTable({
@@ -59,25 +79,44 @@ export function TracesTable({
   totalCount,
   pageSize,
   dateRange,
+  dateRangeField,
   traceIdFilter,
+  statusFilter = [],
+  sorting,
   onNextPage,
   onPreviousPage,
   onPageSizeChange,
   onDateRangeChange,
+  onDateRangeFieldChange,
+  onDateRangeOpenChange,
   onTraceIdFilterChange,
+  onStatusFilterChange,
+  onSortingChange,
   onRefresh,
   showRefresh,
-  autoRefresh = false,
-  onAutoRefreshChange,
+  autoRefreshInterval = null,
+  autoRefreshResumeKey = 0,
+  onAutoRefreshIntervalChange,
 }: TracesTableProps) {
   const { t } = useTranslation();
   const tracesColumns = useTracesColumns();
-  const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>(readColumnVisibility);
   const [rowSelection, setRowSelection] = useState({});
 
-  const displayedData = useAnimatedList(data, autoRefresh);
+  useEffect(() => {
+    try {
+      localStorage.setItem(COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(columnVisibility));
+    } catch {
+      // Storage may be unavailable; the selection still applies for this session.
+    }
+  }, [columnVisibility]);
+
+  const animationResetKey = useMemo(
+    () => JSON.stringify({ dateRange, traceIdFilter, statusFilter, autoRefreshResumeKey }),
+    [dateRange, traceIdFilter, statusFilter, autoRefreshResumeKey]
+  );
+  const displayedData = useAnimatedList(data, showRefresh && autoRefreshInterval !== null, pageSize, animationResetKey);
 
   const table = useReactTable({
     data: displayedData,
@@ -91,16 +130,16 @@ export function TracesTable({
     },
     enableRowSelection: true,
     onRowSelectionChange: setRowSelection,
-    onSortingChange: setSorting,
+    onSortingChange,
     onColumnFiltersChange: setColumnFilters,
     onColumnVisibilityChange: setColumnVisibility,
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
-    getSortedRowModel: getSortedRowModel(),
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
     manualPagination: true,
     manualFiltering: true,
+    manualSorting: true,
   });
 
   return (
@@ -109,14 +148,19 @@ export function TracesTable({
         table={table}
         dateRange={dateRange}
         onDateRangeChange={onDateRangeChange}
+        dateRangeField={dateRangeField}
+        onDateRangeFieldChange={onDateRangeFieldChange}
+        onDateRangeOpenChange={onDateRangeOpenChange}
         traceIdFilter={traceIdFilter}
         onTraceIdFilterChange={onTraceIdFilterChange}
+        statusFilter={statusFilter}
+        onStatusFilterChange={onStatusFilterChange}
         onRefresh={onRefresh}
         showRefresh={showRefresh}
-        autoRefresh={autoRefresh}
-        onAutoRefreshChange={onAutoRefreshChange}
+        autoRefreshInterval={autoRefreshInterval}
+        onAutoRefreshIntervalChange={onAutoRefreshIntervalChange}
       />
-      <div className='shadow-soft relative mt-4 flex-1 overflow-auto overflow-x-hidden rounded-2xl border border-[var(--table-border)]'>
+      <div className='shadow-soft relative mt-4 flex-1 overflow-auto rounded-2xl border border-[var(--table-border)]'>
         <Table data-testid='traces-table' className='border-separate border-spacing-0 rounded-2xl bg-[var(--table-background)]'>
           <TableHeader className='sticky top-0 z-20 bg-[var(--table-header)] shadow-sm'>
             {table.getHeaderGroups().map((headerGroup) => (

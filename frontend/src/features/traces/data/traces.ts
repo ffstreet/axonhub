@@ -1,5 +1,6 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
 import { graphqlRequest } from '@/gql/graphql';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { useErrorHandler } from '@/hooks/use-error-handler';
@@ -20,8 +21,10 @@ function buildTracesQuery() {
             id
             traceID
             firstUserQuery
+            status
             createdAt
             updatedAt
+            lastRequestAt
             thread {
               id
               threadID
@@ -52,6 +55,7 @@ function buildTraceDetailQuery() {
         ... on Trace {
           id
           traceID
+          status
           createdAt
           updatedAt
           usageMetadata {
@@ -61,10 +65,6 @@ function buildTraceDetailQuery() {
             totalCost
             totalCachedTokens
             totalCachedWriteTokens
-          }
-          project {
-            id
-            name
           }
           thread {
             id
@@ -86,6 +86,7 @@ function buildTraceWithRequestTracesQuery() {
         ... on Trace {
           id
           traceID
+          status
           createdAt
           updatedAt
           usageMetadata {
@@ -95,10 +96,6 @@ function buildTraceWithRequestTracesQuery() {
             totalCost
             totalCachedTokens
             totalCachedWriteTokens
-          }
-          project {
-            id
-            name
           }
           thread {
             id
@@ -118,7 +115,7 @@ function buildTraceWithRequestTracesQuery() {
 export function useTraces(variables?: {
   first?: number;
   after?: string;
-  orderBy?: { field: 'CREATED_AT'; direction: 'ASC' | 'DESC' };
+  orderBy?: { field: 'CREATED_AT' | 'LAST_REQUEST_AT'; direction: 'ASC' | 'DESC' };
   where?: {
     projectID?: string;
     threadID?: string;
@@ -143,13 +140,15 @@ export function useTraces(variables?: {
           where: {
             ...variables?.where,
             ...(selectedProjectId && { projectID: selectedProjectId }),
+            // Default: exclude archived traces unless statusIn is explicitly set
+            ...(variables?.where?.statusIn ? {} : { statusNEQ: variables?.where?.statusNEQ ?? 'archived' }),
           },
         };
 
         const data = await graphqlRequest<{ traces: TraceConnection }>(query, finalVariables, headers);
         return traceConnectionSchema.parse(data?.traces);
       } catch (error) {
-        handleError(error, t('traces.errors.loadTracesFailed'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -174,7 +173,7 @@ export function useTrace(id: string) {
         }
         return traceDetailSchema.parse(data.node);
       } catch (error) {
-        handleError(error, t('traces.errors.loadTraceDetailFailed'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -199,7 +198,7 @@ export function useTraceWithSegments(id: string) {
         }
         return traceDetailSchema.parse(data.node);
       } catch (error) {
-        handleError(error, t('traces.errors.loadTraceDetailFailed'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -209,3 +208,80 @@ export function useTraceWithSegments(id: string) {
 
 // Backward compatibility alias
 export const useTraceWithRequestTraces = useTraceWithSegments;
+
+// Status mutation hooks
+export function useArchiveTrace() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const data = await graphqlRequest<{ archiveTrace: boolean }>(
+        `mutation ArchiveTrace($id: ID!) { archiveTrace(id: $id) }`,
+        { id }
+      );
+      return data.archiveTrace;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['traces'] });
+      toast.success(t('traces.messages.archiveSuccess', 'Trace archived'));
+    },
+  });
+}
+
+export function useUnarchiveTrace() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const data = await graphqlRequest<{ unarchiveTrace: boolean }>(
+        `mutation UnarchiveTrace($id: ID!) { unarchiveTrace(id: $id) }`,
+        { id }
+      );
+      return data.unarchiveTrace;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['traces'] });
+      toast.success(t('traces.messages.unarchiveSuccess', 'Trace restored'));
+    },
+  });
+}
+
+export function useRetainTrace() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const data = await graphqlRequest<{ retainTrace: boolean }>(
+        `mutation RetainTrace($id: ID!) { retainTrace(id: $id) }`,
+        { id }
+      );
+      return data.retainTrace;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['traces'] });
+      toast.success(t('traces.messages.retainSuccess', 'Trace retained'));
+    },
+  });
+}
+
+export function useUnretainTrace() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const data = await graphqlRequest<{ unretainTrace: boolean }>(
+        `mutation UnretainTrace($id: ID!) { unretainTrace(id: $id) }`,
+        { id }
+      );
+      return data.unretainTrace;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['traces'] });
+      toast.success(t('traces.messages.unretainSuccess', 'Trace no longer retained'));
+    },
+  });
+}

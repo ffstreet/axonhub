@@ -217,6 +217,85 @@ func TestModelPrice_Equals(t *testing.T) {
 	}
 }
 
+func TestModelPrice_EqualsVolume(t *testing.T) {
+	d1 := decimal.NewFromFloat(0.01)
+	d2 := decimal.NewFromFloat(0.02)
+	upTo1000 := int64(1000)
+
+	p1 := ModelPrice{
+		Items: []ModelPriceItem{
+			{
+				ItemCode: PriceItemCodeUsage,
+				Pricing: Pricing{
+					Mode: PricingModeVolume,
+					UsageTiered: &TieredPricing{
+						Tiers: []PriceTier{
+							{UpTo: &upTo1000, PricePerUnit: d1},
+							{UpTo: nil, PricePerUnit: d2},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p2 := ModelPrice{
+		Items: []ModelPriceItem{
+			{
+				ItemCode: PriceItemCodeUsage,
+				Pricing: Pricing{
+					Mode: PricingModeVolume,
+					UsageTiered: &TieredPricing{
+						Tiers: []PriceTier{
+							{UpTo: &upTo1000, PricePerUnit: d1},
+							{UpTo: nil, PricePerUnit: d2},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.True(t, p1.Equals(p2))
+
+	// Different mode should not be equal
+	p3 := ModelPrice{
+		Items: []ModelPriceItem{
+			{
+				ItemCode: PriceItemCodeUsage,
+				Pricing: Pricing{
+					Mode: PricingModeVolume,
+					UsageTiered: &TieredPricing{
+						Tiers: []PriceTier{
+							{UpTo: &upTo1000, PricePerUnit: d1},
+							{UpTo: nil, PricePerUnit: d2},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p4 := ModelPrice{
+		Items: []ModelPriceItem{
+			{
+				ItemCode: PriceItemCodeUsage,
+				Pricing: Pricing{
+					Mode: PricingModeTiered,
+					UsageTiered: &TieredPricing{
+						Tiers: []PriceTier{
+							{UpTo: &upTo1000, PricePerUnit: d1},
+							{UpTo: nil, PricePerUnit: d2},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.False(t, p3.Equals(p4))
+}
+
 func TestModelPrice_Validate(t *testing.T) {
 	t.Run("flat_fee requires flatFee", func(t *testing.T) {
 		mp := ModelPrice{
@@ -296,6 +375,46 @@ func TestModelPrice_Validate(t *testing.T) {
 		assert.Contains(t, err.Error(), "tiers[1].upTo must be null")
 	})
 
+	t.Run("volume requires usageTiered", func(t *testing.T) {
+		mp := ModelPrice{
+			Items: []ModelPriceItem{
+				{
+					ItemCode: PriceItemCodeUsage,
+					Pricing:  Pricing{Mode: PricingModeVolume},
+				},
+			},
+		}
+
+		err := mp.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "usageTiered is required")
+	})
+
+	t.Run("volume validates tiers same as tiered", func(t *testing.T) {
+		upTo1000 := int64(1000)
+		upTo2000 := int64(2000)
+		mp := ModelPrice{
+			Items: []ModelPriceItem{
+				{
+					ItemCode: PriceItemCodeUsage,
+					Pricing: Pricing{
+						Mode: PricingModeVolume,
+						UsageTiered: &TieredPricing{
+							Tiers: []PriceTier{
+								{UpTo: &upTo1000, PricePerUnit: decimal.NewFromFloat(0.01)},
+								{UpTo: &upTo2000, PricePerUnit: decimal.NewFromFloat(0.02)},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := mp.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tiers[1].upTo must be null")
+	})
+
 	t.Run("variant pricing is also validated", func(t *testing.T) {
 		d := decimal.NewFromFloat(0.01)
 		mp := ModelPrice{
@@ -317,5 +436,66 @@ func TestModelPrice_Validate(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "promptWriteCacheVariants[0]")
 		assert.Contains(t, err.Error(), "usagePerUnit is required")
+	})
+
+	t.Run("write-cache item with empty mode and variants is valid", func(t *testing.T) {
+		d5m := decimal.NewFromFloat(2.5)
+		d1h := decimal.NewFromFloat(3.5)
+		mp := ModelPrice{
+			Items: []ModelPriceItem{
+				{
+					ItemCode: PriceItemCodeUsage,
+					Pricing:  Pricing{Mode: PricingModeUsagePerUnit, UsagePerUnit: &d5m},
+				},
+				{
+					// Mixed-TTL cache write: no aggregate rate is a safe fallback,
+					// so the variants carry the only rates.
+					ItemCode: PriceItemCodeWriteCachedTokens,
+					Pricing:  Pricing{},
+					PromptWriteCacheVariants: []PromptWriteCacheVariant{
+						{
+							VariantCode: PromptWriteCacheVariantCode5Min,
+							Pricing:     Pricing{Mode: PricingModeUsagePerUnit, UsagePerUnit: &d5m},
+						},
+						{
+							VariantCode: PromptWriteCacheVariantCode1Hour,
+							Pricing:     Pricing{Mode: PricingModeUsagePerUnit, UsagePerUnit: &d1h},
+						},
+					},
+				},
+			},
+		}
+
+		require.NoError(t, mp.Validate())
+	})
+
+	t.Run("empty mode without variants is invalid", func(t *testing.T) {
+		mp := ModelPrice{
+			Items: []ModelPriceItem{
+				{
+					ItemCode: PriceItemCodeWriteCachedTokens,
+					Pricing:  Pricing{},
+				},
+			},
+		}
+
+		err := mp.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mode is required")
+	})
+
+	t.Run("empty mode on non-write-cache item is invalid", func(t *testing.T) {
+		mp := ModelPrice{
+			Items: []ModelPriceItem{
+				{
+					ItemCode: PriceItemCodeUsage,
+					Pricing:  Pricing{},
+				},
+			},
+		}
+
+		err := mp.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mode is required")
 	})
 }

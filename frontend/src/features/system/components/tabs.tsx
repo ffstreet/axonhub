@@ -1,78 +1,84 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { AboutSettings } from './about-settings';
-import { BrandSettings } from './brand-settings';
-import { GeneralSettings } from './general-settings';
-import { RetrySettings } from './retry-settings';
-import { StorageSettings } from './storage-settings';
-import { BackupSettings } from './backup-settings';
 import { usePermissions } from '@/hooks/usePermissions';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { useHorizontalScroll } from '@/hooks/use-horizontal-scroll';
+import { SYSTEM_PAGES, type SystemPageKey, type SystemTabKey } from '../pages';
 
-type SystemTabKey = 'general' | 'brand' | 'storage' | 'retry' | 'backup' | 'about';
+export type { SystemTabKey };
 
 interface SystemSettingsTabsProps {
-  initialTab?: SystemTabKey;
+  page: SystemPageKey;
+  initialTab?: string;
 }
 
-export function SystemSettingsTabs({ initialTab }: SystemSettingsTabsProps) {
+export function SystemSettingsTabs({ page, initialTab }: SystemSettingsTabsProps) {
   const { t } = useTranslation();
   const { isOwner } = usePermissions();
-  const [activeTab, setActiveTab] = useState<SystemTabKey>('general');
+  const tabs = useMemo(() => SYSTEM_PAGES[page].tabs.filter((tab) => isOwner || !tab.ownerOnly), [page, isOwner]);
+  const defaultTab = tabs[0].key;
+  const [activeTab, setActiveTab] = useState<SystemTabKey>(defaultTab);
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const horizontalScrollRef = useHorizontalScroll<HTMLDivElement>();
+  const setTabListRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      tabListRef.current = node;
+      horizontalScrollRef(node);
+    },
+    [horizontalScrollRef]
+  );
+
+  const isAvailableTab = useCallback((value: string | undefined): value is SystemTabKey => tabs.some((tab) => tab.key === value), [tabs]);
 
   useEffect(() => {
-    if (initialTab) {
-      setActiveTab(initialTab);
+    setActiveTab(isAvailableTab(initialTab) ? initialTab : defaultTab);
+  }, [initialTab, defaultTab, isAvailableTab]);
+
+  useEffect(() => {
+    const tabList = tabListRef.current;
+    if (!tabList) return;
+
+    const activeTrigger = Array.from(tabList.querySelectorAll<HTMLElement>('[data-value]')).find(
+      (trigger) => trigger.dataset.value === activeTab
+    );
+    if (!activeTrigger) return;
+
+    const listRect = tabList.getBoundingClientRect();
+    const triggerRect = activeTrigger.getBoundingClientRect();
+    if (triggerRect.left < listRect.left) {
+      tabList.scrollLeft -= listRect.left - triggerRect.left;
+    } else if (triggerRect.right > listRect.right) {
+      tabList.scrollLeft += triggerRect.right - listRect.right;
     }
-  }, [initialTab]);
+  }, [activeTab]);
 
   return (
-    <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as SystemTabKey)} className='w-full'>
-      <TabsList className={`shadow-soft border-border bg-background grid w-full rounded-2xl border ${isOwner ? 'grid-cols-6' : 'grid-cols-5'}`}>
-        <TabsTrigger value='general' data-value='general'>
-          {t('system.tabs.general')}
-        </TabsTrigger>
-        <TabsTrigger value='brand' data-value='brand'>
-          {t('system.tabs.brand')}
-        </TabsTrigger>
-        <TabsTrigger value='retry' data-value='retry'>
-          {t('system.tabs.retry')}
-        </TabsTrigger>
-        <TabsTrigger value='storage' data-value='storage'>
-          {t('system.tabs.storage')}
-        </TabsTrigger>
-        {isOwner && (
-          <TabsTrigger value='backup' data-value='backup'>
-            {t('system.tabs.backup')}
+    <Tabs
+      value={activeTab}
+      onValueChange={(value) => {
+        if (!isAvailableTab(value)) return;
+        setActiveTab(value);
+      }}
+      className='w-full'
+    >
+      <TabsList
+        ref={setTabListRef}
+        className='shadow-soft border-border bg-background flex w-full justify-start overflow-x-auto rounded-2xl border sm:overflow-x-visible [&_[data-slot=tabs-trigger]]:flex-none [&_[data-slot=tabs-trigger]]:shrink-0 sm:[&_[data-slot=tabs-trigger]]:flex-1 sm:[&_[data-slot=tabs-trigger]]:shrink'
+      >
+        {tabs.map((tab) => (
+          <TabsTrigger key={tab.key} value={tab.key} data-value={tab.key}>
+            {t(tab.labelKey)}
           </TabsTrigger>
-        )}
-        <TabsTrigger value='about' data-value='about'>
-          {t('system.tabs.about')}
-        </TabsTrigger>
+        ))}
       </TabsList>
-      <div className='shadow-soft border-border bg-card mt-6 rounded-2xl border p-6'>
-        <TabsContent value='general' className='mt-0 p-0'>
-          <GeneralSettings />
-        </TabsContent>
-        <TabsContent value='brand' className='mt-0 p-0'>
-          <BrandSettings />
-        </TabsContent>
-        <TabsContent value='storage' className='mt-0 p-0'>
-          <StorageSettings />
-        </TabsContent>
-        <TabsContent value='retry' className='mt-0 p-0'>
-          <RetrySettings />
-        </TabsContent>
-        {isOwner && (
-          <TabsContent value='backup' className='mt-0 p-0'>
-            <BackupSettings />
+      <div className='shadow-soft border-border bg-card mt-6 rounded-2xl border p-4 sm:p-6'>
+        {tabs.map((tab) => (
+          <TabsContent key={tab.key} value={tab.key} className='mt-0 p-0'>
+            <tab.component />
           </TabsContent>
-        )}
-        <TabsContent value='about' className='mt-0 p-0'>
-          <AboutSettings />
-        </TabsContent>
+        ))}
       </div>
     </Tabs>
   );

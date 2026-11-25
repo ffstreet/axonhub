@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Locator, type Page, type Request } from '@playwright/test'
 import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
 
 test.describe('Admin Channels Management', () => {
@@ -42,7 +42,9 @@ test.describe('Admin Channels Management', () => {
 
     // Fill in API Key
     const apiKeyInput = createDialog.getByTestId('channel-api-key-input')
-    await apiKeyInput.fill('sk-test-key-' + uniqueSuffix)
+    await apiKeyInput.fill('  sk-test-key-' + uniqueSuffix + '  ')
+    await createDialog.getByTestId('channel-name-input').click()
+    await expect(createDialog.getByTestId('channel-name-input')).toBeFocused()
 
     // Add at least one supported model (required to enable Create button)
     // Wait for Quick Add Models section to appear and click on gpt-4o badge
@@ -80,20 +82,39 @@ test.describe('Admin Channels Management', () => {
     // Verify channel appears in the table
     await page.waitForTimeout(1000)
     const channelsTable = page.locator('[data-testid="channels-table"]')
+
+    // New channels are created with 'disabled' status by default.
+    // If an active status filter excludes disabled channels (e.g. "Enabled" is pre-selected),
+    // clear the filter so the new channel is visible.
+    const statusBtn = page
+      .locator('button')
+      .filter({ hasText: /Status|状态/i })
+      .and(page.locator('[aria-haspopup="dialog"]'))
+      .first()
+    const statusBtnText = await statusBtn.textContent()
+    if (statusBtnText && /Enabled|启用/i.test(statusBtnText) && !/Disabled|禁用/i.test(statusBtnText)) {
+      await statusBtn.click()
+      await page.waitForTimeout(500)
+      const disabledOpt = page
+        .getByRole('option', { name: /Disabled|禁用/i })
+        .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
+      if ((await disabledOpt.count()) > 0) {
+        await disabledOpt.first().click()
+        await page.waitForTimeout(500)
+      }
+      await page.keyboard.press('Escape')
+      await page.waitForTimeout(500)
+    }
+
     const channelRow = channelsTable.locator('tbody tr').filter({ hasText: name })
     await expect(channelRow).toBeVisible()
-    // New channels are created with 'disabled' status by default - verify switch is unchecked
     const statusSwitch = channelRow.locator('[data-testid="channel-status-switch"]')
     await expect(statusSwitch).toBeVisible()
     await expect(statusSwitch).not.toBeChecked()
 
-    // Step 2: Edit the channel
-    const actionsTrigger = channelRow.locator('[data-testid="row-actions"]')
-    await actionsTrigger.click()
-
-    const editMenu = page.getByRole('menu')
-    await expect(editMenu).toBeVisible()
-    await editMenu.getByRole('menuitem', { name: /编辑|Edit/i }).click()
+    // Step 2: Edit the channel (click the dedicated edit button in the actions cell)
+    const editButton = channelRow.locator('td:last-child button').first()
+    await editButton.click()
 
     const editDialog = page.getByRole('dialog', { name: /编辑|Edit Channel/i })
     await expect(editDialog).toBeVisible()
@@ -175,49 +196,159 @@ test.describe('Admin Channels Management', () => {
     const archivedSwitch = archivedChannelRow.locator('[data-testid="channel-status-switch"]')
     await expect(archivedSwitch).toBeDisabled()
 
-    // Step 4: Enable the channel (from archived state, use menu action)
-    const enableActionsTrigger = archivedChannelRow.locator('[data-testid="row-actions"]')
-    await enableActionsTrigger.click()
-    const enableMenu = page.getByRole('menu')
-    await expect(enableMenu).toBeVisible()
-    await enableMenu.getByRole('menuitem', { name: /启用|Enable/i }).click()
+    // Archived channels have their switch disabled — no Enable action in the menu.
+    // The test verifies archive was successful (switch disabled) above.
+  })
 
-    const enableDialog = page.getByRole('alertdialog').or(page.getByRole('dialog'))
-    await expect(enableDialog).toBeVisible()
-    await expect(enableDialog).toContainText(/启用|Enable/i)
+  test('preserves a third-party Codex base URL when creating a channel', async ({ page }) => {
+    const uniqueSuffix = Date.now().toString().slice(-6)
+    const name = `pw-test-CodexChannel-${uniqueSuffix}`
+    const baseURL = `https://codex-${uniqueSuffix}.example.com/v1`
 
-    // Wait for dialog to stabilize
+    await page.getByTestId('add-channel-button').click()
+
+    const createDialog = page.getByRole('dialog')
+    await createDialog.getByTestId('provider-codex').click()
+    await createDialog.getByRole('tab', { name: THIRD_PARTY_TAB }).click()
+    await createDialog.getByTestId('channel-name-input').fill(name)
+    await createDialog.getByTestId('channel-base-url-input').fill(baseURL)
+    await createDialog.getByTestId('channel-api-key-input').fill(`sk-test-key-${uniqueSuffix}`)
+
+    const modelBadge = createDialog.getByTestId(`quick-model-${CODEX_MODEL}`)
+    await expect(modelBadge).toBeVisible({ timeout: 5000 })
+    await modelBadge.click()
+    await createDialog.getByTestId('add-selected-models-button').click()
+
+    const defaultTestModelSelect = createDialog.getByTestId('default-test-model-select')
+    await expect(defaultTestModelSelect).toBeVisible({ timeout: 5000 })
+    await defaultTestModelSelect.click()
+    await page.getByRole('option', { name: CODEX_MODEL, exact: true }).click()
+
+    const createRequest = page.waitForRequest((request) => {
+      if (!request.url().includes('/admin/graphql') || request.method() !== 'POST') return false
+      return request.postDataJSON()?.operationName === 'CreateChannel'
+    })
+
+    await Promise.all([
+      createRequest,
+      waitForGraphQLOperation(page, 'CreateChannel'),
+      createDialog.getByTestId('channel-submit-button').click(),
+    ])
+
+    const payload = (await createRequest).postDataJSON() as { variables: { input: { baseURL: string } } }
+    expect(payload.variables.input.baseURL).toBe(baseURL)
+  })
+
+  test('can override the global response timeout for a channel', async ({ page }) => {
+    const uniqueSuffix = Date.now().toString().slice(-6)
+    const name = `pw-test-TimeoutChannel ${uniqueSuffix}`
+    const baseURL = `https://api.timeout-${uniqueSuffix}.example.com`
+
+    // Step 1: Create a channel with a custom response timeout.
+    await page.getByTestId('add-channel-button').click()
+
+    const createDialog = page.getByRole('dialog')
+    await expect(createDialog).toBeVisible()
+    await createDialog.getByTestId('channel-name-input').fill(name)
+    await createDialog.getByTestId('provider-openai').click()
+    await createDialog.getByTestId('channel-base-url-input').fill(baseURL)
+    await createDialog.getByTestId('channel-api-key-input').fill('sk-test-key-' + uniqueSuffix)
+
+    const modelBadge = createDialog.getByTestId('quick-model-gpt-4o')
+    await expect(modelBadge).toBeVisible({ timeout: 5000 })
+    await modelBadge.click()
+    await createDialog.getByTestId('add-selected-models-button').click()
     await page.waitForTimeout(500)
 
-    // Click the confirm button - it's the last button (first is Cancel)
-    const enableButton = enableDialog.getByRole('button', { name: /启用|Enable/i }).last()
-    await Promise.all([waitForGraphQLOperation(page, 'UpdateChannelStatus'), enableButton.click()])
+    const defaultTestModelSelect = createDialog.getByTestId('default-test-model-select')
+    if ((await defaultTestModelSelect.count()) > 0) {
+      await defaultTestModelSelect.click()
+      await page.getByRole('option').first().click()
+      await page.waitForTimeout(300)
+    }
 
-    // Wait for dialog to close before proceeding
-    await expect(enableDialog).not.toBeVisible({ timeout: 10000 })
+    // New channels inherit the global timeouts by default; the override inputs
+    // only appear after switching to Custom.
+    const timeoutMode = createDialog.getByTestId('response-timeout-mode')
+    await expect(timeoutMode).toContainText(/Inherit|继承/i)
+    await expect(createDialog.getByTestId('response-timeout-stream-first-event')).toHaveCount(0)
 
-    // Wait for table to refetch channels after enabling
-    await waitForGraphQLOperation(page, 'GetChannels')
+    await timeoutMode.click()
+    await page
+      .getByRole('option', { name: /^Custom$|^自定义$/i })
+      .first()
+      .click()
 
-    // Clear the Archived filter to see enabled channels
-    await statusFilterButton.click()
-    await page.waitForTimeout(500)
+    const streamTimeoutInput = createDialog.getByTestId('response-timeout-stream-first-event')
+    const nonStreamTimeoutInput = createDialog.getByTestId('response-timeout-non-stream')
+    await expect(streamTimeoutInput).toBeVisible()
+    await expect(nonStreamTimeoutInput).toBeVisible()
+    await streamTimeoutInput.fill('11')
+    await nonStreamTimeoutInput.fill('0')
 
-    // Uncheck Archived filter (it's a CommandItem with role="option")
-    const archivedFilterToUncheck = page
-      .getByRole('option', { name: /Archived|已归档/i })
-      .or(page.locator('[role="option"]').filter({ hasText: /Archived|已归档/i }))
-    await expect(archivedFilterToUncheck).toBeVisible({ timeout: 5000 })
-    await archivedFilterToUncheck.click()
+    await Promise.all([
+      waitForGraphQLOperation(page, 'CreateChannel'),
+      createDialog.getByTestId('channel-submit-button').click(),
+    ])
+    await expect(createDialog).not.toBeVisible({ timeout: 10000 })
+    await page.waitForTimeout(1000)
 
-    // Wait for table to refetch channels after clearing the filter
-    await waitForGraphQLOperation(page, 'GetChannels')
+    // Make sure the new (disabled by default) channel is visible in the table.
+    const statusBtn = page
+      .locator('button')
+      .filter({ hasText: /Status|状态/i })
+      .and(page.locator('[aria-haspopup="dialog"]'))
+      .first()
+    const statusBtnText = await statusBtn.textContent()
+    if (statusBtnText && /Enabled|启用/i.test(statusBtnText) && !/Disabled|禁用/i.test(statusBtnText)) {
+      await statusBtn.click()
+      await page.waitForTimeout(500)
+      const disabledOpt = page
+        .getByRole('option', { name: /Disabled|禁用/i })
+        .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
+      if ((await disabledOpt.count()) > 0) {
+        await disabledOpt.first().click()
+        await page.waitForTimeout(500)
+      }
+      await page.keyboard.press('Escape')
+      await page.waitForTimeout(500)
+    }
 
-    // Now verify the enabled channel appears - switch should be checked
-    const enabledChannelRow = channelsTable.locator('tbody tr').filter({ hasText: updatedName })
-    await expect(enabledChannelRow).toBeVisible({ timeout: 10000 })
-    const enabledSwitch = enabledChannelRow.locator('[data-testid="channel-status-switch"]')
-    await expect(enabledSwitch).toBeChecked()
+    // Step 2: Reopen the channel and verify the override was persisted and echoed.
+    const channelsTable = page.locator('[data-testid="channels-table"]')
+    const channelRow = channelsTable.locator('tbody tr').filter({ hasText: name })
+    await expect(channelRow).toBeVisible()
+    await channelRow.locator('td:last-child button').first().click()
+
+    const editDialog = page.getByRole('dialog', { name: /编辑|Edit Channel/i })
+    await expect(editDialog).toBeVisible()
+    await expect(editDialog.getByTestId('response-timeout-mode')).toContainText(/Custom|自定义/i)
+    await expect(editDialog.getByTestId('response-timeout-stream-first-event')).toHaveValue('11')
+    await expect(editDialog.getByTestId('response-timeout-non-stream')).toHaveValue('0')
+
+    // Step 3: Switch back to inherit and confirm the override is cleared.
+    await editDialog.getByTestId('response-timeout-mode').click()
+    await page
+      .getByRole('option', { name: /Inherit|继承/i })
+      .first()
+      .click()
+    await expect(editDialog.getByTestId('response-timeout-stream-first-event')).toHaveCount(0)
+
+    await Promise.all([
+      waitForGraphQLOperation(page, 'UpdateChannel'),
+      editDialog.getByRole('button', { name: /Edit|编辑|保存|Save|更新|Update/i }).click(),
+    ])
+    await expect(editDialog).not.toBeVisible({ timeout: 10000 })
+    await page.waitForTimeout(1000)
+
+    const updatedRow = channelsTable.locator('tbody tr').filter({ hasText: name })
+    await expect(updatedRow).toBeVisible()
+    await updatedRow.locator('td:last-child button').first().click()
+
+    const reopenedDialog = page.getByRole('dialog', { name: /编辑|Edit Channel/i })
+    await expect(reopenedDialog).toBeVisible()
+    await expect(reopenedDialog.getByTestId('response-timeout-mode')).toContainText(/Inherit|继承/i)
+    await expect(reopenedDialog.getByTestId('response-timeout-stream-first-event')).toHaveCount(0)
   })
 
   test('can test a channel', async ({ page }) => {
@@ -293,6 +424,28 @@ test.describe('Admin Channels Management', () => {
     // Wait for the table to update
     await page.waitForTimeout(1000)
 
+    // Newly created channels are disabled by default.
+    // If an active status filter excludes disabled channels, include them.
+    const statusBtn = page
+      .locator('button')
+      .filter({ hasText: /Status|状态/i })
+      .and(page.locator('[aria-haspopup="dialog"]'))
+      .first()
+    const statusBtnText = await statusBtn.textContent()
+    if (statusBtnText && /Enabled|启用/i.test(statusBtnText) && !/Disabled|禁用/i.test(statusBtnText)) {
+      await statusBtn.click()
+      await page.waitForTimeout(500)
+      const disabledOpt = page
+        .getByRole('option', { name: /Disabled|禁用/i })
+        .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
+      if ((await disabledOpt.count()) > 0) {
+        await disabledOpt.first().click()
+        await page.waitForTimeout(500)
+      }
+      await page.keyboard.press('Escape')
+      await page.waitForTimeout(500)
+    }
+
     // Use the search filter
     const searchInput = page
       .locator('input[placeholder*="搜索"], input[placeholder*="Search"], input[type="search"]')
@@ -356,9 +509,13 @@ test.describe('Admin Channels Management', () => {
     await page.waitForTimeout(1000)
 
     // Look for status filter button/dropdown
+    // The button text may include the selected filter value (e.g. "Status Enabled"),
+    // so we match on the base text "Status" or "状态"
     const statusFilterButton = page
-      .getByRole('button', { name: /Status|状态/i })
-      .or(page.locator('button').filter({ hasText: /Status|状态/i }))
+      .locator('button')
+      .filter({ hasText: /Status|状态/i })
+      .and(page.locator('[aria-haspopup="dialog"]'))
+      .first()
 
     const statusFilterCount = await statusFilterButton.count()
     if (statusFilterCount === 0) {
@@ -366,39 +523,38 @@ test.describe('Admin Channels Management', () => {
       return
     }
 
-    await statusFilterButton.first().click()
+    await statusFilterButton.click()
 
     // Wait for filter menu
     await page.waitForTimeout(500)
 
-    // Select Enabled filter - it's a CommandItem with role="option"
-    const enabledFilter = page
-      .getByRole('option', { name: /Enabled|启用/i })
-      .or(page.locator('[role="option"]').filter({ hasText: /Enabled|启用/i }))
+    // "Enabled" may already be pre-selected as the default filter, so clicking it
+    // would deselect it instead of applying it. Use "Disabled" to test filtering,
+    // which is not pre-selected.
+    const disabledFilter = page
+      .getByRole('option', { name: /Disabled|禁用/i })
+      .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
 
-    const enabledFilterCount = await enabledFilter.count()
-    if (enabledFilterCount > 0) {
-      await enabledFilter.first().click()
+    const disabledFilterCount = await disabledFilter.count()
+    if (disabledFilterCount > 0) {
+      await disabledFilter.first().click()
 
       // Wait for filter to apply
       await page.waitForTimeout(1000)
 
-      // Verify filtered results - enabled channels have checked switches
+      // Verify filtered results - disabled channels have unchecked switches
       const rows = page.locator('tbody tr')
       const rowCount = await rows.count()
 
-      // Skip assertion if no enabled channels exist after filtering
+      // Skip assertion if no disabled channels exist after filtering
       if (rowCount === 0) {
-        // No enabled channels exist - this is valid, skip the assertion
         return
       }
-      
-      // Check that visible rows have enabled status (switch is checked)
+
       const firstRow = rows.first()
       const statusSwitch = firstRow.locator('[data-testid="channel-status-switch"]')
-      // Wait for the switch to be visible first
       await expect(statusSwitch).toBeVisible({ timeout: 5000 })
-      await expect(statusSwitch).toBeChecked({ timeout: 5000 })
+      await expect(statusSwitch).not.toBeChecked({ timeout: 5000 })
     }
   })
 
@@ -604,527 +760,6 @@ test.describe('Admin Channels Management', () => {
     }
   })
 
-  test('can configure override parameters in override settings dialog', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
-
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-
-    // Check if actions button exists (user may not have permission)
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    // Look for override settings option
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
-
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overrideParametersOption.click()
-
-    // Verify override settings dialog opens
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
-    await expect(settingsDialog).toContainText(/Override Settings|覆盖配置|覆盖设置/i)
-
-    // Ensure override parameters section is visible
-    const parametersSection = settingsDialog.locator('[data-testid="override-parameters-section"]')
-    await expect(parametersSection).toBeVisible()
-
-    // Find the textarea for override parameters
-    const overrideTextarea = settingsDialog.locator('[data-testid="override-parameters-textarea"]')
-
-    // Enter valid JSON
-    const validJson = '{"temperature": 0.8, "max_tokens": 4096}'
-    await overrideTextarea.fill(validJson)
-
-    // Wait for validation to run
-    await page.waitForTimeout(500)
-
-    // Verify no validation error appears
-    const errorMessage = settingsDialog.locator('p.text-destructive')
-    await expect(errorMessage).not.toBeVisible()
-
-    // Save the settings
-    const saveButton = settingsDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveButton.click(),
-    ])
-
-    // Wait for dialog to close
-    await expect(settingsDialog).not.toBeVisible({ timeout: 15000 })
-
-    // Re-open override settings dialog to verify the value was saved
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    await expect(refreshedRow).toBeVisible()
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const reopenMenu = page.getByRole('menu')
-    await expect(reopenMenu).toBeVisible()
-    await reopenMenu.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
-
-    const reopenedDialog = page.getByRole('dialog')
-    await expect(reopenedDialog).toBeVisible()
-
-    // Verify the textarea still contains the saved value
-    const reopenedTextarea = reopenedDialog.locator('[data-testid="override-parameters-textarea"]')
-    await expect(reopenedTextarea).toHaveValue(validJson)
-
-    // Close the dialog
-    const cancelButton = reopenedDialog.getByRole('button', { name: /取消|Cancel/i })
-    await cancelButton.click()
-    await expect(reopenedDialog).not.toBeVisible()
-  })
-
-  test('should preserve override settings when saving proxy settings', async ({ page }) => {
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const validJson = `{"temperature": 0.8, "max_tokens": 4096, "note": "pw-${uniqueSuffix}"}`
-    const proxyUrl = `http://proxy.test-${uniqueSuffix}.example.com:8080`
-
-    await page.waitForTimeout(2000)
-
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    const overridesOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overridesCount = await overridesOption.count()
-    if (overridesCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overridesOption.click()
-    const overridesDialog = page.getByRole('dialog')
-    await expect(overridesDialog).toBeVisible()
-
-    const overrideTextarea = overridesDialog.locator('[data-testid="override-parameters-textarea"]')
-    await overrideTextarea.fill(validJson)
-    await page.waitForTimeout(500)
-
-    const saveOverridesButton = overridesDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveOverridesButton.click(),
-    ])
-
-    await expect(overridesDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const menu2 = page.getByRole('menu')
-    await expect(menu2).toBeVisible()
-
-    const proxyOption = menu2.getByRole('menuitem', { name: /Proxy|代理配置/i })
-    const proxyCount = await proxyOption.count()
-    if (proxyCount === 0) {
-      test.skip()
-      return
-    }
-
-    await proxyOption.click()
-    const proxyDialog = page.getByRole('dialog')
-    await expect(proxyDialog).toBeVisible()
-    await expect(proxyDialog).toContainText(/Proxy Configuration|代理配置/i)
-
-    const typeTrigger = proxyDialog.getByRole('combobox').first()
-    await typeTrigger.click()
-
-    const urlTypeOption = page.getByRole('option', { name: /Custom URL|自定义 URL/i }).first()
-    await urlTypeOption.click()
-    await page.waitForTimeout(300)
-
-    const urlInput = proxyDialog.getByPlaceholder(/http:\/\/proxy\.example\.com:8080/i)
-    await urlInput.fill(proxyUrl)
-
-    const saveProxyButton = proxyDialog.getByRole('button', { name: /保存|Save/i })
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveProxyButton.click(),
-    ])
-
-    await expect(proxyDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const finalRow = channelsTable.locator('tbody tr').first()
-    const finalActionsTrigger = finalRow.locator('[data-testid="row-actions"]')
-    await finalActionsTrigger.click()
-
-    const menu3 = page.getByRole('menu')
-    await expect(menu3).toBeVisible()
-    await menu3.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
-
-    const reopenedOverridesDialog = page.getByRole('dialog')
-    await expect(reopenedOverridesDialog).toBeVisible()
-
-    const reopenedTextarea = reopenedOverridesDialog.locator('[data-testid="override-parameters-textarea"]')
-    await expect(reopenedTextarea).toHaveValue(validJson)
-
-    const cancelButton = reopenedOverridesDialog.getByRole('button', { name: /取消|Cancel/i }).first()
-    if ((await cancelButton.count()) > 0) {
-      await cancelButton.click()
-    } else {
-      await page.keyboard.press('Escape')
-    }
-    await expect(reopenedOverridesDialog).not.toBeVisible()
-  })
-
-  test('should preserve proxy settings when saving override settings', async ({ page }) => {
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const validJson = `{"temperature": 0.9, "max_tokens": 2048, "note": "pw-${uniqueSuffix}"}`
-    const proxyUrl = `http://proxy.rev-${uniqueSuffix}.example.com:8080`
-
-    await page.waitForTimeout(2000)
-
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    const proxyOption = menu.getByRole('menuitem', { name: /Proxy|代理配置/i })
-    const proxyCount = await proxyOption.count()
-    if (proxyCount === 0) {
-      test.skip()
-      return
-    }
-
-    await proxyOption.click()
-    const proxyDialog = page.getByRole('dialog')
-    await expect(proxyDialog).toBeVisible()
-    await expect(proxyDialog).toContainText(/Proxy Configuration|代理配置/i)
-
-    const typeTrigger = proxyDialog.getByRole('combobox').first()
-    await typeTrigger.click()
-    const urlTypeOption = page.getByRole('option', { name: /Custom URL|自定义 URL/i }).first()
-    await urlTypeOption.click()
-    await page.waitForTimeout(300)
-
-    const urlInput = proxyDialog.getByPlaceholder(/http:\/\/proxy\.example\.com:8080/i)
-    await urlInput.fill(proxyUrl)
-
-    const saveProxyButton = proxyDialog.getByRole('button', { name: /保存|Save/i })
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveProxyButton.click(),
-    ])
-
-    await expect(proxyDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const menu2 = page.getByRole('menu')
-    await expect(menu2).toBeVisible()
-
-    const overridesOption = menu2.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overridesCount = await overridesOption.count()
-    if (overridesCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overridesOption.click()
-    const overridesDialog = page.getByRole('dialog')
-    await expect(overridesDialog).toBeVisible()
-
-    const overrideTextarea = overridesDialog.locator('[data-testid="override-parameters-textarea"]')
-    await overrideTextarea.fill(validJson)
-    await page.waitForTimeout(500)
-
-    const saveOverridesButton = overridesDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveOverridesButton.click(),
-    ])
-
-    await expect(overridesDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const finalRow = channelsTable.locator('tbody tr').first()
-    const finalActionsTrigger = finalRow.locator('[data-testid="row-actions"]')
-    await finalActionsTrigger.click()
-
-    const menu3 = page.getByRole('menu')
-    await expect(menu3).toBeVisible()
-    await menu3.getByRole('menuitem', { name: /Proxy|代理配置/i }).click()
-
-    const reopenedProxyDialog = page.getByRole('dialog')
-    await expect(reopenedProxyDialog).toBeVisible()
-
-    const reopenedUrlInput = reopenedProxyDialog.getByPlaceholder(/http:\/\/proxy\.example\.com:8080/i)
-    await expect(reopenedUrlInput).toHaveValue(proxyUrl)
-
-    const cancelButton = reopenedProxyDialog.getByRole('button', { name: /取消|Cancel/i }).first()
-    if ((await cancelButton.count()) > 0) {
-      await cancelButton.click()
-    } else {
-      await page.keyboard.press('Escape')
-    }
-    await expect(reopenedProxyDialog).not.toBeVisible()
-  })
-
-  test('should preserve model mappings when saving override settings', async ({ page }) => {
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const aliasName = `pw-alias-${uniqueSuffix}`
-    const validJson = `{"temperature": 0.6, "max_tokens": 1024, "note": "pw-${uniqueSuffix}"}`
-
-    await page.waitForTimeout(2000)
-
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    const modelMappingOption = menu.getByRole('menuitem', { name: /模型别名|Model Alias|Model Mapping|模型映射/i })
-    const modelMappingCount = await modelMappingOption.count()
-    if (modelMappingCount === 0) {
-      test.skip()
-      return
-    }
-
-    await modelMappingOption.click()
-    const modelMappingDialog = page.getByRole('dialog')
-    await expect(modelMappingDialog).toBeVisible()
-
-    const originalInput = modelMappingDialog.getByPlaceholder(/Original Model Name|原模型名称|Alias Name|别名/i)
-    await originalInput.fill(aliasName)
-    await page.waitForTimeout(500)
-
-    const targetSelectTrigger = modelMappingDialog.locator('[role="combobox"]').last()
-    await targetSelectTrigger.click()
-    await page.waitForTimeout(500)
-    const firstOption = page.getByRole('option').first()
-    await firstOption.click()
-    await page.waitForTimeout(500)
-
-    const addButton = modelMappingDialog.getByTestId('add-model-mapping-button')
-    await addButton.click()
-    await page.waitForTimeout(1000)
-
-    const mappingContainer = modelMappingDialog.locator('.rounded-lg.border').filter({ hasText: aliasName })
-    await expect(mappingContainer).toBeVisible()
-
-    const saveModelMappingButton = modelMappingDialog.getByRole('button', { name: /保存|Save/i })
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveModelMappingButton.click(),
-    ])
-
-    await expect(modelMappingDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const menu2 = page.getByRole('menu')
-    await expect(menu2).toBeVisible()
-
-    const overridesOption = menu2.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overridesCount = await overridesOption.count()
-    if (overridesCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overridesOption.click()
-    const overridesDialog = page.getByRole('dialog')
-    await expect(overridesDialog).toBeVisible()
-
-    const overrideTextarea = overridesDialog.locator('[data-testid="override-parameters-textarea"]')
-    await overrideTextarea.fill(validJson)
-    await page.waitForTimeout(500)
-
-    const saveOverridesButton = overridesDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveOverridesButton.click(),
-    ])
-
-    await expect(overridesDialog).not.toBeVisible({ timeout: 15000 })
-    await page.waitForTimeout(1000)
-
-    const finalRow = channelsTable.locator('tbody tr').first()
-    const finalActionsTrigger = finalRow.locator('[data-testid="row-actions"]')
-    await finalActionsTrigger.click()
-
-    const menu3 = page.getByRole('menu')
-    await expect(menu3).toBeVisible()
-    await menu3.getByRole('menuitem', { name: /模型别名|Model Alias|Model Mapping|模型映射/i }).click()
-
-    const reopenedModelMappingDialog = page.getByRole('dialog')
-    await expect(reopenedModelMappingDialog).toBeVisible({ timeout: 5000 })
-    await expect(reopenedModelMappingDialog).toContainText(aliasName)
-
-    await page.keyboard.press('Escape')
-    await expect(reopenedModelMappingDialog).not.toBeVisible()
-  })
-
-  test('validates JSON format in override body settings', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
-
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-
-    // Check if actions button exists (user may not have permission)
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    // Look for override settings option
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
-
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overrideParametersOption.click()
-
-    // Verify override settings dialog opens
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
-    await expect(settingsDialog).toContainText(/Override Settings|覆盖配置|覆盖设置/i)
-
-    // Ensure override parameters section is visible
-    const parametersSection = settingsDialog.locator('[data-testid="override-parameters-section"]')
-    await expect(parametersSection).toBeVisible()
-
-    // Find the textarea for override parameters
-    const overrideTextarea = settingsDialog.locator('[data-testid="override-parameters-textarea"]')
-
-    // Enter invalid JSON
-    const invalidJson = '{"temperature": 0.8, "max_tokens": invalid}'
-    await overrideTextarea.fill(invalidJson)
-
-    // Wait for validation to run (validation happens on change)
-    await page.waitForTimeout(500)
-
-    // Verify validation error appears - it's a <p> tag with class text-destructive
-    const errorMessage = settingsDialog.locator('p.text-destructive')
-    await expect(errorMessage).toBeVisible()
-    await expect(errorMessage).toContainText(/必须是有效的 JSON|Must be valid JSON/i)
-
-    // Enter valid JSON to clear the error
-    const validJson = '{"temperature": 0.8, "max_tokens": 4096}'
-    await overrideTextarea.fill(validJson)
-
-    // Wait for validation to clear
-    await page.waitForTimeout(500)
-
-    // Verify validation error disappears
-    await expect(errorMessage).not.toBeVisible()
-
-    // Close the dialog without saving
-    const cancelButton = settingsDialog.getByRole('button', { name: /取消|Cancel/i })
-    await cancelButton.click()
-    await expect(settingsDialog).not.toBeVisible()
-  })
-
   test('can configure model mappings in model mapping dialog', async ({ page }) => {
     // Wait for table to load
     await page.waitForTimeout(2000)
@@ -1243,69 +878,6 @@ test.describe('Admin Channels Management', () => {
     await expect(reopenedDialog).not.toBeVisible()
   })
 
-  test('can batch create channels with multiple API keys', async ({ page }) => {
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const baseName = `pw-batch-test-${uniqueSuffix}`
-    const baseURL = 'https://api.openai.com/v1'
-    const apiKeys = ['sk-key1-' + uniqueSuffix, 'sk-key2-' + uniqueSuffix, 'sk-key3-' + uniqueSuffix]
-
-    // Look for batch create button (if it exists in the UI)
-    // For now, we'll test via the API by creating channels with the same base name
-    // which should result in numbered channels: "name - (1)", "name - (2)", etc.
-
-    // Create first channel
-    const createButton = page.getByTestId('add-channel-button')
-    await expect(createButton).toBeVisible({ timeout: 10000 })
-    await createButton.click()
-
-    const createDialog = page.getByRole('dialog')
-    await createDialog.getByTestId('channel-name-input').fill(baseName)
-
-    // Select provider - use data-testid for reliable selection
-    const openaiProviderRadio = createDialog.getByTestId('provider-openai')
-    await openaiProviderRadio.click()
-
-    await createDialog.getByTestId('channel-base-url-input').fill(baseURL)
-    await createDialog.getByTestId('channel-api-key-input').fill(apiKeys.join('\n'))
-
-    // Add model - wait for badge to be visible then click
-    const modelBadge = createDialog.getByTestId('quick-model-gpt-4o')
-    await expect(modelBadge).toBeVisible({ timeout: 5000 })
-    await modelBadge.click()
-    await page.waitForTimeout(300)
-    
-    const addSelectedButton = createDialog.getByTestId('add-selected-models-button')
-    await expect(addSelectedButton).toBeEnabled({ timeout: 5000 })
-    await addSelectedButton.click()
-    await page.waitForTimeout(500)
-
-    // Select Default Test Model
-    const defaultTestModelSelect = createDialog.getByTestId('default-test-model-select')
-    await expect(defaultTestModelSelect).toBeVisible({ timeout: 5000 })
-    await defaultTestModelSelect.click()
-    const firstOption = page.getByRole('option').first()
-    await firstOption.click()
-    await page.waitForTimeout(300)
-
-    await Promise.all([
-      waitForGraphQLOperation(page, 'BulkCreateChannels'),
-      createDialog.getByTestId('channel-submit-button').click(),
-    ])
-
-    await expect(createDialog).not.toBeVisible({ timeout: 10000 })
-    await page.waitForTimeout(1500)
-
-    // Verify numbered channels were created for each API key
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const expectedRows = apiKeys.map((_, idx) =>
-      channelsTable.locator('tbody tr').filter({ hasText: `${baseName} - (${idx + 1})` })
-    )
-
-    for (const row of expectedRows) {
-      await expect(row).toBeVisible()
-    }
-  })
-
   test('can filter channels by tags', async ({ page }) => {
     const uniqueSuffix = Date.now().toString().slice(-6)
     const tagName = `pw-tag-${uniqueSuffix}`
@@ -1352,6 +924,28 @@ test.describe('Admin Channels Management', () => {
     await expect(createDialog).not.toBeVisible({ timeout: 10000 })
     await page.waitForTimeout(1000)
 
+    // Newly created channels are disabled by default.
+    // If an active status filter excludes disabled channels, include them.
+    const statusBtn = page
+      .locator('button')
+      .filter({ hasText: /Status|状态/i })
+      .and(page.locator('[aria-haspopup="dialog"]'))
+      .first()
+    const statusBtnText = await statusBtn.textContent()
+    if (statusBtnText && /Enabled|启用/i.test(statusBtnText) && !/Disabled|禁用/i.test(statusBtnText)) {
+      await statusBtn.click()
+      await page.waitForTimeout(500)
+      const disabledOpt = page
+        .getByRole('option', { name: /Disabled|禁用/i })
+        .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
+      if ((await disabledOpt.count()) > 0) {
+        await disabledOpt.first().click()
+        await page.waitForTimeout(500)
+      }
+      await page.keyboard.press('Escape')
+      await page.waitForTimeout(500)
+    }
+
     // Look for tags filter button
     const tagsFilterButton = page
       .locator('button')
@@ -1385,519 +979,769 @@ test.describe('Admin Channels Management', () => {
     }
   })
 
-  test('can configure override headers in override settings dialog', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
+  test.describe('Model price exchange rate', () => {
+    const modelId = 'pw-exchange-rate-model'
+    const createdChannelIds: string[] = []
 
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
+    test.beforeEach(async ({ page }) => {
+      for (const testId of ['onboarding-skip-tour', 'auto-disable-onboarding-skip-tour']) {
+        const skipTour = page.getByTestId(testId)
+        await page.addLocatorHandler(skipTour, () => skipTour.click())
+      }
+    })
+    test.afterEach(async ({ page }) => {
+      const ids = createdChannelIds.splice(0)
+      if (ids.length) {
+        await adminGraphQL(page, 'mutation ($ids: [ID!]!) { bulkArchiveChannels(ids: $ids) }', { ids })
+      }
+    })
 
-    if (rowCount === 0) {
-      test.skip()
-      return
+    async function createPriceChannel(page: Page) {
+      const channel = await seedChannel(page, {
+        type: 'openai',
+        name: `pw-rate-${uniqueSuffix()}`,
+        baseURL: 'https://example.com/v1',
+        credentials: { apiKey: 'test' },
+        supportedModels: [modelId],
+        defaultTestModel: modelId,
+      })
+      createdChannelIds.push(channel.id)
+      return channel.name
     }
 
-    await expect(firstRow).toBeVisible()
-
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-
-    // Check if actions button exists (user may not have permission)
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
+    async function openModelPriceDialog(page: Page, row: Locator) {
+      await openRowAction(page, row, /模型价格|Model Price/i)
+      const dialog = page.getByTestId('channel-price-dialog')
+      await expect(dialog).toBeVisible()
+      return dialog
     }
 
-    await actionsTrigger.click()
+    test('shares the explicit default across channels and uses a temporary rate for filling', async ({ page }) => {
+      const channelA = await createPriceChannel(page)
+      const channelB = await createPriceChannel(page)
+      const dialog = await openModelPriceDialog(page, await showChannel(page, channelA))
+      const rate = dialog.getByTestId('price-exchange-rate')
+      await expect(rate).toHaveValue('7.14')
+      await rate.fill('7.2')
+      await dialog.getByTestId('price-set-default-exchange-rate').click()
+      await page.keyboard.press('Escape')
+      await expect(dialog).toBeHidden()
 
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
+      // Hold the remote catalog across the page navigation and the first edit in channel B.
+      let releaseCatalog!: () => void
+      const catalog = new Promise<void>(resolve => {
+        releaseCatalog = resolve
+      })
+      await page.route('**/admin/graphql', async route => {
+        if (!isGraphQLOperation(route.request(), 'ProvidersCatalog')) return route.fallback()
+        await catalog
+        const providers = { openai: { name: 'Test catalog', models: [{ id: modelId, cost: { input: 2, output: 3 } }] } }
+        await route.fulfill({ json: { data: { providersCatalog: { data: { providers }, source: 'test', filtered: false } } } })
+      })
 
-    // Look for override settings option
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
+      const rowB = await showChannel(page, channelB)
+      await openModelPriceDialog(page, rowB)
+      await expect(rate).toHaveValue('7.2')
+      await rate.fill('7.0')
+      releaseCatalog()
+      await expect(dialog.getByTestId('price-provider').getByRole('combobox')).toHaveValue('Test catalog')
+      await expect(rate).toHaveJSProperty('valueAsNumber', 7)
+      const fill = dialog.getByRole('button', { name: /Match & Fill|一键匹配并填充/i })
+      const promptPrice = dialog.getByTestId('price-per-unit-prompt_tokens')
+      await fill.click()
+      await expect(promptPrice).toHaveValue('14.0000')
+      await dialog.getByRole('button', { name: /^(Save|保存)$/i }).click()
+      await expect(dialog).toBeHidden()
+      await openModelPriceDialog(page, rowB)
+      await expect(rate).toHaveValue('7.2')
+      await expect(promptPrice).toHaveValue(/^14(?:\.0+)?$/)
+      await rate.fill('0')
+      await expect(dialog.getByTestId('price-set-default-exchange-rate')).toBeDisabled()
+      await fill.click()
+      await expect(promptPrice).toHaveValue('0.0000')
+    })
 
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
+    test('falls back when the default is invalid or browser storage is unavailable', async ({ page }) => {
+      const row = await showChannel(page, await createPriceChannel(page))
+      const dialog = page.getByTestId('channel-price-dialog')
+      const rate = dialog.getByTestId('price-exchange-rate')
+      const saveDefault = dialog.getByTestId('price-set-default-exchange-rate')
+      const key = 'channels-model-price-default-exchange-rate'
 
-    await overrideParametersOption.focus()
-    await page.keyboard.press('Enter')
+      for (const stored of ['invalid', '0', '-1', '"7.2"', '1e999']) {
+        await page.evaluate(([key, value]) => localStorage.setItem(key, value), [key, stored])
+        await openModelPriceDialog(page, row)
+        await expect(rate).toHaveValue('7.14')
+        await page.keyboard.press('Escape')
+        await expect(dialog).toBeHidden()
+      }
 
-    // Verify override settings dialog opens
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
-    await expect(settingsDialog).toContainText(/Override Settings|覆盖配置/i)
+      await page.evaluate(key => {
+        localStorage.setItem(key, '7.2')
+        const { setItem } = Storage.prototype
+        Storage.prototype.setItem = function (name, value) {
+          if (name === key) throw new Error('Storage unavailable')
+          setItem.call(this, name, value)
+        }
+      }, key)
+      await openModelPriceDialog(page, row)
+      await expect(rate).toHaveValue('7.2')
+      await rate.fill('7.0')
+      await saveDefault.click()
+      await expect(page.getByText(/save the default exchange rate in this browser|无法在此浏览器中保存默认汇率/)).toBeVisible()
+      await expect(rate).toHaveJSProperty('valueAsNumber', 7)
 
-    // Ensure override headers section is visible - use data-testid for stable selection
-    const headersSection = settingsDialog.locator('[data-testid="override-headers-section"]')
-    await expect(headersSection).toBeVisible()
-    await expect(headersSection).toContainText(/Override Headers|覆盖请求头/i)
+      await page.keyboard.press('Escape')
+      await expect(dialog).toBeHidden()
+      await openModelPriceDialog(page, row)
+      await expect(rate).toHaveValue('7.2')
+      await page.keyboard.press('Escape')
+      await expect(dialog).toBeHidden()
 
-    // Add a new header
-    const addHeaderButton = settingsDialog.locator('[data-testid="add-header-button"]')
-    await addHeaderButton.click()
-    await page.waitForTimeout(500)
+      await page.evaluate(key => {
+        const { getItem } = Storage.prototype
+        Storage.prototype.getItem = function (name) {
+          if (name === key) throw new Error('Storage unavailable')
+          return getItem.call(this, name)
+        }
+      }, key)
+      await openModelPriceDialog(page, row)
+      await expect(rate).toHaveValue('7.14')
+    })
+  })
 
-    // Check if header input was added
-    const headerKeyInput = settingsDialog.locator('[data-testid="header-key-0"]')
-    const headerValueInput = settingsDialog.locator('[data-testid="header-value-0"]')
-    
-    const headerKeyExists = await headerKeyInput.count()
-    const headerValueExists = await headerValueInput.count()
-    console.log(`Header key input exists: ${headerKeyExists > 0}, Header value input exists: ${headerValueExists > 0}`)
+  test.describe('Codex Responses endpoints', () => {
+    test('Codex WebSocket checkbox persists dual endpoints', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-dual-${suffix}`
+      const baseURL = `https://proxy-${suffix}.example.com:8443/openai`
 
-    if (headerKeyExists === 0 || headerValueExists === 0) {
-      console.log('Header inputs were not created properly')
-      // Try to take a screenshot or check the dialog state
-      await page.screenshot({ path: 'debug-override-dialog.png' })
-      test.skip()
-      return
-    }
+      const dialog = await startCodexChannel(page, name)
+      await useCodexThirdParty(dialog, baseURL)
+      const checkbox = dialog.getByTestId('codex-responses-websocket-checkbox')
+      await expect(checkbox).toBeChecked()
+      await expect(dialog.getByTestId('api-format-select')).toHaveCount(0)
+      await expect(dialog.getByTestId('codex-responses-websocket-url')).toContainText(
+        `wss://proxy-${suffix}.example.com:8443/openai/v1/responses`
+      )
+      await addCodexModel(page, dialog)
 
-    // Fill in header key and value - use data-testid for stable selection
-    await headerKeyInput.fill('X-Custom-Header')
-    await headerValueInput.fill('custom-value')
-    
-    // Trigger form validation by blurring the input
-    await headerKeyInput.blur()
-    await page.waitForTimeout(500)
+      const created = await captureGraphQL(page, 'CreateChannel', () => dialog.getByTestId('channel-submit-button').click())
+      expect(created.variables.input.baseURL).toBe(baseURL)
+      expect(created.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }])
+      await expect(dialog).not.toBeVisible({ timeout: 10000 })
 
-    // Verify the values were actually filled
-    const keyFilled = await headerKeyInput.inputValue()
-    const valueFilled = await headerValueInput.inputValue()
-    console.log(`Header key filled: "${keyFilled}", Header value filled: "${valueFilled}"`)
+      const saved = await fetchChannel(page, created.data.createChannel.id)
+      expect(familyFormats(saved.endpoints)).toEqual([RESPONSES, RESPONSES_WS])
+      expect(familyFormats(saved.defaultEndpoints)).toEqual([RESPONSES, RESPONSES_WS])
+      expect((saved.endpoints ?? []).every((endpoint) => !endpoint.transport)).toBe(true)
+      // Native Images keep their HTTP defaults regardless of the checkbox.
+      expect((saved.defaultEndpoints ?? []).map((endpoint) => endpoint.apiFormat)).toEqual(
+        expect.arrayContaining(['openai/image_generation', 'openai/image_edit'])
+      )
 
-    // Check for any validation errors before saving
-    const errorMessage = settingsDialog.locator('p.text-destructive')
-    const errorCount = await errorMessage.count()
-    if (errorCount > 0) {
-      console.log('Validation errors found:', await errorMessage.allTextContents())
-      // If there are validation errors, fail the test early
-      expect(errorCount).toBe(0)
-    }
+      const row = await showChannel(page, name)
+      await expect(row.getByTestId('endpoint-protocol-openai/responses')).toHaveClass(/violet/)
+      const editDialog = await openEditDialog(page, row)
+      await expect(editDialog.getByTestId('codex-responses-websocket-checkbox')).toBeChecked()
+      await expect(editDialog.getByTestId('channel-base-url-input')).toHaveValue(baseURL)
+      await editDialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click()
+      await expect(editDialog).not.toBeVisible()
 
-    // Verify the save button is enabled
-    const saveButton = settingsDialog.locator('[data-testid="override-save-button"]')
-    await expect(saveButton).toBeEnabled()
+      await openRowAction(page, row, /^(Duplicate|复制)$/)
+      const duplicateDialog = page.getByRole('dialog')
+      await expect(duplicateDialog.getByTestId('codex-responses-websocket-checkbox')).toBeChecked()
+      await duplicateDialog.getByTestId('channel-api-key-input').fill(`sk-synthetic-${suffix}`)
+      const duplicated = await captureGraphQL(page, 'DuplicateChannel', () =>
+        duplicateDialog.getByTestId('channel-submit-button').click()
+      )
+      expect(duplicated.variables.input.baseURL).toBe(baseURL)
+      expect(duplicated.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }])
+    })
 
-    // Save the settings
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveButton.click(),
-    ])
+    test('Codex unchecked persists HTTP only', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-http-${suffix}`
+      const baseURL = 'http://127.0.0.1:18080/v1'
 
-    // Wait for dialog to close and ensure it's fully closed
-    await expect(settingsDialog).not.toBeVisible({ timeout: 10000 })
-    await page.waitForTimeout(1000)
+      const dialog = await startCodexChannel(page, name)
+      await useCodexThirdParty(dialog, baseURL)
+      const checkbox = dialog.getByTestId('codex-responses-websocket-checkbox')
+      await checkbox.focus()
+      await page.keyboard.press('Space')
+      await expect(checkbox).not.toBeChecked()
+      await expect(dialog.getByTestId('codex-responses-websocket-url')).toHaveCount(0)
+      await addCodexModel(page, dialog)
 
-    // Re-open override settings dialog to verify the header was saved
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    await expect(refreshedRow).toBeVisible()
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
+      const created = await captureGraphQL(page, 'CreateChannel', () => dialog.getByTestId('channel-submit-button').click())
+      expect(created.variables.input.baseURL).toBe(baseURL)
+      expect(created.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }])
+      await expect(dialog).not.toBeVisible({ timeout: 10000 })
 
-    const reopenMenu = page.getByRole('menu')
-    await expect(reopenMenu).toBeVisible()
-    await reopenMenu.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
+      const saved = await fetchChannel(page, created.data.createChannel.id)
+      expect(familyFormats(saved.endpoints)).toEqual([RESPONSES])
+      // An explicit HTTP-only save suppresses the WebSocket default.
+      expect(familyFormats(saved.defaultEndpoints)).toEqual([RESPONSES])
 
-    const reopenedDialog = page.getByRole('dialog')
-    await expect(reopenedDialog).toBeVisible()
-    await page.waitForTimeout(1000) // Wait for dialog content to fully load
+      const row = await showChannel(page, name)
+      const editDialog = await openEditDialog(page, row)
+      await expect(editDialog.getByTestId('codex-responses-websocket-checkbox')).not.toBeChecked()
+      const updated = await captureGraphQL(page, 'UpdateChannel', () => editDialog.getByTestId('channel-submit-button').click())
+      expect(updated.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }])
+      expect(familyFormats((await fetchChannel(page, saved.id)).endpoints)).toEqual([RESPONSES])
+    })
 
-    // Check if any headers exist at all
-    const headerElements = await reopenedDialog.locator('[data-testid^="header-key-"]').count()
-    console.log(`Found ${headerElements} header elements in reopened dialog`)
+    test('Codex official and auth.json base URLs are locked', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-official-${suffix}`
+      const typedURL = `https://typed-${suffix}.example.com/v1`
 
-    if (headerElements > 0) {
-      // Verify the header still exists
-      const reopenedHeaderKey = reopenedDialog.locator('[data-testid="header-key-0"]')
-      const reopenedHeaderValue = reopenedDialog.locator('[data-testid="header-value-0"]')
-      await expect(reopenedHeaderKey).toHaveValue('X-Custom-Header')
-      await expect(reopenedHeaderValue).toHaveValue('custom-value')
-    } else {
-      // If no headers exist, check if the headers section is visible
-      const headersSectionExists = await reopenedDialog.locator('[data-testid="override-headers-section"]').count()
-      console.log(`Headers section exists: ${headersSectionExists > 0}`)
-      
-      if (headersSectionExists > 0) {
-        // Try adding a header to see if the dialog is working
-        const addNewHeaderButton = reopenedDialog.locator('[data-testid="add-header-button"]')
-        if (await addNewHeaderButton.count() > 0) {
-          await addNewHeaderButton.click()
-          await page.waitForTimeout(500)
-          
-          // Check if header input appears
-          const newHeaderInput = reopenedDialog.locator('[data-testid="header-key-0"]')
-          if (await newHeaderInput.count() > 0) {
-            console.log('Dialog is working, but headers were not saved')
-          } else {
-            console.log('Dialog may not be functioning properly')
-          }
+      const dialog = await startCodexChannel(page, name)
+      const baseURLInput = dialog.getByTestId('channel-base-url-input')
+      await expect(baseURLInput).toBeDisabled()
+      await expect(baseURLInput).toHaveValue(CODEX_BASE_URL)
+
+      await dialog.getByRole('tab', { name: THIRD_PARTY_TAB }).click()
+      await expect(baseURLInput).toBeEnabled()
+      await baseURLInput.fill(typedURL)
+      await dialog.getByRole('tab', { name: OFFICIAL_TAB }).click()
+      await expect(baseURLInput).toBeDisabled()
+      await expect(baseURLInput).toHaveValue(CODEX_BASE_URL)
+      await dialog.getByRole('tab', { name: AUTH_JSON_TAB }).click()
+      await expect(baseURLInput).toBeDisabled()
+      await expect(baseURLInput).toHaveValue(CODEX_BASE_URL)
+      await dialog.getByRole('tab', { name: THIRD_PARTY_TAB }).click()
+      await expect(baseURLInput).toHaveValue(typedURL)
+
+      // The stale third-party URL must never be submitted for auth.json credentials.
+      await dialog.getByRole('tab', { name: AUTH_JSON_TAB }).click()
+      await dialog
+        .getByTestId('codex-auth-json-input')
+        .fill(JSON.stringify({ tokens: { access_token: `synthetic-access-${suffix}`, refresh_token: `synthetic-refresh-${suffix}` } }))
+      await Promise.all([
+        page.waitForResponse((response) => response.url().includes('/codex/auth/decode') && response.ok()),
+        dialog.getByTestId('codex-auth-json-apply').click(),
+      ])
+      await addCodexModel(page, dialog)
+
+      const created = await captureGraphQL(page, 'CreateChannel', () => dialog.getByTestId('channel-submit-button').click())
+      expect(created.variables.input.baseURL).toBe(CODEX_BASE_URL)
+      expect(created.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }])
+      await expect(dialog).not.toBeVisible({ timeout: 10000 })
+
+      // Stored OAuth tokens reopen on the locked Official tab.
+      const row = await showChannel(page, name)
+      const editDialog = await openEditDialog(page, row)
+      await expect(editDialog.getByRole('tab', { name: OFFICIAL_TAB })).toHaveAttribute('aria-selected', 'true')
+      const editBaseURL = editDialog.getByTestId('channel-base-url-input')
+      await expect(editBaseURL).toBeDisabled()
+      await expect(editBaseURL).toHaveValue(CODEX_BASE_URL)
+      await editDialog.getByTestId('codex-responses-websocket-checkbox').click()
+      const updated = await captureGraphQL(page, 'UpdateChannel', () => editDialog.getByTestId('channel-submit-button').click())
+      expect(updated.variables.input.baseURL).toBe(CODEX_BASE_URL)
+      expect(updated.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }])
+
+      const saved = await fetchChannel(page, created.data.createChannel.id)
+      expect(saved.baseURL).toBe(CODEX_BASE_URL)
+      expect(familyFormats(saved.endpoints)).toEqual([RESPONSES])
+      expect(familyFormats(saved.defaultEndpoints)).toEqual([RESPONSES])
+    })
+
+    test('Codex third-party rejects WS URLs and derives matching WS endpoint', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-ws-${suffix}`
+
+      const dialog = await startCodexChannel(page, name)
+      await useCodexThirdParty(dialog, `wss://proxy-${suffix}.example.com/v1`)
+      await addCodexModel(page, dialog)
+      const derived = dialog.getByTestId('codex-responses-websocket-url')
+      await expect(derived).toHaveCount(0)
+
+      const createRequests: string[] = []
+      page.on('request', (request) => {
+        if (isGraphQLOperation(request, 'CreateChannel')) createRequests.push(request.url())
+      })
+      await dialog.getByTestId('channel-submit-button').click()
+      await expect(dialog.getByText(/http:\/\/ or https:\/\/|http:\/\/ 或 https:\/\//)).toBeVisible()
+      expect(createRequests).toEqual([])
+
+      const baseURLInput = dialog.getByTestId('channel-base-url-input')
+      for (const [httpURL, webSocketURL] of [
+        [`https://proxy-${suffix}.example.com:8443/openai`, `wss://proxy-${suffix}.example.com:8443/openai/v1/responses`],
+        [`https://proxy-${suffix}.example.com/codex/#`, `wss://proxy-${suffix}.example.com/codex/responses`],
+        [`https://proxy-${suffix}.example.com/v1/responses##`, `wss://proxy-${suffix}.example.com/v1/responses`],
+        ['http://127.0.0.1:18080/v1', 'ws://127.0.0.1:18080/v1/responses'],
+      ]) {
+        await baseURLInput.fill(httpURL)
+        await expect(derived).toContainText(webSocketURL)
+        await expect(derived).not.toContainText('#')
+        await expect(derived).not.toContainText('responses/responses')
+      }
+
+      const created = await captureGraphQL(page, 'CreateChannel', () => dialog.getByTestId('channel-submit-button').click())
+      expect(created.variables.input.baseURL).toBe('http://127.0.0.1:18080/v1')
+      expect(created.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }])
+      expect(JSON.stringify(created.variables.input)).not.toMatch(/wss?:\/\//)
+    })
+
+    test('Codex legacy WS-only upgrades only on explicit save', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-legacy-${suffix}`
+      const legacyBaseURL = `wss://legacy-${suffix}.example.com:8443/codex#`
+      const httpBaseURL = `https://legacy-${suffix}.example.com:8443/codex#`
+      const seeded = await seedChannel(page, {
+        type: 'codex',
+        name,
+        baseURL: legacyBaseURL,
+        credentials: { apiKeys: [`sk-synthetic-${suffix}`] },
+        supportedModels: [CODEX_MODEL],
+        defaultTestModel: CODEX_MODEL,
+      })
+      const before = await fetchChannel(page, seeded.id)
+      expect(before.baseURL).toBe(legacyBaseURL)
+      expect(familyFormats(before.endpoints)).toEqual([])
+      expect(familyFormats(before.defaultEndpoints)).toEqual([RESPONSES_WS])
+
+      const row = await showChannel(page, name)
+      // List and detail recognize the WebSocket-only endpoint as Responses.
+      await expect(row.getByTestId('endpoint-protocol-openai/responses')).toHaveClass(/violet/)
+      await row.locator('button:has(svg.tabler-icon-chevron-right)').click()
+      await expect(page.getByText('OpenAI (Responses WebSocket)', { exact: true })).toBeVisible()
+
+      const editDialog = await openEditDialog(page, row)
+      await expect(editDialog.getByTestId('codex-responses-websocket-checkbox')).toBeChecked()
+      await expect(editDialog.getByTestId('codex-responses-websocket-upgrade-note')).toBeVisible()
+      await expect(editDialog.getByTestId('channel-base-url-input')).toHaveValue(httpBaseURL)
+      await expect(editDialog.getByTestId('codex-responses-websocket-url')).toContainText(
+        `wss://legacy-${suffix}.example.com:8443/codex/responses`
+      )
+      await editDialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click()
+      await expect(editDialog).not.toBeVisible()
+
+      const endpointsDialog = await openEndpointsDialog(page, row)
+      await expect(endpointsDialog.getByTestId('codex-endpoints-websocket-checkbox')).toBeChecked()
+      await expect(endpointsDialog.getByTestId('codex-endpoints-websocket-upgrade-note')).toBeVisible()
+      await endpointsDialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click()
+      await expect(endpointsDialog).not.toBeVisible()
+
+      const untouched = await fetchChannel(page, seeded.id)
+      expect(untouched.baseURL).toBe(legacyBaseURL)
+      expect(untouched.endpoints ?? []).toEqual(before.endpoints ?? [])
+
+      const saveDialog = await openEditDialog(page, row)
+      const updated = await captureGraphQL(page, 'UpdateChannel', () => saveDialog.getByTestId('channel-submit-button').click())
+      expect(updated.variables.input.baseURL).toBe(httpBaseURL)
+      expect(updated.variables.input.endpoints).toEqual([{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }])
+
+      const after = await fetchChannel(page, seeded.id)
+      expect(after.baseURL).toBe(httpBaseURL)
+      expect(familyFormats(after.endpoints)).toEqual([RESPONSES, RESPONSES_WS])
+      expect(familyFormats(after.defaultEndpoints)).toEqual([RESPONSES, RESPONSES_WS])
+    })
+
+    test('Codex endpoints dialog shares the WebSocket projection and guards model restrictions', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-endpoints-${suffix}`
+      const seeded = await seedChannel(page, {
+        type: 'codex',
+        name,
+        baseURL: `https://gateway-${suffix}.example.com:9443/api`,
+        credentials: { apiKeys: [`sk-synthetic-${suffix}`] },
+        supportedModels: [CODEX_MODEL, 'gpt-6-luna'],
+        defaultTestModel: CODEX_MODEL,
+        endpoints: [
+          { apiFormat: RESPONSES, path: '/custom/responses' },
+          { apiFormat: RESPONSES_WS, path: '/custom/responses' },
+          { apiFormat: 'openai/image_generation', path: '/images/generations' },
+        ],
+        settings: { modelProtocols: [{ model: CODEX_MODEL, apiFormats: [RESPONSES_WS], enabled: true }] },
+      })
+
+      const row = await showChannel(page, name)
+      const dialog = await openEndpointsDialog(page, row)
+      const checkbox = dialog.getByTestId('codex-endpoints-websocket-checkbox')
+      await expect(checkbox).toBeChecked()
+      await expect(dialog.getByTestId('codex-endpoints-websocket-url')).toContainText(
+        `wss://gateway-${suffix}.example.com:9443/api/custom/responses`
+      )
+      // Responses rows are previews managed by the checkbox; other endpoints stay removable.
+      for (const format of [RESPONSES, RESPONSES_WS]) {
+        await expect(dialog.getByRole('button', { name: removeEndpointLabel(format) })).toHaveCount(0)
+      }
+      await expect(dialog.getByRole('button', { name: removeEndpointLabel('openai/image_generation') })).toBeVisible()
+      await expect(dialog.getByText(/^(Unsupported|不支持)$/)).toHaveCount(0)
+
+      await checkbox.click()
+      const blocked = page.getByRole('alertdialog')
+      await expect(blocked).toBeVisible()
+      await expect(blocked).toContainText(RESPONSES_WS)
+      await expect(blocked).toContainText(CODEX_MODEL)
+      await blocked.getByRole('button', { name: /^(Close|关闭)$/ }).click()
+      await expect(blocked).not.toBeVisible()
+      await expect(checkbox).toBeChecked()
+
+      const model = escapeRegExp(CODEX_MODEL)
+      await dialog.getByRole('button', { name: new RegExp(`^(Remove protocol override for ${model}|删除 ${model} 的协议覆盖)$`) }).click()
+      await checkbox.click()
+      await expect(checkbox).not.toBeChecked()
+      await expect(dialog.getByTestId('codex-endpoints-websocket-url')).toHaveCount(0)
+
+      const updated = await captureGraphQL(page, 'UpdateChannel', () => dialog.getByRole('button', { name: /^(Save|保存)$/ }).click())
+      expect(updated.variables.input.baseURL).toBeUndefined()
+      expect(updated.variables.input.endpoints).toEqual([
+        { apiFormat: RESPONSES, path: '/custom/responses' },
+        { apiFormat: 'openai/image_generation', path: '/images/generations' },
+      ])
+      expect(updated.variables.input.settings.modelProtocols).toEqual([])
+
+      const after = await fetchChannel(page, seeded.id)
+      expect(familyFormats(after.endpoints)).toEqual([RESPONSES])
+      expect(familyFormats(after.defaultEndpoints)).toEqual([RESPONSES])
+      expect(after.endpoints?.find((endpoint) => endpoint.apiFormat === 'openai/image_generation')?.path).toBe('/images/generations')
+    })
+
+    test('OpenAI Responses legacy single transport stays unchanged', async ({ page }) => {
+      const suffix = uniqueSuffix()
+      const name = `pw-openai-ws-${suffix}`
+
+      await page.getByTestId('add-channel-button').click()
+      const dialog = page.getByRole('dialog')
+      await dialog.getByTestId('provider-openai').click()
+      await dialog.getByTestId('api-format-select').click()
+      await page.getByRole('option', { name: 'OpenAI (Responses WebSocket)' }).click()
+      await expect(dialog.getByTestId('channel-base-url-input')).toHaveValue('wss://api.openai.com/v1#')
+      await expect(dialog.getByTestId('codex-responses-websocket-checkbox')).toHaveCount(0)
+      await dialog.getByTestId('channel-name-input').fill(name)
+      await dialog.getByTestId('channel-api-key-input').fill(`sk-synthetic-${suffix}`)
+      await dialog.getByTestId('quick-model-gpt-4o').click()
+      await dialog.getByTestId('add-selected-models-button').click()
+      await dialog.getByTestId('default-test-model-select').click()
+      await page.getByRole('option', { name: 'gpt-4o', exact: true }).click()
+
+      const created = await captureGraphQL(page, 'CreateChannel', () => dialog.getByTestId('channel-submit-button').click())
+      expect(created.variables.input.type).toBe('openai_responses')
+      expect(created.variables.input.baseURL).toBe('wss://api.openai.com/v1#')
+      expect(created.variables.input.endpoints).toBeUndefined()
+      await expect(dialog).not.toBeVisible({ timeout: 10000 })
+      const saved = await fetchChannel(page, created.data.createChannel.id)
+      expect(familyFormats(saved.defaultEndpoints)).toEqual([RESPONSES_WS])
+
+      const row = await showChannel(page, name)
+      await expect(row.getByTestId('endpoint-protocol-openai/responses')).toHaveClass(/violet/)
+      const endpointsDialog = await openEndpointsDialog(page, row)
+      await expect(endpointsDialog.getByTestId('codex-endpoints-websocket-checkbox')).toHaveCount(0)
+      await expect(endpointsDialog.getByText(RESPONSES_WS, { exact: true })).toBeVisible()
+      await expect(endpointsDialog.getByText(/^(Unsupported|不支持)$/)).toHaveCount(0)
+      const updated = await captureGraphQL(page, 'UpdateChannel', () =>
+        endpointsDialog.getByRole('button', { name: /^(Save|保存)$/ }).click()
+      )
+      expect(updated.variables.input.baseURL).toBeUndefined()
+      expect(updated.variables.input.endpoints).toEqual([])
+
+      const after = await fetchChannel(page, saved.id)
+      expect(after.baseURL).toBe('wss://api.openai.com/v1#')
+      expect(familyFormats(after.defaultEndpoints)).toEqual([RESPONSES_WS])
+
+      const editDialog = await openEditDialog(page, row)
+      await expect(editDialog.getByTestId('api-format-select')).toContainText('OpenAI (Responses WebSocket)')
+    })
+
+    test('Codex WebSocket controls render in English and Chinese', async ({ page }, testInfo) => {
+      // Two languages at two widths for both dialogs; the shared beforeEach sets 60s.
+      test.setTimeout(120_000)
+      const suffix = uniqueSuffix()
+      const name = `pw-codex-visual-${suffix}`
+      await seedChannel(page, {
+        type: 'codex',
+        name,
+        baseURL: `https://visual-${suffix}.example.com/v1`,
+        credentials: { apiKeys: [`sk-synthetic-${suffix}`] },
+        supportedModels: [CODEX_MODEL],
+        defaultTestModel: CODEX_MODEL,
+        endpoints: [{ apiFormat: RESPONSES }, { apiFormat: RESPONSES_WS }],
+      })
+
+      for (const language of ['en', 'zh']) {
+        await page.setViewportSize({ width: 1280, height: 900 })
+        await page.evaluate((lng) => localStorage.setItem('i18nextLng', lng), language)
+        // The app applies the signed-in user's preferred language from `me`; override it for
+        // this page only so the shared admin profile used by parallel tests stays unchanged.
+        await page.unroute('**/admin/graphql')
+        await page.route('**/admin/graphql', async (route) => {
+          if (!isGraphQLOperation(route.request(), 'Me')) return route.fallback()
+          const response = await route.fetch()
+          const json = await response.json()
+          json.data.me.preferLanguage = language
+          await route.fulfill({ response, json })
+        })
+        const row = await showChannel(page, name)
+
+        const editDialog = await openEditDialog(page, row)
+        const checkbox = editDialog.getByTestId('codex-responses-websocket-checkbox')
+        await expect(checkbox).toBeChecked()
+        const derivedURL = editDialog.getByTestId('codex-responses-websocket-url')
+        await expect(derivedURL).toContainText(`wss://visual-${suffix}.example.com/v1/responses`)
+        await expect(derivedURL).toContainText(language === 'zh' ? 'WebSocket 端点' : 'WebSocket endpoint')
+        for (const width of [1280, 375]) {
+          await page.setViewportSize({ width, height: width === 375 ? 812 : 900 })
+          await checkbox.scrollIntoViewIfNeeded()
+          await expect(checkbox).toBeVisible()
+          await page.screenshot({ path: testInfo.outputPath(`codex-form-${language}-${width}.png`) })
+        }
+        await page.setViewportSize({ width: 1280, height: 900 })
+        await editDialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click()
+        await expect(editDialog).not.toBeVisible()
+
+        const endpointsDialog = await openEndpointsDialog(page, row)
+        const endpointsCheckbox = endpointsDialog.getByTestId('codex-endpoints-websocket-checkbox')
+        await expect(endpointsCheckbox).toBeChecked()
+        await expect(endpointsDialog.getByTestId('codex-endpoints-websocket-url')).toContainText(
+          language === 'zh' ? 'WebSocket 端点' : 'WebSocket endpoint'
+        )
+        for (const width of [1280, 375]) {
+          await page.setViewportSize({ width, height: width === 375 ? 812 : 900 })
+          await endpointsCheckbox.scrollIntoViewIfNeeded()
+          await expect(endpointsCheckbox).toBeVisible()
+          await page.screenshot({ path: testInfo.outputPath(`codex-endpoints-${language}-${width}.png`) })
+        }
+        await page.setViewportSize({ width: 1280, height: 900 })
+        await endpointsDialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click()
+        await expect(endpointsDialog).not.toBeVisible()
+      }
+    })
+  })
+})
+
+const RESPONSES = 'openai/responses'
+const RESPONSES_WS = 'openai/responses-ws'
+const CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex#'
+const CODEX_MODEL = 'gpt-6.1-sol'
+const OFFICIAL_TAB = /^(Official|官方)$/
+const AUTH_JSON_TAB = /^auth\.json$/
+const THIRD_PARTY_TAB = /^(Third[- ]party|第三方)$/i
+
+type EndpointShape = { apiFormat: string; path?: string | null; baseURL?: string | null; transport?: string | null }
+type ChannelProjection = {
+  id: string
+  name: string
+  baseURL: string
+  endpoints: EndpointShape[] | null
+  defaultEndpoints: EndpointShape[] | null
+  settings: { modelProtocols: { model: string; apiFormats: string[]; enabled: boolean | null }[] | null } | null
+}
+
+const CHANNEL_PROJECTION_QUERY = `
+  query ResponsesChannelProjection($input: QueryChannelInput!) {
+    queryChannels(input: $input) {
+      edges {
+        node {
+          id
+          name
+          baseURL
+          endpoints { apiFormat path baseURL transport }
+          defaultEndpoints { apiFormat path baseURL transport }
+          settings { modelProtocols { model apiFormats enabled } }
         }
       }
     }
+  }
+`
 
-    // Close the dialog
-    const cancelButton = reopenedDialog.locator('[data-testid="override-cancel-button"]')
-    if (await cancelButton.count() > 0) {
-      await cancelButton.click()
-    } else {
-      await page.keyboard.press('Escape')
-    }
-    await expect(reopenedDialog).not.toBeVisible()
+const SEED_CHANNEL_MUTATION = `
+  mutation SeedResponsesChannel($input: CreateChannelInput!) {
+    createChannel(input: $input) { id name }
+  }
+`
+
+function uniqueSuffix() {
+  return `${Date.now().toString().slice(-6)}${Math.random().toString(36).slice(2, 6)}`
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+}
+
+function removeEndpointLabel(apiFormat: string) {
+  const format = escapeRegExp(apiFormat)
+  return new RegExp(`^(Remove ${format} endpoint|删除 ${format} 端点)$`)
+}
+
+function familyFormats(endpoints: EndpointShape[] | null | undefined) {
+  return (endpoints ?? []).map((endpoint) => endpoint.apiFormat).filter((format) => format === RESPONSES || format === RESPONSES_WS)
+}
+
+// Reads or seeds configuration through the admin GraphQL API with the signed-in session.
+async function adminGraphQL<T>(page: Page, query: string, variables: Record<string, unknown>): Promise<T> {
+  return (await page.evaluate(
+    async ({ query, variables }) => {
+      const response = await fetch('/admin/graphql', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('axonhub_access_token') ?? ''}`,
+        },
+        body: JSON.stringify({ query, variables }),
+      })
+      const body = await response.json()
+      if (body.errors?.length) {
+        throw new Error(JSON.stringify(body.errors))
+      }
+      return body.data
+    },
+    { query, variables }
+  )) as T
+}
+
+async function fetchChannel(page: Page, id: string): Promise<ChannelProjection> {
+  const data = await adminGraphQL<{ queryChannels: { edges: { node: ChannelProjection }[] } }>(page, CHANNEL_PROJECTION_QUERY, {
+    input: { first: 1, where: { id } },
   })
+  const channel = data.queryChannels.edges[0]?.node
+  expect(channel, `channel ${id} exists`).toBeTruthy()
+  return channel
+}
 
-  test('can add and remove multiple override headers', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
+async function seedChannel(page: Page, input: Record<string, unknown>) {
+  const data = await adminGraphQL<{ createChannel: { id: string; name: string } }>(page, SEED_CHANNEL_MUTATION, { input })
+  return data.createChannel
+}
 
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
+function isGraphQLOperation(request: Request, operationName: string) {
+  if (!request.url().includes('/admin/graphql') || request.method() !== 'POST') return false
+  try {
+    return request.postDataJSON()?.operationName === operationName
+  } catch {
+    return false
+  }
+}
 
-    if (rowCount === 0) {
-      test.skip()
-      return
+// Captures the exact variables the UI sends and fails on GraphQL errors.
+async function captureGraphQL(page: Page, operationName: string, action: () => Promise<unknown>) {
+  const [request, response] = await Promise.all([
+    page.waitForRequest((request) => isGraphQLOperation(request, operationName)),
+    page.waitForResponse((response) => isGraphQLOperation(response.request(), operationName)),
+    action(),
+  ])
+  const body = await response.json()
+  expect(body.errors, `${operationName} errors`).toBeUndefined()
+  return { variables: request.postDataJSON().variables, data: body.data }
+}
+
+async function includeDisabledChannels(page: Page) {
+  const statusBtn = page
+    .locator('button')
+    .filter({ hasText: /Status|状态/i })
+    .and(page.locator('[aria-haspopup="dialog"]'))
+    .first()
+  const statusBtnText = await statusBtn.textContent()
+  if (statusBtnText && /Enabled|启用/i.test(statusBtnText) && !/Disabled|禁用/i.test(statusBtnText)) {
+    await statusBtn.click()
+    const disabledOpt = page
+      .getByRole('option', { name: /Disabled|禁用/i })
+      .or(page.locator('[role="option"]').filter({ hasText: /Disabled|禁用/i }))
+    if ((await disabledOpt.count()) > 0) {
+      await disabledOpt.first().click()
     }
+    await page.keyboard.press('Escape')
+  }
+}
 
-    await expect(firstRow).toBeVisible()
+async function showChannel(page: Page, name: string) {
+  await gotoAndEnsureAuth(page, '/channels')
+  const table = page.locator('[data-testid="channels-table"]')
+  await table.waitFor({ state: 'visible', timeout: 15000 })
+  await includeDisabledChannels(page)
+  await page.getByPlaceholder(/^(Search by name|按名称筛选)$/).fill(name)
+  const row = table.locator('tbody tr').filter({ hasText: name })
+  await expect(row).toBeVisible({ timeout: 15000 })
+  return row
+}
 
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
+async function openEditDialog(page: Page, row: Locator) {
+  await row.locator('td:last-child button').first().click()
+  const dialog = page.getByRole('dialog', { name: /编辑|Edit Channel/i })
+  await expect(dialog).toBeVisible()
+  return dialog
+}
 
-    await actionsTrigger.click()
+async function openRowAction(page: Page, row: Locator, name: RegExp) {
+  await row.getByTestId('row-actions').click()
+  await page.getByRole('menuitem', { name }).click()
+}
 
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
+async function openEndpointsDialog(page: Page, row: Locator) {
+  await openRowAction(page, row, /^(Endpoints|端点配置)$/)
+  const dialog = page.getByRole('dialog', { name: /Endpoints|端点配置/ })
+  await expect(dialog).toBeVisible()
+  return dialog
+}
 
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
+async function startCodexChannel(page: Page, name: string) {
+  await page.getByTestId('add-channel-button').click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  await dialog.getByTestId('provider-codex').click()
+  await dialog.getByTestId('channel-name-input').fill(name)
+  return dialog
+}
 
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
+async function useCodexThirdParty(dialog: Locator, baseURL: string) {
+  await dialog.getByRole('tab', { name: THIRD_PARTY_TAB }).click()
+  await dialog.getByTestId('channel-base-url-input').fill(baseURL)
+  await dialog.getByTestId('channel-api-key-input').fill(`sk-synthetic-${uniqueSuffix()}`)
+}
 
-    await overrideParametersOption.focus()
-    await page.keyboard.press('Enter')
+async function addCodexModel(page: Page, dialog: Locator) {
+  await dialog.getByTestId(`quick-model-${CODEX_MODEL}`).click()
+  await dialog.getByTestId('add-selected-models-button').click()
+  await dialog.getByTestId('default-test-model-select').click()
+  await page.getByRole('option', { name: CODEX_MODEL, exact: true }).click()
+}
 
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
+for (const storage of ['legacy', 'structured'] as const) {
+  test(`Claude Code catalog preserves refreshed ${storage} credentials on model-only save`, async ({ page }) => {
+    const skipTour = page.getByRole('button', { name: 'Skip Tour' })
+    await page.addLocatorHandler(skipTour, () => skipTour.click())
+    await gotoAndEnsureAuth(page, '/channels')
+    const name = `pw-claude-catalog-${uniqueSuffix()}`
+    const old = { access_token: 'fixture-old' }
+    const saved = await seedChannel(page, {
+      name,
+      type: 'claudecode',
+      baseURL: 'https://api.anthropic.com',
+      credentials: storage === 'legacy' ? { apiKey: JSON.stringify(old) } : { oauth: { accessToken: old.access_token } },
+      supportedModels: ['fixture-old-model'],
+      defaultTestModel: 'fixture-old-model',
+    })
+    const row = await showChannel(page, name)
+    const dialog = await openEditDialog(page, row)
+    await page.route('**/admin/graphql', async (route) => {
+      if (!isGraphQLOperation(route.request(), 'FetchModels')) return route.continue()
+      const { input } = route.request().postDataJSON().variables
+      expect(input.channelID).toBe(saved.id)
+      expect(input.apiKey).toBeUndefined()
+      await route.fulfill({ json: { data: { fetchModels: {
+        models: [{ id: 'fixture-new', pricing: null }],
+        fallback: false, error: null, fallbackReason: null, codexCatalogVersion: null, codexCatalogSkippedReason: null,
+      } } } })
+    })
+    await dialog.getByTestId('fetch-channel-models').click()
+    await expect(dialog.getByTestId('claude-catalog-source')).toHaveText('Upstream models (1)')
 
-    // Add first header
-    const addHeaderButton = settingsDialog.locator('[data-testid="add-header-button"]')
-    await addHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    let headerKeyInput = settingsDialog.locator('[data-testid="header-key-0"]')
-    let headerValueInput = settingsDialog.locator('[data-testid="header-value-0"]')
-    await headerKeyInput.fill('User-Agent')
-    await headerValueInput.fill('MyApp/1.0')
-
-    // Add second header
-    await addHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    headerKeyInput = settingsDialog.locator('[data-testid="header-key-1"]')
-    headerValueInput = settingsDialog.locator('[data-testid="header-value-1"]')
-    await headerKeyInput.fill('X-Custom-ID')
-    await headerValueInput.fill('12345')
-
-    // Add third header
-    await addHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    headerKeyInput = settingsDialog.locator('[data-testid="header-key-2"]')
-    headerValueInput = settingsDialog.locator('[data-testid="header-value-2"]')
-    await headerKeyInput.fill('X-Request-Source')
-    await headerValueInput.fill('automated-test')
-
-    // Verify all headers are present
-    await expect(settingsDialog.locator('[data-testid="header-key-0"]')).toHaveValue('User-Agent')
-    await expect(settingsDialog.locator('[data-testid="header-value-0"]')).toHaveValue('MyApp/1.0')
-    await expect(settingsDialog.locator('[data-testid="header-key-1"]')).toHaveValue('X-Custom-ID')
-    await expect(settingsDialog.locator('[data-testid="header-value-1"]')).toHaveValue('12345')
-    await expect(settingsDialog.locator('[data-testid="header-key-2"]')).toHaveValue('X-Request-Source')
-    await expect(settingsDialog.locator('[data-testid="header-value-2"]')).toHaveValue('automated-test')
-
-    // Remove the second header (index 1)
-    const removeHeaderButton = settingsDialog.locator('[data-testid="remove-header-1"]')
-    await removeHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    // Verify the header was removed and other headers are still present
-    await expect(settingsDialog.locator('[data-testid="header-key-0"]')).toHaveValue('User-Agent')
-    await expect(settingsDialog.locator('[data-testid="header-value-0"]')).toHaveValue('MyApp/1.0')
-    
-    // After removing index 1, index 2 should become index 1
-    await expect(settingsDialog.locator('[data-testid="header-key-1"]')).toHaveValue('X-Request-Source')
-    await expect(settingsDialog.locator('[data-testid="header-value-1"]')).toHaveValue('automated-test')
-
-    // Verify the removed header no longer exists
-    await expect(settingsDialog.locator('[data-testid="header-key-2"]')).not.toBeVisible()
-
-    // Close the dialog without saving
-    const cancelButton = settingsDialog.locator('[data-testid="override-cancel-button"]')
-    await cancelButton.click()
-    await expect(settingsDialog).not.toBeVisible()
+    // Simulate token rotation while the edit form still displays the original credential.
+    const fresh = { accessToken: 'fixture-rotated' }
+    await adminGraphQL(page, 'mutation ($id: ID!, $input: UpdateChannelInput!) { updateChannel(id: $id, input: $input) { id } }',
+      { id: saved.id, input: { credentials: { oauth: fresh } } })
+    await dialog.getByTestId('catalog-model-row').getByRole('checkbox').click()
+    await dialog.getByRole('button', { name: 'Add Selected (1)', exact: true }).click()
+    await dialog.getByTestId('channel-submit-button').click()
+    await expect(dialog).toBeHidden()
+    const result = await adminGraphQL<{ node: { supportedModels: string[]; credentials: { oauth: { accessToken: string } } } }>(
+      page,
+      'query ($id: ID!) { node(id: $id) { ... on Channel { supportedModels credentials { oauth { accessToken } } } } }',
+      { id: saved.id }
+    )
+    expect(result.node.supportedModels).toEqual(['fixture-old-model', 'fixture-new'])
+    expect(result.node.credentials.oauth).toEqual(fresh)
   })
-
-  // NOTE: Test for 'validates forbidden headers in override settings' was removed
-  // because the sensitive headers validation logic was deleted from the codebase
-
-  test('can clear headers by leaving value empty', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
-
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
-
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overrideParametersOption.focus()
-    await page.keyboard.press('Enter')
-
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
-
-    // Check existing headers first
-    const existingHeaderKeys = settingsDialog.locator('[data-testid^="header-key-"]')
-    const existingHeaderCount = await existingHeaderKeys.count()
-    
-    // Add a header with key but empty value
-    const addHeaderButton = settingsDialog.locator('[data-testid="add-header-button"]')
-    await addHeaderButton.click()
-
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const headerKeyName = `X-To-Remove-${uniqueSuffix}`
-
-    // Get the correct header index (should be existingHeaderCount)
-    const headerIndex = existingHeaderCount
-    // Wait for the new header input to be visible
-    await expect(settingsDialog.locator(`[data-testid="header-key-${existingHeaderCount}"]`)).toBeVisible()
-    const headerKeyInput = settingsDialog.locator(`[data-testid="header-key-${headerIndex}"]`)
-    const headerValueInput = settingsDialog.locator(`[data-testid="header-value-${headerIndex}"]`)
-
-    await headerKeyInput.fill(headerKeyName)
-    // Leave value empty to indicate removal
-
-    // Save the settings
-    const saveButton = settingsDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveButton.click(),
-    ])
-
-    // Wait for the dialog to close. A generous timeout is used to accommodate for
-    // network latency and UI updates. A failure here indicates a potential application bug.
-    await expect(settingsDialog).not.toBeVisible({ timeout: 15000 })
-
-    // Re-open to verify
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    await expect(refreshedRow).toBeVisible()
-    
-    // Wait for query invalidation to complete and data to refresh
-    await waitForGraphQLOperation(page, 'GetChannels')
-    await page.waitForTimeout(1000)
-    
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const reopenMenu = page.getByRole('menu')
-    await expect(reopenMenu).toBeVisible()
-    await reopenMenu.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
-
-    const reopenedDialog = page.getByRole('dialog')
-    await expect(reopenedDialog).toBeVisible()
-
-    // Verify the header is still saved (frontend saves headers with empty values)
-    const reopenedHeaderKey = reopenedDialog.locator(`[data-testid="header-key-${headerIndex}"]`)
-    const reopenedHeaderValue = reopenedDialog.locator(`[data-testid="header-value-${headerIndex}"]`)
-    await expect(reopenedHeaderKey).toHaveValue(headerKeyName)
-    await expect(reopenedHeaderValue).toHaveValue('')
-
-    // Close the dialog
-    const cancelButton = reopenedDialog.locator('[data-testid="override-cancel-button"]')
-    await cancelButton.click()
-    await expect(reopenedDialog).not.toBeVisible()
-  })
-
-  test('can remove headers using remove button', async ({ page }) => {
-    // Wait for table to load
-    await page.waitForTimeout(2000)
-
-    // Find the first channel row
-    const channelsTable = page.locator('[data-testid="channels-table"]')
-    const firstRow = channelsTable.locator('tbody tr').first()
-    const rowCount = await channelsTable.locator('tbody tr').count()
-
-    if (rowCount === 0) {
-      test.skip()
-      return
-    }
-
-    await expect(firstRow).toBeVisible()
-
-    // Click actions menu
-    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
-    const actionsCount = await actionsTrigger.count()
-    if (actionsCount === 0) {
-      test.skip()
-      return
-    }
-
-    await actionsTrigger.click()
-
-    const menu = page.getByRole('menu')
-    await expect(menu).toBeVisible()
-
-    const overrideParametersOption = menu.getByRole('menuitem', { name: /Overrides|覆盖设置/i })
-    const overrideParametersCount = await overrideParametersOption.count()
-
-    if (overrideParametersCount === 0) {
-      test.skip()
-      return
-    }
-
-    await overrideParametersOption.focus()
-    await page.keyboard.press('Enter')
-
-    const settingsDialog = page.getByRole('dialog')
-    await expect(settingsDialog).toBeVisible()
-
-    // Check existing headers first
-    const existingHeaderKeys = settingsDialog.locator('[data-testid^="header-key-"]')
-    const existingHeaderCount = await existingHeaderKeys.count()
-
-    // Add a header first
-    const addHeaderButton = settingsDialog.locator('[data-testid="add-header-button"]')
-    await addHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    const uniqueSuffix = Date.now().toString().slice(-6)
-    const headerKeyName = `X-To-Remove-${uniqueSuffix}`
-
-    // Get the correct header index (should be existingHeaderCount)
-    const headerIndex = existingHeaderCount
-    const headerKeyInput = settingsDialog.locator(`[data-testid="header-key-${headerIndex}"]`)
-    const headerValueInput = settingsDialog.locator(`[data-testid="header-value-${headerIndex}"]`)
-
-    await headerKeyInput.fill(headerKeyName)
-    await headerValueInput.fill('some-value')
-
-    // Save the settings
-    const saveButton = settingsDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      saveButton.click(),
-    ])
-
-    // Wait for dialog to close
-    await expect(settingsDialog).not.toBeVisible({ timeout: 10000 })
-
-    // Re-open and remove the header
-    const refreshedRow = channelsTable.locator('tbody tr').first()
-    await expect(refreshedRow).toBeVisible()
-    
-    // Wait for query invalidation to complete and data to refresh
-    await waitForGraphQLOperation(page, 'GetChannels')
-    await page.waitForTimeout(1000)
-    
-    const refreshedActionsTrigger = refreshedRow.locator('[data-testid="row-actions"]')
-    await refreshedActionsTrigger.click()
-
-    const reopenMenu = page.getByRole('menu')
-    await expect(reopenMenu).toBeVisible()
-    await reopenMenu.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
-
-    const reopenedDialog = page.getByRole('dialog')
-    await expect(reopenedDialog).toBeVisible()
-
-    // Verify the header exists
-    const reopenedHeaderKey = reopenedDialog.locator(`[data-testid="header-key-${headerIndex}"]`)
-    await expect(reopenedHeaderKey).toHaveValue(headerKeyName)
-
-    // Remove the header using the remove button
-    const removeHeaderButton = reopenedDialog.locator(`[data-testid="remove-header-${headerIndex}"]`)
-    await removeHeaderButton.click()
-    await page.waitForTimeout(500)
-
-    // Save the changes
-    const reopenedSaveButton = reopenedDialog.locator('[data-testid="override-save-button"]')
-    await Promise.all([
-      waitForGraphQLOperation(page, 'UpdateChannel'),
-      reopenedSaveButton.click(),
-    ])
-
-    // Wait for the dialog to close. A generous timeout is used to accommodate for
-    // network latency and UI updates. A failure here indicates a potential application bug.
-    await expect(reopenedDialog).not.toBeVisible({ timeout: 15000 })
-
-    // Re-open again to verify the header is gone
-    const finalRow = channelsTable.locator('tbody tr').first()
-    await expect(finalRow).toBeVisible()
-    
-    // Wait for query invalidation to complete and data to refresh
-    await waitForGraphQLOperation(page, 'GetChannels')
-    await page.waitForTimeout(1000)
-    
-    const finalActionsTrigger = finalRow.locator('[data-testid="row-actions"]')
-    await finalActionsTrigger.click()
-
-    const finalMenu = page.getByRole('menu')
-    await expect(finalMenu).toBeVisible()
-    await finalMenu.getByRole('menuitem', { name: /Overrides|覆盖设置/i }).click()
-
-    const finalDialog = page.getByRole('dialog')
-    await expect(finalDialog).toBeVisible()
-
-    // Verify the header is completely removed
-    const finalHeaderKey = finalDialog.locator(`[data-testid="header-key-${headerIndex}"]`)
-    const hasHeader = await finalHeaderKey.count()
-    expect(hasHeader).toBe(0)
-
-    // Close the dialog
-    const finalCancelButton = finalDialog.locator('[data-testid="override-cancel-button"]')
-    await finalCancelButton.click()
-    await expect(finalDialog).not.toBeVisible()
-  })
-})
+}

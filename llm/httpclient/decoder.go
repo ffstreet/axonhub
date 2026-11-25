@@ -1,15 +1,22 @@
 package httpclient
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tmaxmax/go-sse"
-
-	"github.com/looplj/axonhub/internal/log"
 )
+
+var ErrStreamEventTooLarge = errors.New("stream event exceeds byte limit")
+
+const defaultMaxSSEEventBytes = 32 * 1024 * 1024
 
 // decoderRegistry holds registered stream decoders.
 type decoderRegistry struct {
@@ -42,32 +49,176 @@ func GetDecoder(contentType string) (StreamDecoderFactory, bool) {
 
 // NewDefaultSSEDecoder creates a new default SSE decoder.
 func NewDefaultSSEDecoder(ctx context.Context, rc io.ReadCloser) StreamDecoder {
-	return &defaultSSEDecoder{
-		ctx: ctx,
-		// sseStream: sse.NewStream(rc),
-		// 图片生成需要大量数据，设置最大事件大小
-		sseStream: sse.NewStreamWithConfig(rc, &sse.StreamConfig{
-			MaxEventSize: 32 * 1024 * 1024,
-		}),
+	return NewSSEDecoderWithMaxEventSize(ctx, rc, defaultMaxSSEEventBytes)
+}
+
+// NewSSEDecoderWithMaxEventSize creates an SSE decoder with a hard parser
+// limit, so oversized events are rejected before an Event string and []byte
+// payload copy are constructed.
+func NewSSEDecoderWithMaxEventSize(ctx context.Context, rc io.ReadCloser, maxEventSize int) StreamDecoder {
+	if maxEventSize <= 0 {
+		maxEventSize = defaultMaxSSEEventBytes
 	}
+
+	reader := newNewlineTerminatingReader(rc)
+
+	return &defaultSSEDecoder{
+		ctx:    ctx,
+		reader: reader,
+		sseStream: sse.NewStreamWithConfig(reader, &sse.StreamConfig{
+			MaxEventSize: maxEventSize,
+		}),
+		maxEventSize: maxEventSize,
+	}
+}
+
+// newlineTerminatingReader guarantees the wrapped body ends with a newline.
+//
+// SSE fields are terminated by a newline; go-sse's field parser reports
+// ErrUnexpectedEOF and drops the field when the final buffered line has no
+// terminator, so a body whose last line is "data: [DONE]" (no trailing
+// newline, as sent by synthetic.new) loses its terminal event entirely. The
+// parser can only yield that field once the line is terminated, so this wrapper
+// synthesizes the missing newline at EOF. It is purely a framing repair: the
+// decoder consumes the bytes and emits decoded events, and no raw-pass-through
+// path forwards upstream bytes verbatim, so the synthesized newline never
+// reaches a client payload.
+type newlineTerminatingReader struct {
+	rc io.ReadCloser
+
+	// sawByte records whether the body produced any byte, so empty bodies stay empty.
+	sawByte bool
+	// lastByte is the final byte observed from the underlying reader.
+	lastByte byte
+	// pendingNewline is set when EOF arrived on a non-empty body whose last byte
+	// was not a newline; the newline is emitted before io.EOF is reported.
+	pendingNewline bool
+	// finished records that the synthesized newline was delivered and the next
+	// Read must report io.EOF.
+	finished bool
+}
+
+func newNewlineTerminatingReader(rc io.ReadCloser) io.ReadCloser {
+	return &newlineTerminatingReader{rc: rc}
+}
+
+func (r *newlineTerminatingReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if r.pendingNewline {
+		r.pendingNewline = false
+		r.finished = true
+		p[0] = '\n'
+
+		return 1, nil
+	}
+
+	if r.finished {
+		return 0, io.EOF
+	}
+
+	n, err := r.rc.Read(p)
+	if n > 0 {
+		r.sawByte = true
+		r.lastByte = p[n-1]
+	}
+
+	if err == nil {
+		return n, nil
+	}
+
+	if !errors.Is(err, io.EOF) {
+		return n, err
+	}
+
+	// The body ended. If it was non-empty and its last byte was not a newline
+	// ('\n' or '\r'; both terminate an SSE line), the final SSE field is
+	// unterminated: emit the missing newline before EOF.
+	if r.sawByte && r.lastByte != '\n' && r.lastByte != '\r' {
+		if n > 0 {
+			r.pendingNewline = true
+
+			return n, nil
+		}
+
+		r.finished = true
+		p[0] = '\n'
+
+		return 1, nil
+	}
+
+	if n > 0 {
+		// Let the caller consume the final bytes before observing EOF.
+		return n, nil
+	}
+
+	return 0, io.EOF
+}
+
+func (r *newlineTerminatingReader) Close() error {
+	return r.rc.Close()
 }
 
 // Ensure defaultSSEDecoder implements StreamDecoder.
 var _ StreamDecoder = (*defaultSSEDecoder)(nil)
 
-// defaultSSEDecoder implements streams.Stream for Server-Sent Events using go-sse Stream.
+// defaultSSEDecoder implements streams.Stream for Server-Sent Events backed by
+// go-sse Stream.
+//
+// Concurrency model:
+//   - Next / Current / Err must be called from a single goroutine (the reader).
+//   - Close is idempotent (sync.Once) and safe to call concurrently with Next
+//     from any goroutine. The reader (typically *http.Response.Body) is closed
+//     directly, which is documented to be safe to call concurrently with Read
+//     and is what unblocks an in-flight Recv.
+//   - The `closed` flag is the only field written by Close and read by Next,
+//     hence it must be atomic. All other state mutations (s.err, s.current)
+//     happen only on the reader goroutine.
+//
+// Why we close the underlying reader instead of sse.Stream.Close:
+//   - sse.Stream.Close() is essentially `s.closed = true; reader.Close()`. The
+//     `closed` field on sse.Stream is a plain bool with no synchronization and
+//     is read inside Recv, so calling sse.Stream.Close from another goroutine
+//     while Recv is running causes a data race. Closing the reader directly
+//     avoids touching sse.Stream's non-thread-safe state entirely; only the
+//     reader's Read returns an error and Recv unwinds naturally.
+//
+// Why the `closed` flag is necessary even though Recv would surface the
+// reader-Close error on its own:
+//   - The decoder API contract is "after Close, Next returns false". We cannot
+//     enforce this by writing to s.err from Close, because s.err is read by
+//     Next on the reader goroutine and writing it from another goroutine would
+//     be a data race. An atomic flag is the cheapest way to honor the contract
+//     regardless of whether the underlying reader actually fails Read after
+//     being closed (e.g., test mocks backed by bytes.Reader do not).
+//
+// Why there is no recover() in Next:
+//   - The historical panic in #1634 came from the race on sse.Stream described
+//     above. With sse.Stream's internal state no longer touched concurrently,
+//     that race is gone at the source. The pass-through producer goroutine
+//     still has its own top-level recover (per project rule), which is the
+//     proper place to catch any unforeseen panic from this stack.
+//
+// Why context cancellation has no dedicated watcher goroutine:
+//   - When the decoder wraps an *http.Response.Body produced via
+//     http.NewRequestWithContext, the http.Transport already aborts the
+//     in-flight Read on ctx.Done(), unblocking Recv naturally. Callers that
+//     pass a Reader not bound to ctx are responsible for calling Close.
 //
 //nolint:containedctx // Checked.
 type defaultSSEDecoder struct {
-	ctx       context.Context
-	sseStream *sse.Stream
-	current   *StreamEvent
-	err       error
+	ctx          context.Context
+	reader       io.ReadCloser
+	sseStream    *sse.Stream
+	maxEventSize int
+	current      *StreamEvent
+	err          error
 
-	// NOT concurrency-safe: do not call Next/Close from multiple goroutines.
-	// Close is made idempotent (safe to call multiple times sequentially).
-	closed   bool
-	closeErr error
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Next advances to the next event in the stream.
@@ -76,41 +227,45 @@ func (s *defaultSSEDecoder) Next() bool {
 		return false
 	}
 
-	if s.closed {
+	// Honor the "Close stops Next" contract without writing to s.err from
+	// the closer goroutine (which would race with this read).
+	if s.closed.Load() {
 		return false
 	}
 
-	// Check context cancellation
+	// Pre-check ctx so we don't enter Recv after explicit cancellation.
 	select {
 	case <-s.ctx.Done():
-		log.Debug(s.ctx, "SSE stream closed")
-
-		s.err = s.ctx.Err()
-		_ = s.Close()
+		s.err = StreamContextError(s.ctx)
 
 		return false
 	default:
 	}
 
-	// Receive next event from go-sse Stream
 	event, err := s.sseStream.Recv()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			log.Debug(s.ctx, "SSE stream closed")
-			_ = s.Close()
+			slog.DebugContext(s.ctx, "SSE stream closed")
 
 			return false
 		}
 
-		s.err = err
-		_ = s.Close()
+		// If the error surfaced because ctx was canceled (or the reader was
+		// closed by an external Close), surface ctx.Err() to callers so they
+		// can distinguish cancellation from genuine transport errors.
+		if errors.Is(err, bufio.ErrTooLong) {
+			s.err = fmt.Errorf("%w: limit %d bytes", ErrStreamEventTooLarge, s.maxEventSize)
+		} else if ctxErr := StreamContextError(s.ctx); ctxErr != nil {
+			s.err = ctxErr
+		} else {
+			s.err = err
+		}
 
 		return false
 	}
 
-	log.Debug(s.ctx, "SSE event received", log.Any("event", event))
+	slog.DebugContext(s.ctx, "SSE event received", slog.Any("event", event))
 
-	// Create stream event for this event
 	s.current = &StreamEvent{
 		LastEventID: event.LastEventID,
 		Type:        event.Type,
@@ -130,18 +285,20 @@ func (s *defaultSSEDecoder) Err() error {
 	return s.err
 }
 
-// Close closes the stream and releases resources.
+// Close closes the underlying reader. It is idempotent and safe to call from
+// any goroutine, including concurrently with Next.
 func (s *defaultSSEDecoder) Close() error {
-	// NOT concurrency-safe: callers must not call Close concurrently with Next.
-	if s.closed {
-		return s.closeErr
-	}
+	s.closeOnce.Do(func() {
+		// Set the closed flag before touching the reader so a concurrent
+		// Next observes the closed state on its next entry.
+		s.closed.Store(true)
 
-	s.closed = true
-	if s.sseStream != nil {
-		s.closeErr = s.sseStream.Close()
-		log.Debug(s.ctx, "SSE stream closed")
-	}
+		if s.reader != nil {
+			s.closeErr = s.reader.Close()
+		}
+
+		slog.DebugContext(s.ctx, "SSE stream closed")
+	})
 
 	return s.closeErr
 }
@@ -150,4 +307,134 @@ func (s *defaultSSEDecoder) Close() error {
 func init() {
 	RegisterDecoder("text/event-stream", NewDefaultSSEDecoder)
 	RegisterDecoder("text/event-stream; charset=utf-8", NewDefaultSSEDecoder)
+	RegisterDecoder("audio/mpeg", NewBinaryChunkDecoder("audio/mpeg"))
+	RegisterDecoder("audio/mp3", NewBinaryChunkDecoder("audio/mpeg"))
+	RegisterDecoder("audio/wav", NewBinaryChunkDecoder("audio/wav"))
+	RegisterDecoder("audio/x-wav", NewBinaryChunkDecoder("audio/wav"))
+	RegisterDecoder("audio/opus", NewBinaryChunkDecoder("audio/opus"))
+	RegisterDecoder("audio/aac", NewBinaryChunkDecoder("audio/aac"))
+	RegisterDecoder("audio/flac", NewBinaryChunkDecoder("audio/flac"))
+	RegisterDecoder("audio/pcm", NewBinaryChunkDecoder("audio/pcm"))
+	RegisterDecoder("application/octet-stream", NewBinaryChunkDecoder("application/octet-stream"))
+}
+
+// NewBinaryChunkDecoder creates a decoder that yields raw bytes as stream events.
+// It is used for provider streams that do not use SSE framing, such as chunked TTS
+// audio responses.
+func NewBinaryChunkDecoder(contentType string) StreamDecoderFactory {
+	return func(ctx context.Context, rc io.ReadCloser) StreamDecoder {
+		return &binaryChunkDecoder{
+			ctx:         ctx,
+			reader:      rc,
+			contentType: contentType,
+			buf:         make([]byte, 32*1024),
+		}
+	}
+}
+
+type binaryChunkDecoder struct {
+	ctx         context.Context
+	reader      io.ReadCloser
+	contentType string
+	buf         []byte
+	current     *StreamEvent
+	err         error
+	pendingErr  error
+	doneSent    bool
+
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
+}
+
+var _ StreamDecoder = (*binaryChunkDecoder)(nil)
+
+// Next yields bytes before reporting a read's accompanying error on the next call.
+// A clean EOF yields one completion event; cancellation preserves the idle cause.
+func (d *binaryChunkDecoder) Next() bool {
+	if d.err != nil {
+		return false
+	}
+
+	if d.pendingErr != nil {
+		d.err = d.pendingErr
+		d.pendingErr = nil
+
+		return false
+	}
+
+	if d.closed.Load() {
+		return false
+	}
+
+	select {
+	case <-d.ctx.Done():
+		d.err = StreamContextError(d.ctx)
+		return false
+	default:
+	}
+
+	n, err := d.reader.Read(d.buf)
+	if n > 0 {
+		if err != nil && !errors.Is(err, io.EOF) {
+			if ctxErr := StreamContextError(d.ctx); ctxErr != nil {
+				d.pendingErr = ctxErr
+			} else {
+				d.pendingErr = err
+			}
+		}
+
+		payload := bytes.Clone(d.buf[:n])
+		d.current = &StreamEvent{
+			Type: d.contentType,
+			Data: payload,
+		}
+
+		return true
+	}
+
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, io.EOF) {
+		if !d.doneSent {
+			d.doneSent = true
+			d.current = &StreamEvent{Type: BinaryStreamDoneEventType}
+
+			return true
+		}
+
+		slog.DebugContext(d.ctx, "binary stream closed")
+		return false
+	}
+
+	if ctxErr := StreamContextError(d.ctx); ctxErr != nil {
+		d.err = ctxErr
+	} else {
+		d.err = err
+	}
+
+	return false
+}
+
+func (d *binaryChunkDecoder) Current() *StreamEvent {
+	return d.current
+}
+
+func (d *binaryChunkDecoder) Err() error {
+	return d.err
+}
+
+func (d *binaryChunkDecoder) Close() error {
+	d.closeOnce.Do(func() {
+		d.closed.Store(true)
+		if d.reader != nil {
+			d.closeErr = d.reader.Close()
+		}
+
+		slog.DebugContext(d.ctx, "binary stream closed")
+	})
+
+	return d.closeErr
 }

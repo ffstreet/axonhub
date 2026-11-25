@@ -8,6 +8,7 @@ import (
 
 var (
 	ErrInvalidJWT             = errors.New("invalid jwt token")
+	ErrInvalidToken           = errors.New("invalid token")
 	ErrInvalidAPIKey          = errors.New("invalid api key")
 	ErrInvalidPassword        = errors.New("invalid password")
 	ErrInvalidModel           = transformer.ErrInvalidModel
@@ -16,4 +17,12 @@ var (
 	ErrServiceAccountRequired = errors.New("service account api key required")
 	ErrAPIKeyScopeRequired    = errors.New("api key missing required scope")
 	ErrAPIKeyNameRequired     = errors.New("api key name is required")
+	ErrSystemNotInitialized   = errors.New("system not initialized")
+	ErrOIDCLoginRequired      = errors.New("OIDC user without password, please login via OIDC or set a password")
+	ErrProjectNotFound        = errors.New("project not found")
+
+	// ErrChannelUpdatedConcurrently is returned when an optimistic-locked
+	// channel update loses the race against a concurrent commit. Read-merge-
+	// write callers can detect it with errors.Is and retry the merge.
+	ErrChannelUpdatedConcurrently = errors.New("channel was updated concurrently; retry the operation")
 )

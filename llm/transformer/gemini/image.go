@@ -16,9 +16,12 @@ import (
 
 // buildImageGenerationRequest builds the HTTP request for Gemini image generation/editing.
 // Gemini uses the generateContent endpoint with responseModalities: ["TEXT", "IMAGE"].
-func (t *OutboundTransformer) buildImageGenerationRequest(ctx context.Context, llmReq *llm.Request) (*httpclient.Request, error) {
+func (t *OutboundTransformer) buildImageGenerationRequest(ctx context.Context, llmReq *llm.Request, apiKey string) (*httpclient.Request, error) {
 	if llmReq.Image == nil {
 		return nil, fmt.Errorf("%w: image request is required", transformer.ErrInvalidRequest)
+	}
+	if err := transformer.ValidateImageBytes(llmReq.Image); err != nil {
+		return nil, err
 	}
 
 	if llmReq.Image.Prompt == "" {
@@ -72,22 +75,20 @@ func (t *OutboundTransformer) buildImageGenerationRequest(ctx context.Context, l
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Accept", "application/json")
 
-	// Prepare authentication
+	// Prepare authentication. The key is selected once per outbound attempt by
+	// TransformRequest; looking it up again would consume a second round-robin slot.
 	var auth *httpclient.AuthConfig
 
-	if t.config.APIKeyProvider != nil {
-		apiKey := t.config.APIKeyProvider.Get(ctx)
-		if apiKey != "" {
-			auth = &httpclient.AuthConfig{
-				Type:      "api_key",
-				APIKey:    apiKey,
-				HeaderKey: "x-goog-api-key",
-			}
+	if apiKey != "" {
+		auth = &httpclient.AuthConfig{
+			Type:      "api_key",
+			APIKey:    apiKey,
+			HeaderKey: "x-goog-api-key",
 		}
 	}
 
 	// Build URL - image generation uses the same generateContent endpoint
-	url := t.buildImageRequestURL(llmReq)
+	url := t.buildImageRequestURL(ctx, llmReq)
 
 	rawReq := &httpclient.Request{
 		Method:                http.MethodPost,
@@ -105,9 +106,10 @@ func (t *OutboundTransformer) buildImageGenerationRequest(ctx context.Context, l
 	return rawReq, nil
 }
 
-// buildImageRequestURL constructs the URL for image generation requests.
-// Image generation uses generateContent endpoint (not streaming).
-func (t *OutboundTransformer) buildImageRequestURL(llmReq *llm.Request) string {
+// buildImageRequestURL constructs the URL for image generation requests for the
+// credential selected by the API key provider, so a Vertex key resolves to its own
+// project and region. Image generation uses generateContent (not streaming).
+func (t *OutboundTransformer) buildImageRequestURL(ctx context.Context, llmReq *llm.Request) string {
 	version := t.config.APIVersion
 	if version == "" {
 		version = DefaultAPIVersion
@@ -115,7 +117,7 @@ func (t *OutboundTransformer) buildImageRequestURL(llmReq *llm.Request) string {
 
 	// For Vertex AI platform
 	if t.config.PlatformType == PlatformVertex {
-		baseURL := strings.TrimSuffix(t.config.BaseURL, "/")
+		baseURL := strings.TrimSuffix(t.resolveBaseURL(ctx), "/")
 		if strings.Contains(baseURL, "/v1/") {
 			return fmt.Sprintf("%s/publishers/google/models/%s:generateContent", baseURL, llmReq.Model)
 		}
@@ -124,7 +126,7 @@ func (t *OutboundTransformer) buildImageRequestURL(llmReq *llm.Request) string {
 	}
 
 	// Standard Gemini API format
-	return fmt.Sprintf("%s/%s/models/%s:generateContent", t.config.BaseURL, version, llmReq.Model)
+	return fmt.Sprintf("%s/%s/models/%s:generateContent", t.resolveBaseURL(ctx), version, llmReq.Model)
 }
 
 // buildImageConfig builds the ImageConfig from ImageRequest parameters.
@@ -295,15 +297,6 @@ func transformImageGenerationResponse(httpResp *httpclient.Response) (*llm.Respo
 					B64JSON: part.InlineData.Data,
 				})
 			}
-		}
-	}
-
-	// Set usage info for image generation
-	if resp.Usage != nil {
-		imageResponse.Usage = &llm.ImageUsage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
 		}
 	}
 

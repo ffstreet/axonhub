@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 )
 
 // OnboardingModule represents a granular onboarding module.
@@ -29,8 +28,6 @@ type OnboardingRecord struct {
 // OnboardingInfo retrieves the onboarding information from system settings.
 // Returns nil if not set.
 func (s *SystemService) OnboardingInfo(ctx context.Context) (*OnboardingRecord, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
 	value, err := s.getSystemValue(ctx, SystemKeyOnboarded)
 	if err != nil {
 		if ent.IsNotFound(err) {

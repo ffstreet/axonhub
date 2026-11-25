@@ -10,7 +10,7 @@ import { formatNumber } from '@/utils/format-number';
 import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -22,15 +22,26 @@ import { useModels } from '../context/models-context';
 import { DEVELOPER_IDS, DEVELOPER_ICONS } from '../data/constants';
 import { useCreateModel, useUpdateModel } from '../data/models';
 import { useDevelopersData } from '../data/providers';
-import { type Provider, type ProviderModel } from '../data/providers.schema';
-import { CreateModelInput, createModelInputSchema, UpdateModelInput, ModelCard, updateModelInputSchema } from '../data/schema';
+import { isSuggestedModel, withMiniMaxFlash } from '../data/model-suggestions';
+import { type Provider, type ProviderModel, resolveVision } from '../data/providers.schema';
+import { REASONING_EFFORTS, deriveReasoningEfforts } from '../data/reasoning-efforts';
+import {
+  CreateModelInput,
+  createModelInputSchema,
+  UpdateModelInput,
+  ModelType,
+  modelTypeSchema,
+  referencePriceFields,
+  normalizeModelRoutingPolicyValue,
+  updateModelInputSchema,
+} from '../data/schema';
 
 function isDeveloper(provider: string) {
   return DEVELOPER_IDS.includes(provider);
 }
 
 export function ModelsActionDialog() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { open, setOpen, currentRow } = useModels();
   const createModel = useCreateModel();
   const updateModel = useUpdateModel();
@@ -39,7 +50,6 @@ export function ModelsActionDialog() {
   const [developerSearchValue, setDeveloperSearchValue] = useState<string>('');
   const [modelIdInput, setModelIdInput] = useState<string>('');
   const [modelIdSearchValue, setModelIdSearchValue] = useState<string>('');
-  const [_selectedModelCard, setSelectedModelCard] = useState<ModelCard>({});
 
   // 用于解决 Dialog 内 Popover 无法滚动的问题
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
@@ -54,7 +64,7 @@ export function ModelsActionDialog() {
       .map(([key, provider]: [string, Provider]) => ({
         id: key,
         name: provider.display_name || provider.name,
-        models: provider.models || [],
+        models: withMiniMaxFlash(provider.models || [], key),
       }));
   }, [developersData]);
 
@@ -64,18 +74,28 @@ export function ModelsActionDialog() {
     return provider?.models || [];
   }, [selectedProvider, providers]);
 
+  const getDeveloperLabel = useCallback(
+    (developer: string) => {
+      const key = `models.developers.${developer}`;
+      return i18n.exists(key) ? t(key) : developer;
+    },
+    [i18n, t]
+  );
+
   const developerOptions = useMemo(() => {
     return DEVELOPER_IDS.map((id) => ({
       value: id,
-      label: id,
+      label: getDeveloperLabel(id),
     }));
-  }, []);
+  }, [getDeveloperLabel]);
 
   const modelIdOptions = useMemo(() => {
-    return selectedProviderModels.map((m: ProviderModel) => ({
-      value: m.id,
-      label: m.id,
-    }));
+    return selectedProviderModels
+      .filter((model) => isSuggestedModel(model.id))
+      .map((m: ProviderModel) => ({
+        value: m.id,
+        label: m.id,
+      }));
   }, [selectedProviderModels]);
 
   const iconOptions = useMemo(() => {
@@ -102,13 +122,20 @@ export function ModelsActionDialog() {
       icon: '',
       group: '',
       modelCard: {},
-      settings: { associations: [] },
+      settings: { associations: [], loadBalancerStrategy: 'default', traceStickyMode: 'default' },
       remark: '',
     },
   });
 
   useEffect(() => {
     if (isEdit && currentRow) {
+      const modelCard: CreateModelInput['modelCard'] = { ...currentRow.modelCard };
+      if (modelCard.cost && currentRow.missingReferencePrices?.length) {
+        modelCard.cost = { ...modelCard.cost };
+        for (const field of referencePriceFields) {
+          if (currentRow.missingReferencePrices.includes(field)) delete modelCard.cost[field];
+        }
+      }
       form.reset({
         developer: currentRow.developer,
         modelID: currentRow.modelID,
@@ -116,15 +143,18 @@ export function ModelsActionDialog() {
         name: currentRow.name,
         icon: currentRow.icon,
         group: currentRow.group,
-        modelCard: currentRow.modelCard,
-        settings: currentRow.settings,
+        modelCard,
+        settings: {
+          ...currentRow.settings,
+          associations: currentRow.settings?.associations ?? [],
+          loadBalancerStrategy: normalizeModelRoutingPolicyValue(currentRow.settings?.loadBalancerStrategy),
+          traceStickyMode: normalizeModelRoutingPolicyValue(currentRow.settings?.traceStickyMode),
+        },
         remark: currentRow.remark || '',
       });
       setSelectedProvider(currentRow.developer);
-      setDeveloperSearchValue(currentRow.developer);
       setModelIdInput(currentRow.modelID);
       setModelIdSearchValue(currentRow.modelID);
-      setSelectedModelCard(currentRow.modelCard || {});
     } else if (!isEdit) {
       form.reset({
         developer: '',
@@ -134,31 +164,49 @@ export function ModelsActionDialog() {
         icon: '',
         group: '',
         modelCard: {},
-        settings: { associations: [] },
+        settings: { associations: [], loadBalancerStrategy: 'default', traceStickyMode: 'default' },
         remark: '',
       });
       setSelectedProvider('');
       setDeveloperSearchValue('');
       setModelIdInput('');
       setModelIdSearchValue('');
-      setSelectedModelCard({});
     }
   }, [isEdit, currentRow, form, isOpen]);
+
+  useEffect(() => {
+    if (isEdit && currentRow) {
+      setDeveloperSearchValue(getDeveloperLabel(currentRow.developer));
+    }
+  }, [currentRow, getDeveloperLabel, isEdit]);
 
   const handleProviderChange = useCallback(
     (providerId: string) => {
       setSelectedProvider(providerId);
-      setDeveloperSearchValue(providerId);
+      setDeveloperSearchValue(getDeveloperLabel(providerId));
       form.setValue('developer', providerId);
-      const icon = DEVELOPER_ICONS[providerId] || providerId;
-      form.setValue('icon', icon);
-      setModelIdInput('');
-      setModelIdSearchValue('');
-      form.setValue('modelID', '');
-      form.setValue('name', '');
-      form.setValue('group', '');
-      form.setValue('modelCard', {});
-      setSelectedModelCard({});
+      if (!isEdit) {
+        const icon = DEVELOPER_ICONS[providerId] || providerId;
+        form.setValue('icon', icon);
+        setModelIdInput('');
+        setModelIdSearchValue('');
+        form.setValue('modelID', '');
+        form.setValue('name', '');
+        form.setValue('group', '');
+        form.setValue('modelCard', {});
+      }
+    },
+    [form, getDeveloperLabel, isEdit]
+  );
+
+  // 用户直接在输入框键入时实时同步 form 值，避免 blur/submit 竞态导致提交旧值。
+  // 注意不要同步 modelIdInput：它是 AutoComplete 的“已提交选中值”，若跟随搜索词变化，
+  // 手输完整 model ID 后再点选该项会被判定为取消选择而清空，blur 时也不会再触发
+  // handleModelIdChange，导致新建模型时 name/group/type/modelCard 无法回填。
+  const handleModelIdSearchChange = useCallback(
+    (value: string) => {
+      setModelIdSearchValue(value);
+      form.setValue('modelID', value);
     },
     [form]
   );
@@ -168,27 +216,32 @@ export function ModelsActionDialog() {
       setModelIdInput(modelId);
       setModelIdSearchValue(modelId);
       form.setValue('modelID', modelId);
-  
+
       const selectedModel = selectedProviderModels.find((m: ProviderModel) => m.id === modelId);
-  
-      if (selectedModel) {
+
+      if (selectedModel && !isEdit) {
         form.setValue('name', selectedModel.display_name || selectedModel.name || '');
         form.setValue('group', selectedModel.family || selectedProvider);
-        const modelCard: ModelCard = {
+        const normalizedType = selectedModel.type?.replace(/-/g, '_');
+        if (normalizedType && modelTypeSchema.safeParse(normalizedType).success) {
+          form.setValue('type', normalizedType as ModelType);
+        }
+        const modelCard: CreateModelInput['modelCard'] = {
           reasoning: {
             supported: selectedModel.reasoning?.supported || false,
             default: selectedModel.reasoning?.default || false,
           },
+          reasoningEfforts: deriveReasoningEfforts(selectedModel.reasoning_options),
           toolCall: selectedModel.tool_call,
           temperature: selectedModel.temperature,
           modalities: {
             input: selectedModel.modalities?.input || [],
             output: selectedModel.modalities?.output || [],
           },
-          vision: selectedModel.vision,
+          vision: resolveVision(selectedModel),
           cost: {
-            input: selectedModel.cost?.input || 0,
-            output: selectedModel.cost?.output || 0,
+            input: selectedModel.cost?.input,
+            output: selectedModel.cost?.output,
             cacheRead: selectedModel.cost?.cache_read,
             cacheWrite: selectedModel.cost?.cache_write,
           },
@@ -201,19 +254,18 @@ export function ModelsActionDialog() {
           lastUpdated: selectedModel.last_updated,
         };
         form.setValue('modelCard', modelCard);
-        setSelectedModelCard(modelCard);
-      } else {
-        const currentModelCard = form.getValues('modelCard');
-        setSelectedModelCard(currentModelCard || {});
       }
     },
-    [selectedProviderModels, selectedProvider, form]
+    [selectedProviderModels, selectedProvider, form, isEdit]
   );
 
   const onSubmit = async (data: CreateModelInput) => {
     try {
       if (isEdit && currentRow) {
         const updateData: UpdateModelInput = {
+          developer: data.developer,
+          modelID: data.modelID,
+          type: data.type,
           name: data.name,
           icon: data.icon,
           group: data.group,
@@ -221,7 +273,11 @@ export function ModelsActionDialog() {
           settings: data.settings,
           remark: data.remark,
         };
-        await updateModel.mutateAsync({ id: currentRow.id, input: updateData });
+        const editedPrices = referencePriceFields.filter((field) => {
+          const original = currentRow.missingReferencePrices?.includes(field) ? undefined : currentRow.modelCard.cost?.[field];
+          return data.modelCard.cost?.[field] !== original;
+        }).map((field) => ({ field, missing: data.modelCard.cost?.[field] == null }));
+        await updateModel.mutateAsync({ id: currentRow.id, input: updateData, editedPrices, expectedVersion: currentRow.editVersion });
       } else {
         await createModel.mutateAsync(data);
       }
@@ -238,7 +294,6 @@ export function ModelsActionDialog() {
     setDeveloperSearchValue('');
     setModelIdInput('');
     setModelIdSearchValue('');
-    setSelectedModelCard({});
   }, [form, setOpen]);
 
   return (
@@ -262,20 +317,16 @@ export function ModelsActionDialog() {
                       <FormItem>
                         <FormLabel>{t('models.fields.developer')}</FormLabel>
                         <FormControl>
-                          {isEdit ? (
-                            <Input value={field.value} disabled={true} className='bg-muted' />
-                          ) : (
-                            <AutoComplete
-                              selectedValue={selectedProvider}
-                              onSelectedValueChange={handleProviderChange}
-                              searchValue={developerSearchValue}
-                              onSearchValueChange={setDeveloperSearchValue}
-                              items={developerOptions}
-                              placeholder={t('models.fields.selectDeveloper')}
-                              emptyMessage={t('models.fields.noModels')}
-                              portalContainer={dialogContent}
-                            />
-                          )}
+                          <AutoComplete
+                            selectedValue={selectedProvider}
+                            onSelectedValueChange={handleProviderChange}
+                            searchValue={developerSearchValue}
+                            onSearchValueChange={setDeveloperSearchValue}
+                            items={developerOptions}
+                            placeholder={t('models.fields.selectDeveloper')}
+                            emptyMessage={t('models.fields.noModels')}
+                            portalContainer={dialogContent}
+                          />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -289,14 +340,12 @@ export function ModelsActionDialog() {
                       <FormItem>
                         <FormLabel>{t('models.fields.modelId')}</FormLabel>
                         <FormControl>
-                          {isEdit ? (
-                            <Input value={field.value} disabled={true} className='bg-muted' />
-                          ) : selectedProvider && modelIdOptions.length > 0 ? (
+                          {selectedProvider && modelIdOptions.length > 0 ? (
                             <AutoComplete
                               selectedValue={modelIdInput}
                               onSelectedValueChange={handleModelIdChange}
                               searchValue={modelIdSearchValue}
-                              onSearchValueChange={setModelIdSearchValue}
+                              onSearchValueChange={handleModelIdSearchChange}
                               items={modelIdOptions}
                               placeholder={t('models.fields.modelIdPlaceholder')}
                               emptyMessage={t('models.fields.noModels')}
@@ -307,7 +356,7 @@ export function ModelsActionDialog() {
                               selectedValue={modelIdInput}
                               onSelectedValueChange={handleModelIdChange}
                               searchValue={modelIdSearchValue}
-                              onSearchValueChange={setModelIdSearchValue}
+                              onSearchValueChange={handleModelIdSearchChange}
                               items={[]}
                               placeholder={t('models.fields.modelIdPlaceholder')}
                               emptyMessage={t('models.fields.noModels')}
@@ -375,7 +424,7 @@ export function ModelsActionDialog() {
                     render={({ field }) => (
                       <FormItem>
                         <FormLabel>{t('models.fields.type')}</FormLabel>
-                        <Select disabled={isEdit} value={field.value} onValueChange={field.onChange}>
+                        <Select value={field.value} onValueChange={field.onChange}>
                           <FormControl>
                             <SelectTrigger>
                               <SelectValue />
@@ -385,6 +434,8 @@ export function ModelsActionDialog() {
                             <SelectItem value='chat'>{t('models.types.chat')}</SelectItem>
                             <SelectItem value='embedding'>{t('models.types.embedding')}</SelectItem>
                             <SelectItem value='rerank'>{t('models.types.rerank')}</SelectItem>
+                            <SelectItem value='image_generation'>{t('models.types.image_generation')}</SelectItem>
+                            <SelectItem value='video_generation'>{t('models.types.video_generation')}</SelectItem>
                           </SelectContent>
                         </Select>
                         <FormMessage />
@@ -486,6 +537,38 @@ export function ModelsActionDialog() {
                   </div>
 
                   <div className='space-y-2'>
+                    <FormLabel>{t('models.modelCard.reasoningEfforts')}</FormLabel>
+                    <FormField
+                      control={form.control}
+                      name='modelCard.reasoningEfforts'
+                      render={({ field }) => (
+                        <FormItem>
+                          <div className='grid grid-cols-2 gap-2'>
+                            {REASONING_EFFORTS.map((effort) => (
+                              <FormItem key={effort} className='flex items-center space-y-0 space-x-2'>
+                                <FormControl>
+                                  <Checkbox
+                                    checked={field.value?.includes(effort) || false}
+                                    onCheckedChange={(checked) => {
+                                      const current = field.value || [];
+                                      const next = checked
+                                        ? [...current, effort]
+                                        : current.filter((value) => value !== effort);
+                                      // Clearing every level means "unknown", not "no levels".
+                                      field.onChange(next.length ? next : null);
+                                    }}
+                                  />
+                                </FormControl>
+                                <FormLabel className='font-normal'>{effort}</FormLabel>
+                              </FormItem>
+                            ))}
+                          </div>
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+
+                  <div className='space-y-2'>
                     <FormLabel>{t('models.modelCard.modalities')}</FormLabel>
                     <div className='grid grid-cols-2 gap-4'>
                       <FormField
@@ -561,86 +644,29 @@ export function ModelsActionDialog() {
                     <FormLabel>{t('models.modelCard.cost')} ($/M tokens)</FormLabel>
                     <p className='text-xs text-muted-foreground'>{t('models.modelCard.costHint')}</p>
                     <div className='grid grid-cols-2 gap-2'>
-                      <FormField
-                        control={form.control}
-                        name='modelCard.cost.input'
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className='text-xs'>{t('models.modelCard.input')}</FormLabel>
-                            <FormControl>
-                              <Input
-                                type='number'
-                                step='0.01'
-                                {...field}
-                                value={field.value ?? ''}
-                                onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
-                                placeholder='0'
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name='modelCard.cost.output'
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className='text-xs'>{t('models.modelCard.output')}</FormLabel>
-                            <FormControl>
-                              <Input
-                                type='number'
-                                step='0.01'
-                                {...field}
-                                value={field.value ?? ''}
-                                onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
-                                placeholder='0'
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name='modelCard.cost.cacheRead'
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className='text-xs'>{t('models.modelCard.cacheRead')}</FormLabel>
-                            <FormControl>
-                              <Input
-                                type='number'
-                                step='0.01'
-                                {...field}
-                                value={field.value ?? ''}
-                                onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
-                                placeholder='0'
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name='modelCard.cost.cacheWrite'
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className='text-xs'>{t('models.modelCard.cacheWrite')}</FormLabel>
-                            <FormControl>
-                              <Input
-                                type='number'
-                                step='0.01'
-                                {...field}
-                                value={field.value ?? ''}
-                                onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
-                                placeholder='0'
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+                      {referencePriceFields.map((priceField) => (
+                        <FormField
+                          key={priceField}
+                          control={form.control}
+                          name={`modelCard.cost.${priceField}`}
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel className='text-xs'>{t(`models.modelCard.${priceField}`)}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  type='number'
+                                  step='any'
+                                  {...field}
+                                  value={field.value ?? ''}
+                                  onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
+                                  placeholder='—'
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      ))}
                     </div>
                   </div>
 
@@ -810,14 +836,14 @@ export function ModelsActionDialog() {
               </div>
             </div>
 
-            <div className='flex flex-shrink-0 justify-end gap-2 border-t pt-4'>
+            <DialogFooter pinned divided>
               <Button type='button' variant='outline' onClick={handleClose}>
                 {t('common.buttons.cancel')}
               </Button>
               <Button type='submit' disabled={createModel.isPending || updateModel.isPending}>
                 {isEdit ? t('common.buttons.save') : t('common.buttons.create')}
               </Button>
-            </div>
+            </DialogFooter>
           </form>
         </Form>
       </DialogContent>

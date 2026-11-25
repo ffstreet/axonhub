@@ -8,10 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 )
@@ -22,7 +21,7 @@ type channelBasedStrategy struct {
 	scores map[int]float64
 }
 
-func (c *channelBasedStrategy) Score(ctx context.Context, channel *biz.Channel) float64 {
+func (c *channelBasedStrategy) Score(ctx context.Context, channel *biz.Channel, metrics *biz.AggregatedMetrics) float64 {
 	if score, ok := c.scores[channel.ID]; ok {
 		return score
 	}
@@ -30,8 +29,8 @@ func (c *channelBasedStrategy) Score(ctx context.Context, channel *biz.Channel) 
 	return 0
 }
 
-func (c *channelBasedStrategy) ScoreWithDebug(ctx context.Context, channel *biz.Channel) (float64, StrategyScore) {
-	score := c.Score(ctx, channel)
+func (c *channelBasedStrategy) ScoreWithDebug(ctx context.Context, channel *biz.Channel, metrics *biz.AggregatedMetrics) (float64, StrategyScore) {
+	score := c.Score(ctx, channel, metrics)
 
 	return score, StrategyScore{
 		StrategyName: c.name,
@@ -49,45 +48,40 @@ type noopSelectionTracker struct{}
 
 func (n *noopSelectionTracker) IncrementChannelSelection(channelID int) {}
 
-// newTestLoadBalancer creates a LoadBalancer with mock system service for testing.
-func newTestLoadBalancer(t *testing.T, retryPolicy *biz.RetryPolicy, strategies ...LoadBalanceStrategy) *LoadBalancer {
+// sortAllCandidates asks LoadBalancer.Sort to rank every candidate.
+const sortAllCandidates = 0
+
+// newTestLoadBalancer creates a LoadBalancer with a no-op selection tracker for testing.
+func newTestLoadBalancer(t *testing.T, metricsProvider ChannelMetricsProvider, strategies ...LoadBalanceStrategy) *LoadBalancer {
 	t.Helper()
 
-	if retryPolicy == nil {
-		// Pass nil to mockSystemService so it uses its own default (Enabled: false)
-		mockSvc := &mockSystemService{retryPolicy: nil}
-		return NewLoadBalancer(mockSvc, &noopSelectionTracker{}, strategies...)
-	}
-	// Use the provided retry policy
-	mockSvc := &mockSystemService{retryPolicy: retryPolicy}
-
-	return NewLoadBalancer(mockSvc, &noopSelectionTracker{}, strategies...)
+	return NewLoadBalancer(metricsProvider, &noopSelectionTracker{}, strategies...)
 }
 
 func TestLoadBalancer_Sort_EmptyChannels(t *testing.T) {
 	ctx := context.Background()
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3})
+	lb := newTestLoadBalancer(t, nil)
 
-	result := lb.Sort(ctx, []*ChannelModelsCandidate{}, "")
+	result := lb.Sort(ctx, []*ChannelModelsCandidate{}, "", false, sortAllCandidates)
 	assert.Empty(t, result)
 }
 
 func TestLoadBalancer_Sort_SingleChannel(t *testing.T) {
 	ctx := context.Background()
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3})
+	lb := newTestLoadBalancer(t, nil)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 1)
 	assert.Equal(t, 1, result[0].Channel.ID)
 }
 
 func TestLoadBalancer_Sort_NoStrategies(t *testing.T) {
 	ctx := context.Background()
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3})
+	lb := newTestLoadBalancer(t, nil)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
@@ -95,9 +89,256 @@ func TestLoadBalancer_Sort_NoStrategies(t *testing.T) {
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 	// Without strategies, order should remain unchanged (all score 0)
+}
+
+func TestLoadBalancer_Sort_WithoutWeightTieBreaker_PreservesInputOrderWhenScoresTie(t *testing.T) {
+	ctx := context.Background()
+	lb := newTestLoadBalancer(t, nil).WithoutWeightTieBreaker()
+
+	candidates := []*ChannelModelsCandidate{
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1", OrderingWeight: 10}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2", OrderingWeight: 100}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3", OrderingWeight: 50}}},
+	}
+
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
+	require.Len(t, result, 3)
+	assert.Equal(t, 1, result[0].Channel.ID)
+	assert.Equal(t, 2, result[1].Channel.ID)
+	assert.Equal(t, 3, result[2].Channel.ID)
+}
+
+func TestLoadBalancer_Sort_RoundRobinHighCountsStayBalanced(t *testing.T) {
+	ctx := context.Background()
+	channel1Metrics := &biz.AggregatedMetrics{}
+	channel1Metrics.RequestCount = 3000
+	channel2Metrics := &biz.AggregatedMetrics{}
+	channel2Metrics.RequestCount = 3000
+	metricsProvider := &mockMetricsProvider{
+		metrics: map[int]*biz.AggregatedMetrics{
+			1: channel1Metrics,
+			2: channel2Metrics,
+		},
+	}
+	lb := NewLoadBalancer(
+		metricsProvider,
+		metricsProvider,
+		NewRoundRobinStrategy(),
+		NewRateLimitAwareStrategy(NewChannelRequestTracker(), NewChannelLimiterManager()),
+	).WithoutWeightTieBreaker()
+	candidates := []*ChannelModelsCandidate{
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
+	}
+
+	selected := map[int]int{}
+	for range 20 {
+		result := lb.Sort(ctx, candidates, "", false, 1)
+		require.Len(t, result, 1)
+		selected[result[0].Channel.ID]++
+	}
+
+	assert.Equal(t, 10, selected[1])
+	assert.Equal(t, 10, selected[2])
+}
+
+func TestLoadBalancer_Sort_RoundRobinWithRateLimit(t *testing.T) {
+	tests := []struct {
+		name          string
+		requestCounts [2]int64
+		rpmLimits     [2]int64
+		cooldown      bool
+		wantChannelID int
+	}{
+		{
+			name:          "small headroom difference preserves round robin preference",
+			requestCounts: [2]int64{20, 21},
+			rpmLimits:     [2]int64{100, 200},
+			wantChannelID: 1,
+		},
+		{
+			name:          "unconfigured limits preserve round robin preference",
+			requestCounts: [2]int64{20, 21},
+			wantChannelID: 1,
+		},
+		{
+			name:          "cooldown overrides lower request count",
+			requestCounts: [2]int64{0, 3000},
+			cooldown:      true,
+			wantChannelID: 2,
+		},
+		{
+			name:          "exhausted rpm overrides lower request count",
+			requestCounts: [2]int64{1, 3000},
+			rpmLimits:     [2]int64{1, 200},
+			wantChannelID: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metricsProvider := &mockMetricsProvider{metrics: make(map[int]*biz.AggregatedMetrics)}
+			tracker := NewChannelRequestTracker()
+			candidates := make([]*ChannelModelsCandidate, 0, 2)
+			for i, count := range tt.requestCounts {
+				id := i + 1
+				metrics := &biz.AggregatedMetrics{}
+				metrics.RequestCount = count
+				metricsProvider.metrics[id] = metrics
+				channel := &biz.Channel{Channel: &ent.Channel{ID: id}}
+				if rpm := tt.rpmLimits[i]; rpm > 0 {
+					channel.Settings = &objects.ChannelSettings{RateLimit: &objects.ChannelRateLimit{RPM: &rpm}}
+					require.True(t, tracker.TryAcquireRequest(id, rpm))
+				}
+				candidates = append(candidates, &ChannelModelsCandidate{Channel: channel})
+			}
+			if tt.cooldown {
+				tracker.SetCooldown(1, time.Now().Add(time.Minute))
+			}
+			lb := newTestLoadBalancer(t, metricsProvider,
+				NewRoundRobinStrategy(),
+				NewRateLimitAwareStrategy(tracker, NewChannelLimiterManager()),
+			).WithoutWeightTieBreaker().WithRoundRobinHealthFilter(NewRoundRobinHealthStrategy())
+
+			// With one RPM slot used each, limits of 100 and 200 yield scores
+			// of 99 and 99.5. This small difference must not reverse 20 vs 21
+			// requests, while cooldown and exhausted limits must still win.
+			result := lb.Sort(context.Background(), candidates, "", false, 1)
+			require.Len(t, result, 1)
+			require.Equal(t, tt.wantChannelID, result[0].Channel.ID)
+		})
+	}
+}
+
+func TestLoadBalancer_Sort_RoundRobinHealthMovesUnhealthyChannelsLast(t *testing.T) {
+	ctx := context.Background()
+	recentFailure := time.Now().Add(-time.Minute)
+
+	unhealthy := &biz.AggregatedMetrics{}
+	unhealthy.ConsecutiveFailures = roundRobinFailureThreshold
+	unhealthy.LastFailureAt = &recentFailure
+
+	healthyLowUsage := &biz.AggregatedMetrics{}
+	healthyLowUsage.RequestCount = 10
+
+	healthyHighUsage := &biz.AggregatedMetrics{}
+	healthyHighUsage.RequestCount = 100
+
+	metricsProvider := &mockMetricsProvider{
+		metrics: map[int]*biz.AggregatedMetrics{
+			1: unhealthy,
+			2: healthyLowUsage,
+			3: healthyHighUsage,
+		},
+	}
+	lb := newTestLoadBalancer(
+		t,
+		metricsProvider,
+		NewRoundRobinStrategy(),
+	).WithoutWeightTieBreaker().WithRoundRobinHealthFilter(NewRoundRobinHealthStrategy())
+
+	candidates := []*ChannelModelsCandidate{
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "unhealthy"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "healthy-low-usage"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "healthy-high-usage"}}},
+	}
+
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
+	require.Len(t, result, 3)
+	assert.Equal(t, 2, result[0].Channel.ID)
+	assert.Equal(t, 3, result[1].Channel.ID)
+	assert.Equal(t, 1, result[2].Channel.ID)
+}
+
+func TestLoadBalancer_Sort_RoundRobinHealthSkipsUnhealthyBeforeTopK(t *testing.T) {
+	ctx := context.Background()
+	recentFailure := time.Now().Add(-time.Minute)
+
+	unhealthy := &biz.AggregatedMetrics{}
+	unhealthy.RequestCount = 0
+	unhealthy.ConsecutiveFailures = roundRobinFailureThreshold
+	unhealthy.LastFailureAt = &recentFailure
+
+	healthyLowUsage := &biz.AggregatedMetrics{}
+	healthyLowUsage.RequestCount = 10
+
+	healthyHighUsage := &biz.AggregatedMetrics{}
+	healthyHighUsage.RequestCount = 100
+
+	metricsProvider := &mockMetricsProvider{
+		metrics: map[int]*biz.AggregatedMetrics{
+			1: unhealthy,
+			2: healthyLowUsage,
+			3: healthyHighUsage,
+		},
+	}
+	lb := newTestLoadBalancer(
+		t,
+		metricsProvider,
+		NewRoundRobinStrategy(),
+	).WithoutWeightTieBreaker().WithRoundRobinHealthFilter(NewRoundRobinHealthStrategy())
+
+	candidates := []*ChannelModelsCandidate{
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "unhealthy"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "healthy-low-usage"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "healthy-high-usage"}}},
+	}
+
+	result := lb.Sort(ctx, candidates, "", false, 2)
+	require.Len(t, result, 2)
+	assert.Equal(t, 2, result[0].Channel.ID)
+	assert.Equal(t, 3, result[1].Channel.ID)
+}
+
+func TestLoadBalancer_Sort_RoundRobinHealthKeepsHardUnavailableLast(t *testing.T) {
+	ctx := context.Background()
+	recentFailure := time.Now().Add(-time.Minute)
+
+	unhealthy := &biz.AggregatedMetrics{}
+	unhealthy.RequestCount = 10
+	unhealthy.ConsecutiveFailures = roundRobinFailureThreshold
+	unhealthy.LastFailureAt = &recentFailure
+
+	hardUnavailable := &biz.AggregatedMetrics{}
+	hardUnavailable.RequestCount = 0
+
+	healthy := &biz.AggregatedMetrics{}
+	healthy.RequestCount = 100
+
+	metricsProvider := &mockMetricsProvider{
+		metrics: map[int]*biz.AggregatedMetrics{
+			1: unhealthy,
+			2: hardUnavailable,
+			3: healthy,
+		},
+	}
+	hardUnavailableStrategy := &channelBasedStrategy{
+		name: "hard-unavailable",
+		scores: map[int]float64{
+			2: rateLimitExhaustedScore,
+		},
+	}
+	lb := newTestLoadBalancer(
+		t,
+		metricsProvider,
+		NewRoundRobinStrategy(),
+		hardUnavailableStrategy,
+	).WithoutWeightTieBreaker().WithRoundRobinHealthFilter(NewRoundRobinHealthStrategy())
+
+	candidates := []*ChannelModelsCandidate{
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "unhealthy"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "hard-unavailable"}}},
+		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "healthy"}}},
+	}
+
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
+	require.Len(t, result, 3)
+	assert.Equal(t, 3, result[0].Channel.ID)
+	assert.Equal(t, 1, result[1].Channel.ID)
+	assert.Equal(t, 2, result[2].Channel.ID)
 }
 
 func TestLoadBalancer_Sort_SingleStrategy(t *testing.T) {
@@ -112,8 +353,7 @@ func TestLoadBalancer_Sort_SingleStrategy(t *testing.T) {
 		},
 	}
 
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, strategy)
+	lb := newTestLoadBalancer(t, nil, strategy)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
@@ -121,7 +361,7 @@ func TestLoadBalancer_Sort_SingleStrategy(t *testing.T) {
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 
 	// Should be sorted by descending score: ch2(200), ch3(150), ch1(100)
@@ -153,8 +393,7 @@ func TestLoadBalancer_Sort_MultipleStrategies(t *testing.T) {
 		},
 	}
 
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, strategy1, strategy2)
+	lb := newTestLoadBalancer(t, nil, strategy1, strategy2)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
@@ -162,7 +401,7 @@ func TestLoadBalancer_Sort_MultipleStrategies(t *testing.T) {
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 
 	// Total scores: ch1=150, ch2=100, ch3=125
@@ -179,14 +418,13 @@ func TestLoadBalancer_Sort_AdditiveScoring(t *testing.T) {
 	s2 := &mockStrategy{name: "s2", score: 50}
 	s3 := &mockStrategy{name: "s3", score: 25}
 
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, s1, s2, s3)
+	lb := newTestLoadBalancer(t, nil, s1, s2, s3)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 1)
 
 	// With mock strategies returning fixed scores, all channels get same total
@@ -198,8 +436,7 @@ func TestLoadBalancer_Sort_Stability(t *testing.T) {
 
 	// All channels get same score
 	strategy := &mockStrategy{name: "equal", score: 100}
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, strategy)
+	lb := newTestLoadBalancer(t, nil, strategy)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
@@ -207,7 +444,7 @@ func TestLoadBalancer_Sort_Stability(t *testing.T) {
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 
 	// When scores are equal, original order should be preserved (stable sort)
@@ -226,8 +463,7 @@ func TestLoadBalancer_Sort_NegativeScores(t *testing.T) {
 		},
 	}
 
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, strategy)
+	lb := newTestLoadBalancer(t, nil, strategy)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
@@ -235,7 +471,7 @@ func TestLoadBalancer_Sort_NegativeScores(t *testing.T) {
 		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 
 	// Should handle negative scores: ch2(100), ch3(-25), ch1(-50)
@@ -248,7 +484,7 @@ func TestLoadBalancer_Sort_NegativeScores(t *testing.T) {
 // with recent errors are ranked lower in the load balancer.
 func TestLoadBalancer_ErrorAware_ChannelWithErrorsRankedLower(t *testing.T) {
 	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 	defer client.Close()
@@ -289,12 +525,12 @@ func TestLoadBalancer_ErrorAware_ChannelWithErrorsRankedLower(t *testing.T) {
 	// Record consecutive failures for ch2
 	for range 3 {
 		perf := &biz.PerformanceRecord{
-			ChannelID:        ch2.ID,
-			StartTime:        time.Now().Add(-time.Minute),
-			EndTime:          time.Now(),
-			Success:          false,
-			RequestCompleted: true,
-			ErrorStatusCode:  500,
+			ChannelID:          ch2.ID,
+			StartTime:          time.Now().Add(-time.Minute),
+			EndTime:            time.Now(),
+			Success:            false,
+			RequestCompleted:   true,
+			ResponseStatusCode: 500,
 		}
 		channelService.RecordPerformance(ctx, perf)
 	}
@@ -312,10 +548,9 @@ func TestLoadBalancer_ErrorAware_ChannelWithErrorsRankedLower(t *testing.T) {
 	}
 
 	// Create load balancer with ErrorAware and Weight strategies
-	errorStrategy := NewErrorAwareStrategy(channelService)
+	errorStrategy := NewErrorAwareStrategy()
 	weightStrategy := NewWeightStrategy()
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, errorStrategy, weightStrategy)
+	lb := newTestLoadBalancer(t, channelService, errorStrategy, weightStrategy)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: ch1}},
@@ -323,7 +558,7 @@ func TestLoadBalancer_ErrorAware_ChannelWithErrorsRankedLower(t *testing.T) {
 		{Channel: &biz.Channel{Channel: ch3}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 3)
 
 	// ch2 (failing channel) should be ranked last due to consecutive failures
@@ -339,7 +574,7 @@ func TestLoadBalancer_ErrorAware_ChannelWithErrorsRankedLower(t *testing.T) {
 // recent errors are penalized but recover after the cooldown period.
 func TestLoadBalancer_ErrorAware_ShortTermErrorPenalty(t *testing.T) {
 	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 	defer client.Close()
@@ -368,12 +603,12 @@ func TestLoadBalancer_ErrorAware_ShortTermErrorPenalty(t *testing.T) {
 
 	// Record a recent failure for ch1 (within cooldown period)
 	perf := &biz.PerformanceRecord{
-		ChannelID:        ch1.ID,
-		StartTime:        time.Now().Add(-30 * time.Second),
-		EndTime:          time.Now(),
-		Success:          false,
-		RequestCompleted: true,
-		ErrorStatusCode:  500,
+		ChannelID:          ch1.ID,
+		StartTime:          time.Now().Add(-30 * time.Second),
+		EndTime:            time.Now(),
+		Success:            false,
+		RequestCompleted:   true,
+		ResponseStatusCode: 500,
 	}
 	channelService.RecordPerformance(ctx, perf)
 
@@ -387,16 +622,15 @@ func TestLoadBalancer_ErrorAware_ShortTermErrorPenalty(t *testing.T) {
 	}
 	channelService.RecordPerformance(ctx, perf2)
 
-	errorStrategy := NewErrorAwareStrategy(channelService)
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, errorStrategy)
+	errorStrategy := NewErrorAwareStrategy()
+	lb := newTestLoadBalancer(t, channelService, errorStrategy)
 
 	candidates := []*ChannelModelsCandidate{
 		{Channel: &biz.Channel{Channel: ch1}},
 		{Channel: &biz.Channel{Channel: ch2}},
 	}
 
-	result := lb.Sort(ctx, candidates, "")
+	result := lb.Sort(ctx, candidates, "", false, sortAllCandidates)
 	require.Len(t, result, 2)
 
 	// ch2 should be ranked higher due to ch1's recent error
@@ -404,255 +638,7 @@ func TestLoadBalancer_ErrorAware_ShortTermErrorPenalty(t *testing.T) {
 	assert.Equal(t, ch1.ID, result[1].Channel.ID, "Channel with recent error should be ranked lower")
 }
 
-// TestLoadBalancer_TraceAware_SameChannelPrioritized tests that when a trace ID
-// exists, the channel that last succeeded for that trace is prioritized.
-func TestLoadBalancer_TraceAware_SameChannelPrioritized(t *testing.T) {
-	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	// Create project
-	project, err := client.Project.Create().
-		SetName("test-project").
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Create channels
-	ch1, err := client.Channel.Create().
-		SetName("channel-1").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-1"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	ch2, err := client.Channel.Create().
-		SetName("channel-2").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-2"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	ch3, err := client.Channel.Create().
-		SetName("channel-3").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-3"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Create trace
-	trace, err := client.Trace.Create().
-		SetProjectID(project.ID).
-		SetTraceID("test-trace-abc").
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Create a successful request with ch2 in this trace
-	_, err = client.Request.Create().
-		SetProjectID(project.ID).
-		SetTraceID(trace.ID).
-		SetChannelID(ch2.ID).
-		SetModelID("gpt-4").
-		SetStatus("completed").
-		SetSource("api").
-		SetRequestBody([]byte(`{"model":"gpt-4","messages":[]}`)).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Add trace entity to context and ent client
-	ctx = contexts.WithTrace(ctx, trace) // Use the trace entity directly
-	ctx = ent.NewContext(ctx, client)
-
-	requestService := newTestRequestService(client)
-	traceStrategy := NewTraceAwareStrategy(requestService)
-	weightStrategy := NewWeightStrategy()
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, traceStrategy, weightStrategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: ch1}},
-		{Channel: &biz.Channel{Channel: ch2}},
-		{Channel: &biz.Channel{Channel: ch3}},
-	}
-
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 3)
-
-	// ch2 should be ranked first because it was the last successful channel in this trace
-	assert.Equal(t, ch2.ID, result[0].Channel.ID, "Channel from trace should be ranked first")
-}
-
-// TestLoadBalancer_Combined_ErrorAndTrace tests the combined behavior of
-// error-aware and trace-aware strategies.
-func TestLoadBalancer_Combined_ErrorAndTrace(t *testing.T) {
-	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	// Create project
-	project, err := client.Project.Create().
-		SetName("test-project").
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Create channels
-	ch1, err := client.Channel.Create().
-		SetName("healthy-channel").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-1"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	ch2, err := client.Channel.Create().
-		SetName("trace-channel-with-errors").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-2"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	ch3, err := client.Channel.Create().
-		SetName("another-channel").
-		SetType("openai").
-		SetSupportedModels([]string{"gpt-4"}).
-		SetDefaultTestModel("gpt-4").
-		SetOrderingWeight(50).
-		SetCredentials(objects.ChannelCredentials{APIKey: "test-key-3"}).
-		Save(ctx)
-	require.NoError(t, err)
-
-	channelService := newTestChannelService(client)
-
-	// Record consecutive failures for ch2
-	for range 2 {
-		perf := &biz.PerformanceRecord{
-			ChannelID:        ch2.ID,
-			StartTime:        time.Now().Add(-time.Minute),
-			EndTime:          time.Now(),
-			Success:          false,
-			RequestCompleted: true,
-			ErrorStatusCode:  500,
-		}
-		channelService.RecordPerformance(ctx, perf)
-	}
-
-	// Create trace with ch2 as last successful channel
-	trace, err := client.Trace.Create().
-		SetProjectID(project.ID).
-		SetTraceID("test-trace-xyz").
-		Save(ctx)
-	require.NoError(t, err)
-
-	_, err = client.Request.Create().
-		SetProjectID(project.ID).
-		SetTraceID(trace.ID).
-		SetChannelID(ch2.ID).
-		SetModelID("gpt-4").
-		SetStatus("completed").
-		SetSource("api").
-		SetRequestBody([]byte(`{"model":"gpt-4","messages":[]}`)).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Add trace entity to context and ent client
-	ctx = contexts.WithTrace(ctx, trace) // Use the trace entity directly
-	ctx = ent.NewContext(ctx, client)
-
-	// Create load balancer with both strategies
-	requestService := newTestRequestService(client)
-	traceStrategy := NewTraceAwareStrategy(requestService)
-	errorStrategy := NewErrorAwareStrategy(channelService)
-	weightStrategy := NewWeightStrategy()
-	// Mock SystemService for testing
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, traceStrategy, errorStrategy, weightStrategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: ch1}},
-		{Channel: &biz.Channel{Channel: ch2}},
-		{Channel: &biz.Channel{Channel: ch3}},
-	}
-
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 3)
-
-	// ch2 should still be ranked first because trace boost (1000) outweighs error penalty
-	// TraceAware gives +1000, ErrorAware gives penalty (around -100 to -150), Weight gives +50
-	// Net score for ch2: ~900-950
-	// ch1 and ch3: ErrorAware ~200, Weight ~50 = ~250
-	assert.Equal(t, ch2.ID, result[0].Channel.ID, "Trace channel should be first despite errors (trace boost is stronger)")
-}
-
-// mockSystemService is a test mock for SystemService.
-type mockSystemService struct {
-	retryPolicy *biz.RetryPolicy
-}
-
-func (m *mockSystemService) RetryPolicyOrDefault(ctx context.Context) *biz.RetryPolicy {
-	if m.retryPolicy != nil {
-		return m.retryPolicy
-	}
-	// Return default policy if not set
-	return &biz.RetryPolicy{
-		Enabled:                 false,
-		MaxChannelRetries:       3,
-		MaxSingleChannelRetries: 2,
-		RetryDelayMs:            1000,
-	}
-}
-
-// TestLoadBalancer_TopK_OnlyOneChannel tests that only 1 channel is returned when retry is disabled.
-func TestLoadBalancer_TopK_OnlyOneChannel(t *testing.T) {
-	ctx := context.Background()
-
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-			4: 300,
-			5: 50,
-		},
-	}
-
-	// Mock SystemService with retry disabled
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: false}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 4, Name: "ch4"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 5, Name: "ch5"}}},
-	}
-
-	// With retry disabled, should only return the highest scored channel
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 1)
-	assert.Equal(t, 4, result[0].Channel.ID, "Should return only ch4 with highest score 300")
-}
-
-// TestLoadBalancer_TopK_TopThreeChannels tests that only top 3 channels are returned.
-func TestLoadBalancer_TopK_TopThreeChannels(t *testing.T) {
-	ctx := context.Background()
-
+func TestLoadBalancer_Sort_TopK(t *testing.T) {
 	strategy := &channelBasedStrategy{
 		name: "test",
 		scores: map[int]float64{
@@ -665,179 +651,37 @@ func TestLoadBalancer_TopK_TopThreeChannels(t *testing.T) {
 		},
 	}
 
-	// Mock SystemService with 2 retries (topK=1+2=3)
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 2}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 4, Name: "ch4"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 5, Name: "ch5"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 6, Name: "ch6"}}},
+	tests := []struct {
+		name string
+		topK int
+		want []int
+	}{
+		{name: "single best candidate", topK: 1, want: []int{4}},
+		{name: "top three", topK: 3, want: []int{4, 6, 2}},
+		{name: "top four", topK: 4, want: []int{4, 6, 2, 3}},
+		{name: "more than available sorts all", topK: 10, want: []int{4, 6, 2, 3, 1, 5}},
+		{name: "zero sorts all", topK: sortAllCandidates, want: []int{4, 6, 2, 3, 1, 5}},
+		{name: "negative sorts all", topK: -1, want: []int{4, 6, 2, 3, 1, 5}},
 	}
 
-	// With 2 retries, should return top 3 channels
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 3)
-	// Scores: ch4=300, ch6=250, ch2=200
-	assert.Equal(t, 4, result[0].Channel.ID, "First should be ch4 with score 300")
-	assert.Equal(t, 6, result[1].Channel.ID, "Second should be ch6 with score 250")
-	assert.Equal(t, 2, result[2].Channel.ID, "Third should be ch2 with score 200")
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lb := newTestLoadBalancer(t, nil, strategy)
 
-// TestLoadBalancer_TopK_MoreThanAvailable tests when retry count exceeds available channels.
-func TestLoadBalancer_TopK_MoreThanAvailable(t *testing.T) {
-	ctx := context.Background()
+			candidates := make([]*ChannelModelsCandidate, 0, len(strategy.scores))
+			for id := 1; id <= len(strategy.scores); id++ {
+				candidates = append(candidates, &ChannelModelsCandidate{
+					Channel: &biz.Channel{Channel: &ent.Channel{ID: id, Name: "ch"}},
+				})
+			}
 
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-		},
+			result := lb.Sort(context.Background(), candidates, "", false, tt.topK)
+			got := make([]int, 0, len(result))
+			for _, candidate := range result {
+				got = append(got, candidate.Channel.ID)
+			}
+
+			assert.Equal(t, tt.want, got)
+		})
 	}
-
-	// Mock SystemService with 10 retries (topK=1+10=11) but only 3 channels
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 10}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-	}
-
-	// With 10 retries but only 3 channels, should return all 3
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 3)
-	assert.Equal(t, 2, result[0].Channel.ID, "First should be ch2 with score 200")
-	assert.Equal(t, 3, result[1].Channel.ID, "Second should be ch3 with score 150")
-	assert.Equal(t, 1, result[2].Channel.ID, "Third should be ch1 with score 100")
-}
-
-// TestLoadBalancer_TopK_RetryDisabled simulates retry disabled.
-func TestLoadBalancer_TopK_RetryDisabled(t *testing.T) {
-	ctx := context.Background()
-
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-			4: 300,
-			5: 50,
-		},
-	}
-
-	// Mock SystemService with retry disabled
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: false}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 4, Name: "ch4"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 5, Name: "ch5"}}},
-	}
-
-	// With retry disabled, should only get best channel
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 1)
-	assert.Equal(t, 4, result[0].Channel.ID, "With retry disabled, should get only best channel")
-}
-
-// TestLoadBalancer_TopK_RetryEnabled simulates retry enabled with max 3 retries.
-func TestLoadBalancer_TopK_RetryEnabled(t *testing.T) {
-	ctx := context.Background()
-
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-			4: 300,
-			5: 50,
-		},
-	}
-
-	// Mock SystemService with 3 retries (topK=1+3=4)
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 3}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 4, Name: "ch4"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 5, Name: "ch5"}}},
-	}
-
-	// With 3 retries, should get top 4 channels
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 4)
-	// Top 4: ch4(300), ch2(200), ch3(150), ch1(100)
-	assert.Equal(t, 4, result[0].Channel.ID)
-	assert.Equal(t, 2, result[1].Channel.ID)
-	assert.Equal(t, 3, result[2].Channel.ID)
-	assert.Equal(t, 1, result[3].Channel.ID)
-}
-
-// TestLoadBalancer_TopK_FewChannelsManyRetries tests when retry count exceeds channel count.
-func TestLoadBalancer_TopK_FewChannelsManyRetries(t *testing.T) {
-	ctx := context.Background()
-
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-		},
-	}
-
-	// Mock SystemService with 10 retries but only 3 channels
-	lb := newTestLoadBalancer(t, &biz.RetryPolicy{Enabled: true, MaxChannelRetries: 10}, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-	}
-
-	// With 10 retries but only 3 channels, should return all 3
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 3, "Should return all 3 channels even though retry count is high")
-	assert.Equal(t, 2, result[0].Channel.ID)
-	assert.Equal(t, 3, result[1].Channel.ID)
-	assert.Equal(t, 1, result[2].Channel.ID)
-}
-
-// TestLoadBalancer_TopK_DefaultPolicy tests that default retry policy works.
-func TestLoadBalancer_TopK_DefaultPolicy(t *testing.T) {
-	ctx := context.Background()
-
-	strategy := &channelBasedStrategy{
-		name: "test",
-		scores: map[int]float64{
-			1: 100,
-			2: 200,
-			3: 150,
-		},
-	}
-
-	// Mock SystemService with nil policy (should use default)
-	lb := newTestLoadBalancer(t, nil, strategy)
-
-	candidates := []*ChannelModelsCandidate{
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 1, Name: "ch1"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 2, Name: "ch2"}}},
-		{Channel: &biz.Channel{Channel: &ent.Channel{ID: 3, Name: "ch3"}}},
-	}
-
-	// With default policy (retry disabled), should return 1 channel
-	result := lb.Sort(ctx, candidates, "")
-	require.Len(t, result, 1)
-	assert.Equal(t, 2, result[0].Channel.ID, "Should return only best channel with default policy")
 }

@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -27,17 +31,72 @@ type RenderContext struct {
 	Model string `json:"model"`
 	// Metadata is the metadata used in the current request.
 	Metadata map[string]string `json:"metadata"`
+	// RequestHeader is the filtered request headers used in the current request.
+	RequestHeader map[string]string `json:"request_header"`
+	// PromptCacheKey is the prompt cache key provided by the original request.
+	PromptCacheKey string `json:"prompt_cache_key"`
 	// ReasoningEffort is the reasoning effort used in the current request.
 	ReasoningEffort string `json:"reasoning_effort"`
 }
 
+var overrideTemplateFuncs = template.FuncMap{
+	"toJSON": func(value any) (string, error) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	},
+	// The matched value is the last argument so these functions also work in
+	// pipelines, e.g. {{.Model | regexMatch "^claude-"}}.
+	"contains": func(substr, value string) bool {
+		return strings.Contains(value, substr)
+	},
+	"regexMatch": func(pattern, value string) (bool, error) {
+		return regexp.MatchString(pattern, value)
+	},
+	"globMatch": globMatch,
+}
+
+func buildRequestHeaderMap(llmReq *llm.Request) map[string]string {
+	requestHeaders := make(map[string]string)
+	if llmReq == nil || llmReq.RawRequest == nil || llmReq.RawRequest.Headers == nil {
+		return requestHeaders
+	}
+
+	for key, values := range llmReq.RawRequest.Headers {
+		if len(values) == 0 {
+			continue
+		}
+
+		if httpclient.IsSensitiveHeader(key) {
+			continue
+		}
+
+		value := values[0]
+		canonicalKey := http.CanonicalHeaderKey(key)
+		requestHeaders[canonicalKey] = value
+		requestHeaders[strings.ToLower(key)] = value
+	}
+
+	return requestHeaders
+}
+
 func buildRenderContext(llmReq *llm.Request, requestModel string) RenderContext {
-	return RenderContext{
+	renderCtx := RenderContext{
 		RequestModel:    requestModel,
 		Model:           llmReq.Model,
 		Metadata:        llmReq.Metadata,
+		RequestHeader:   buildRequestHeaderMap(llmReq),
 		ReasoningEffort: llmReq.ReasoningEffort,
 	}
+	if llmReq.PromptCacheKey != nil {
+		renderCtx.PromptCacheKey = *llmReq.PromptCacheKey
+	} else if llmReq.Compact != nil {
+		renderCtx.PromptCacheKey = llmReq.Compact.PromptCacheKey
+	}
+
+	return renderCtx
 }
 
 // renderTemplate renders a Go template string against RenderContext. Returns the original value on error.
@@ -46,7 +105,7 @@ func renderTemplate(ctx context.Context, value string, renderCtx RenderContext) 
 		return value
 	}
 
-	tmpl, err := template.New("override").Funcs(template.FuncMap{}).Parse(value)
+	tmpl, err := template.New("override").Funcs(overrideTemplateFuncs).Parse(value)
 	if err != nil {
 		log.Warn(ctx, "failed to parse override template",
 			log.String("template", value),
@@ -109,9 +168,33 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 			return request, nil
 		}
 
+		// Body override operations are implemented with sjson, which silently discards a
+		// non-JSON document and rebuilds it as a fresh JSON object. Applying them to a
+		// multipart body (image edit/variation, transcription, ...) would replace the whole
+		// payload with a tiny JSON object while the Content-Type still advertises the
+		// multipart boundary, so the upstream sees a truncated form.
+		if !bodyOverrideSupported(request) {
+			log.Warn(ctx, "skipping body override operations for non-JSON request body",
+				log.String("channel", channel.Name),
+				log.Int("channel_id", channel.ID),
+				log.String("content_type", requestContentType(request)),
+				log.String("api_format", request.APIFormat),
+			)
+
+			return request, nil
+		}
+
 		llmReq := outbound.state.LlmRequest
 		renderCtx := buildRenderContext(llmReq, outbound.state.OriginalModel)
 		body := request.Body
+
+		// The outbound body is produced by format transformation, so a field the client
+		// sent may not survive it. set_if_absent also consults the original inbound body
+		// so such a field still counts as present (see applyBodySetIfAbsent).
+		var originalBody []byte
+		if llmReq.RawRequest != nil && gjson.ValidBytes(llmReq.RawRequest.Body) {
+			originalBody = llmReq.RawRequest.Body
+		}
 
 		for _, op := range ops {
 			if strings.EqualFold(op.Path, "stream") {
@@ -125,7 +208,7 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 
 			var err error
 
-			body, err = applyBodyOperation(ctx, body, op, renderCtx)
+			body, err = applyBodyOperation(ctx, body, op, renderCtx, originalBody)
 			if err != nil {
 				log.Warn(ctx, "failed to apply override operation",
 					log.String("channel", channel.Name),
@@ -152,11 +235,54 @@ func applyOverrideRequestBody(outbound *PersistentOutboundTransformer) pipeline.
 	})
 }
 
+// requestContentType returns the effective outbound Content-Type, preferring the
+// explicit field and falling back to the header.
+func requestContentType(request *httpclient.Request) string {
+	if request == nil {
+		return ""
+	}
+
+	if request.ContentType != "" {
+		return request.ContentType
+	}
+
+	return request.Headers.Get("Content-Type")
+}
+
+// bodyOverrideSupported reports whether channel body override operations can safely be
+// applied to the outbound request body. Only JSON bodies are patchable: sjson treats any
+// non-JSON input as an empty document and returns a freshly built object, which would
+// destroy multipart and binary payloads.
+func bodyOverrideSupported(request *httpclient.Request) bool {
+	if request == nil || len(request.Body) == 0 {
+		return false
+	}
+
+	contentType := requestContentType(request)
+	if contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && !isJSONMediaType(mediaType) {
+			return false
+		}
+	}
+
+	return gjson.ValidBytes(request.Body)
+}
+
+func isJSONMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(mediaType)
+
+	return mediaType == "application/json" ||
+		mediaType == "text/json" ||
+		strings.HasSuffix(mediaType, "+json")
+}
+
 func applyBodyOperation(
 	ctx context.Context,
 	body []byte,
 	op objects.OverrideOperation,
 	renderCtx RenderContext,
+	originalBody []byte,
 ) ([]byte, error) {
 	if !evaluateCondition(ctx, op.Condition, renderCtx) {
 		return body, nil
@@ -165,12 +291,22 @@ func applyBodyOperation(
 	switch op.Op {
 	case objects.OverrideOpSet:
 		return applyBodySet(ctx, body, op, renderCtx)
+	case objects.OverrideOpSetIfAbsent:
+		return applyBodySetIfAbsent(ctx, body, op, renderCtx, originalBody)
 	case objects.OverrideOpDelete:
 		return applyBodyDelete(body, op)
 	case objects.OverrideOpRename:
 		return applyBodyRename(body, op)
 	case objects.OverrideOpCopy:
 		return applyBodyCopy(body, op)
+	case objects.OverrideOpArrayAppend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtEnd)
+	case objects.OverrideOpArrayPrepend:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtStart)
+	case objects.OverrideOpArrayInsert:
+		return applyBodyArrayInsert(ctx, body, op, renderCtx, arrayInsertAtIndex)
+	case objects.OverrideOpArrayRemove:
+		return applyBodyArrayRemove(body, op)
 	default:
 		log.Warn(ctx, "unknown override operation",
 			log.String("op", op.Op),
@@ -192,10 +328,271 @@ func applyBodySet(
 		return sjson.DeleteBytes(body, op.Path)
 	}
 
-	return sjson.SetBytes(body, op.Path, renderedValue)
+	// sjson only writes to the first element a query path such as
+	// `messages.#.content.#(type=="image_url")` matches, so expand it first.
+	targets := expandQueryPath(body, op.Path)
+
+	updated, ok, err := spliceTargets(body, targets, renderedValue)
+	if err != nil {
+		return body, err
+	}
+
+	if !ok {
+		// A target without a usable offset (for example a field that does not exist
+		// yet) is written by sjson, one path at a time.
+		updated = body
+
+		for _, target := range targets {
+			updated, err = sjson.SetBytes(updated, target.path, renderedValue)
+			if err != nil {
+				return body, err
+			}
+		}
+	}
+
+	// sjson reports no error for some path shapes it cannot handle, such as the
+	// `#(...)#` all-matches form, and returns a broken document instead.
+	if !gjson.ValidBytes(updated) {
+		return body, fmt.Errorf("set at path %q produced invalid JSON", op.Path)
+	}
+
+	return updated, nil
+}
+
+// pathTarget is a concrete path a set operation writes to, with the value currently
+// stored there.
+type pathTarget struct {
+	path  string
+	value gjson.Result
+}
+
+// expandQueryPath resolves the `#` and `#(query)` segments of a path against body and
+// returns one target per matching element. A path without a `#(query)` segment is
+// returned as is, as is a path using the `#(query)#` all-matches form, which sjson cannot
+// set. A query path that matches nothing returns no targets.
+func expandQueryPath(body []byte, path string) []pathTarget {
+	segments := splitPathSegments(path)
+
+	hasQuery := false
+
+	for _, segment := range segments {
+		if isQuerySegment(segment) {
+			hasQuery = true
+		}
+
+		if strings.HasPrefix(segment, "#(") && strings.HasSuffix(segment, ")#") {
+			return []pathTarget{{path: path}}
+		}
+	}
+
+	if !hasQuery {
+		return []pathTarget{{path: path}}
+	}
+
+	return resolvePathSegments(gjson.ParseBytes(body), nil, segments)
+}
+
+func isQuerySegment(segment string) bool {
+	return strings.HasPrefix(segment, "#(") && strings.HasSuffix(segment, ")")
+}
+
+func resolvePathSegments(node gjson.Result, prefix, rest []string) []pathTarget {
+	if len(rest) == 0 {
+		return []pathTarget{{path: strings.Join(prefix, "."), value: node}}
+	}
+
+	segment := rest[0]
+	if segment != "#" && !isQuerySegment(segment) {
+		return resolvePathSegments(node.Get(segment), append(slices.Clip(prefix), segment), rest[1:])
+	}
+
+	if !node.IsArray() {
+		return nil
+	}
+
+	var targets []pathTarget
+
+	for index, element := range node.Array() {
+		if segment != "#" && !gjson.Get("["+element.Raw+"]", segment).Exists() {
+			continue
+		}
+
+		next := append(slices.Clip(prefix), strconv.Itoa(index))
+		targets = append(targets, resolvePathSegments(element, next, rest[1:])...)
+	}
+
+	return targets
+}
+
+// spliceTargets replaces every target's current value in body with value in a single
+// pass, instead of rewriting the whole body once per target. It reports false, without
+// touching body, when a target has no verifiable offset or the targets overlap.
+func spliceTargets(body []byte, targets []pathTarget, value any) ([]byte, bool, error) {
+	if len(targets) == 0 {
+		return body, true, nil
+	}
+
+	// Format the value exactly as sjson would, once.
+	formatted, err := sjson.SetBytes([]byte("[null]"), "0", value)
+	if err != nil {
+		return nil, false, err
+	}
+
+	replacement := gjson.GetBytes(formatted, "0").Raw
+
+	spans := make([][2]int, 0, len(targets))
+
+	for _, target := range targets {
+		start, raw := target.value.Index, target.value.Raw
+		if start <= 0 || raw == "" || start+len(raw) > len(body) || string(body[start:start+len(raw)]) != raw {
+			return nil, false, nil
+		}
+
+		spans = append(spans, [2]int{start, start + len(raw)})
+	}
+
+	slices.SortFunc(spans, func(a, b [2]int) int { return a[0] - b[0] })
+
+	out := make([]byte, 0, len(body)+len(spans)*len(replacement))
+	last := 0
+
+	for _, span := range spans {
+		if span[0] < last {
+			return nil, false, nil
+		}
+
+		out = append(out, body[last:span[0]]...)
+		out = append(out, replacement...)
+		last = span[1]
+	}
+
+	return append(out, body[last:]...), true, nil
+}
+
+// splitPathSegments splits a gjson path at its unescaped dots, keeping dots, quotes and
+// parentheses inside a `#(query)` segment intact.
+func splitPathSegments(path string) []string {
+	var (
+		segments []string
+		start    int
+		depth    int
+		quoted   bool
+	)
+
+	for i := 0; i < len(path); i++ {
+		switch c := path[i]; {
+		case c == '\\':
+			i++
+		case c == '"' && depth > 0:
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')' && depth > 0:
+			depth--
+		case c == '.' && depth == 0:
+			segments = append(segments, path[start:i])
+			start = i + 1
+		}
+	}
+
+	return append(segments, path[start:])
+}
+
+func applyBodySetIfAbsent(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+	originalBody []byte,
+) ([]byte, error) {
+	existing := gjson.GetBytes(body, op.Path)
+	if existing.Exists() || existing.Raw == "null" {
+		return body, nil
+	}
+
+	// A field the client sent may have been dropped or remapped by format
+	// transformation, so it can be absent from the outbound body even though the
+	// client provided it. Treat a field present in the original inbound body as
+	// present, keeping set_if_absent a default that clients can override.
+	if len(originalBody) > 0 {
+		original := gjson.GetBytes(originalBody, op.Path)
+		if original.Exists() || original.Raw == "null" {
+			return body, nil
+		}
+	}
+
+	return applyBodySet(ctx, body, op, renderCtx)
 }
 
 func applyBodyDelete(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	for i := 0; i < len(op.Path); i++ {
+		if op.Path[i] == '\\' {
+			i++
+			continue
+		}
+
+		if !strings.HasPrefix(op.Path[i:], "[*]") {
+			continue
+		}
+
+		rest := op.Path[i+3:]
+		if rest != "" && rest[0] != '.' && !strings.HasPrefix(rest, "[*]") {
+			continue
+		}
+
+		prefix := op.Path[:i]
+		array := gjson.ParseBytes(body)
+		if prefix != "" {
+			array = gjson.GetBytes(body, prefix)
+		}
+
+		if !array.IsArray() {
+			return body, nil
+		}
+
+		// Delete within each item's raw JSON, then replace the array once.
+		// This avoids copying the full request body for every array element.
+		rebuilt := make([]byte, 0, len(array.Raw))
+		rebuilt = append(rebuilt, '[')
+		changed := false
+		if rest == "" {
+			changed = len(array.Array()) > 0
+		} else {
+			relative := op
+			// Keep a concrete index before the suffix so empty path segments
+			// retain their meaning, including the distinction between .[*] and [*].
+			relative.Path = "0" + rest
+
+			for index, item := range array.Array() {
+				raw := make([]byte, 0, len(item.Raw)+2)
+				raw = append(raw, '[')
+				raw = append(raw, item.Raw...)
+				raw = append(raw, ']')
+				updated, err := applyBodyDelete(raw, relative)
+				if err != nil {
+					return body, err
+				}
+
+				changed = changed || !bytes.Equal(raw, updated)
+				if index > 0 {
+					rebuilt = append(rebuilt, ',')
+				}
+				rebuilt = append(rebuilt, gjson.GetBytes(updated, "0").Raw...)
+			}
+		}
+		rebuilt = append(rebuilt, ']')
+
+		if !changed {
+			return body, nil
+		}
+		if prefix == "" {
+			return rebuilt, nil
+		}
+
+		return sjson.SetRawBytes(body, prefix, rebuilt)
+	}
+
 	return sjson.DeleteBytes(body, op.Path)
 }
 
@@ -222,6 +619,140 @@ func applyBodyCopy(body []byte, op objects.OverrideOperation) ([]byte, error) {
 	return sjson.SetBytes(body, op.To, result.Value())
 }
 
+type arrayInsertMode int
+
+const (
+	arrayInsertAtStart arrayInsertMode = iota
+	arrayInsertAtEnd
+	arrayInsertAtIndex
+)
+
+// applyBodyArrayInsert inserts one or more values into an array at the requested position.
+// Behavior:
+//   - If the rendered value is a JSON array and op.Splat is nil or true, its elements are
+//     spread into the target array. Set Splat=false to insert the array as a single nested element.
+//   - When the target path does not exist, a new array is created with the value(s).
+//   - When the target path exists but is not an array, an error is returned.
+//   - For arrayInsertAtIndex, op.Index is required and may be negative (counted from the end).
+//     Out-of-range indexes are clamped to [0, len].
+func applyBodyArrayInsert(
+	ctx context.Context,
+	body []byte,
+	op objects.OverrideOperation,
+	renderCtx RenderContext,
+	mode arrayInsertMode,
+) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array op requires a path")
+	}
+
+	rendered := renderOverrideValue(ctx, op.Value, renderCtx)
+
+	splat := true
+	if op.Splat != nil {
+		splat = *op.Splat
+	}
+
+	var toInsert []any
+
+	if arr, ok := rendered.([]any); ok && splat {
+		toInsert = arr
+	} else {
+		toInsert = []any{rendered}
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		// Create a new array at the path. For arrayInsertAtIndex with a non-zero index,
+		// the position is effectively clamped to 0 since the array is empty.
+		return sjson.SetBytes(body, op.Path, toInsert)
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	var current []any
+	if err := json.Unmarshal([]byte(existing.Raw), &current); err != nil {
+		return body, fmt.Errorf("decode array at %q: %w", op.Path, err)
+	}
+
+	var pos int
+
+	switch mode {
+	case arrayInsertAtStart:
+		pos = 0
+	case arrayInsertAtEnd:
+		pos = len(current)
+	case arrayInsertAtIndex:
+		if op.Index == nil {
+			return body, fmt.Errorf("array_insert requires an index")
+		}
+
+		pos = *op.Index
+		if pos < 0 {
+			pos = len(current) + pos
+		}
+
+		if pos < 0 {
+			pos = 0
+		}
+
+		if pos > len(current) {
+			pos = len(current)
+		}
+	}
+
+	merged := make([]any, 0, len(current)+len(toInsert))
+	merged = append(merged, current[:pos]...)
+	merged = append(merged, toInsert...)
+	merged = append(merged, current[pos:]...)
+
+	return sjson.SetBytes(body, op.Path, merged)
+}
+
+// applyBodyArrayRemove removes array items whose relative match path equals the configured value.
+func applyBodyArrayRemove(body []byte, op objects.OverrideOperation) ([]byte, error) {
+	if op.Path == "" {
+		return body, fmt.Errorf("array_remove requires a path")
+	}
+
+	if op.Match == nil {
+		return body, fmt.Errorf("array_remove requires a match")
+	}
+
+	if strings.TrimSpace(op.Match.Path) == "" {
+		return body, fmt.Errorf("array_remove requires a match path")
+	}
+
+	if strings.TrimSpace(op.Match.Eq) == "" {
+		return body, fmt.Errorf("array_remove requires a match eq value")
+	}
+
+	existing := gjson.GetBytes(body, op.Path)
+	if !existing.Exists() {
+		return body, nil
+	}
+
+	if !existing.IsArray() {
+		return body, fmt.Errorf("path %q is not an array", op.Path)
+	}
+
+	matchEq := strings.TrimSpace(op.Match.Eq)
+	items := existing.Array()
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		result := gjson.GetBytes([]byte(item.Raw), op.Match.Path)
+		if result.Exists() && result.String() == matchEq {
+			continue
+		}
+
+		kept = append(kept, json.RawMessage([]byte(item.Raw)))
+	}
+
+	return sjson.SetBytes(body, op.Path, kept)
+}
+
 func applyOverrideOperationToHeaders(
 	ctx context.Context,
 	headers http.Header,
@@ -234,14 +765,14 @@ func applyOverrideOperationToHeaders(
 
 	switch op.Op {
 	case objects.OverrideOpSet:
-		renderedValue := renderOverrideValue(ctx, op.Value, renderCtx)
+		renderedValue := renderTemplate(ctx, op.Value, renderCtx)
 		// For backward compatibility, we still support "__AXONHUB_CLEAR__" to clear the header.
 		if renderedValue == "__AXONHUB_CLEAR__" {
 			headers.Del(op.Path)
 			return
 		}
 
-		headers.Set(op.Path, fmt.Sprintf("%v", renderedValue))
+		headers.Set(op.Path, renderedValue)
 	case objects.OverrideOpDelete:
 		headers.Del(op.Path)
 	case objects.OverrideOpRename:

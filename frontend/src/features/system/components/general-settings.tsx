@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Loader2, Save } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,10 @@ import { Label } from '@/components/ui/label';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { useSystemContext } from '../context/system-context';
 import { currencyCodes } from '../data/currencies';
-import { useGeneralSettings, useUpdateGeneralSettings } from '../data/system';
+import {
+  useGeneralSettings,
+  useUpdateGeneralSettings,
+} from '../data/system';
 import { GMTTimeZoneOptions } from '../data/timezones';
 
 export function GeneralSettings() {
@@ -33,7 +36,7 @@ export function GeneralSettings() {
   const timezoneItems = React.useMemo(() => GMTTimeZoneOptions, []);
 
   // Update local state when settings are loaded
-  React.useEffect(() => {
+  useEffect(() => {
     if (settings) {
       setCurrencyCode(settings.currencyCode || 'USD');
       setTimezone(settings.timezone || 'UTC');
@@ -52,7 +55,9 @@ export function GeneralSettings() {
     }
   };
 
-  const hasChanges = settings ? settings.currencyCode !== currencyCode || settings.timezone !== timezone : false;
+  const hasChanges = settings
+    ? settings.currencyCode !== currencyCode || settings.timezone !== timezone
+    : false;
 
   if (isLoadingSettings) {
     return (
@@ -100,6 +105,7 @@ export function GeneralSettings() {
           </div>
         </CardContent>
       </Card>
+
 
       {hasChanges && (
         <div className='flex justify-end'>

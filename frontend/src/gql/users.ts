@@ -9,6 +9,14 @@ export const ME_QUERY = `
       scopes
       preferLanguage
       avatar
+      hasPassword
+      oidcIdentities {
+        id
+        idpName
+        issuer
+        subject
+        email
+      }
       roles {
         name
       }
@@ -16,6 +24,7 @@ export const ME_QUERY = `
         projectID
         isOwner
         scopes
+        effectiveScopes
         roles {
           name
         }
@@ -24,29 +33,39 @@ export const ME_QUERY = `
   }
 `;
 
+export const ME_QUERY_OPERATION_NAME = 'Me';
+
+const USER_FIELDS = `
+  id
+  createdAt
+  updatedAt
+  email
+  status
+  firstName
+  lastName
+  isOwner
+  preferLanguage
+  scopes
+`;
+
+const SYSTEM_ROLE_FIELDS = `
+  roles(where: { level: system }) @include(if: $includeRoles) {
+    edges {
+      node {
+        id
+        name
+      }
+    }
+  }
+`;
+
 export const USERS_QUERY = `
-  query Users($first: Int, $after: Cursor, $orderBy: UserOrder, $where: UserWhereInput) {
+  query Users($first: Int, $after: Cursor, $orderBy: UserOrder, $where: UserWhereInput, $includeRoles: Boolean!) {
     users(first: $first, after: $after, orderBy: $orderBy, where: $where) {
       edges {
         node {
-          id
-          createdAt
-          updatedAt
-          email
-          status
-          firstName
-          lastName
-          isOwner
-          preferLanguage
-          scopes
-          roles {
-            edges {
-              node {
-                id
-                name
-              }
-            }
-          }
+          ${USER_FIELDS}
+          ${SYSTEM_ROLE_FIELDS}
         }
       }
       pageInfo {
@@ -60,26 +79,10 @@ export const USERS_QUERY = `
 `;
 
 export const USER_QUERY = `
-  query User($id: ID!) {
+  query User($id: ID!, $includeRoles: Boolean!) {
     user(id: $id) {
-      id
-      createdAt
-      updatedAt
-      email
-      status
-      firstName
-      lastName
-      isOwner
-      preferLanguage
-      scopes
-      roles {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
+      ${USER_FIELDS}
+      ${SYSTEM_ROLE_FIELDS}
     }
   }
 `;
@@ -87,24 +90,7 @@ export const USER_QUERY = `
 export const CREATE_USER_MUTATION = `
   mutation CreateUser($input: CreateUserInput!) {
     createUser(input: $input) {
-      id
-      createdAt
-      updatedAt
-      email
-      status
-      firstName
-      lastName
-      isOwner
-      preferLanguage
-      scopes
-      roles {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
+      ${USER_FIELDS}
     }
   }
 `;
@@ -112,24 +98,7 @@ export const CREATE_USER_MUTATION = `
 export const UPDATE_USER_MUTATION = `
   mutation UpdateUser($id: ID!, $input: UpdateUserInput!) {
     updateUser(id: $id, input: $input) {
-      id
-      createdAt
-      updatedAt
-      email
-      status
-      firstName
-      lastName
-      isOwner
-      preferLanguage
-      scopes
-      roles {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
+      ${USER_FIELDS}
     }
   }
 `;
@@ -137,25 +106,14 @@ export const UPDATE_USER_MUTATION = `
 export const UPDATE_USER_STATUS_MUTATION = `
   mutation UpdateUserStatus($id: ID!, $status: UserStatus!) {
     updateUserStatus(id: $id, status: $status) {
-      id
-      createdAt
-      updatedAt
-      email
-      status
-      firstName
-      lastName
-      isOwner
-      preferLanguage
-      scopes
-      roles {
-        edges {
-          node {
-            id
-            name
-          }
-        }
-      }
+      ${USER_FIELDS}
     }
+  }
+`;
+
+export const DELETE_USER_MUTATION = `
+  mutation DeleteUser($id: ID!) {
+    deleteUser(id: $id)
   }
 `;
 
@@ -202,5 +160,17 @@ export const UPDATE_ME_MUTATION = `
       preferLanguage
       avatar
     }
+  }
+`;
+
+export const UPDATE_MY_PASSWORD_MUTATION = `
+  mutation UpdateMyPassword($input: UpdateMyPasswordInput!) {
+    updateMyPassword(input: $input)
+  }
+`;
+
+export const UNLINK_OIDC_IDENTITY_MUTATION = `
+  mutation UnlinkOIDCIdentity($id: ID!) {
+    unlinkOIDCIdentity(id: $id)
   }
 `;

@@ -16,22 +16,19 @@ func TestDecoratorChain_FullStack(t *testing.T) {
 
 	channelService := newTestChannelServiceForChannels(client)
 	systemService := newTestSystemService(client)
-	requestService := newTestRequestServiceForChannels(client, systemService)
-	connectionTracker := NewDefaultConnectionTracker(10)
 
 	strategies := []LoadBalanceStrategy{
-		NewTraceAwareStrategy(requestService),
-		NewErrorAwareStrategy(channelService),
-		NewWeightRoundRobinStrategy(channelService),
-		NewConnectionAwareStrategy(channelService, connectionTracker),
+		NewErrorAwareStrategy(),
+		NewWeightRoundRobinStrategy(),
+		NewLatencyAwareStrategy(),
 	}
-	loadBalancer := NewLoadBalancer(systemService, nil, strategies...)
+	loadBalancer := NewLoadBalancer(channelService, nil, strategies...)
 
 	// Build decorator chain: Default -> SelectedChannels -> LoadBalanced
 	modelService := newTestModelService(client)
 	baseSelector := NewDefaultSelector(channelService, modelService, systemService)
 	filteredSelector := WithSelectedChannelsSelector(baseSelector, []int{channels[0].ID, channels[1].ID})
-	selector := WithLoadBalancedSelector(filteredSelector, loadBalancer, systemService)
+	selector := WithLoadBalancedSelector(filteredSelector, loadBalancer, systemService.RetryPolicyOrDefault(ctx))
 
 	req := &llm.Request{
 		Model: "gpt-4",
@@ -62,9 +59,8 @@ func TestSelectedChannelsSelector_WithAllowedChannels(t *testing.T) {
 	channelService := newTestChannelServiceForChannels(client)
 	systemService := newTestSystemService(client)
 	requestService := newTestRequestServiceForChannels(client, systemService)
-	connectionTracker := NewDefaultConnectionTracker(10)
 
-	baseSelector := newTestLoadBalancedSelector(channelService, client, systemService, requestService, connectionTracker)
+	baseSelector := newTestLoadBalancedSelector(channelService, client, systemService, requestService)
 
 	req := &llm.Request{
 		Model: "gpt-4",

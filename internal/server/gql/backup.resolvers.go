@@ -7,10 +7,12 @@ package gql
 
 import (
 	"context"
-	"io"
 
 	"github.com/99designs/gqlgen/graphql"
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/log"
+	"github.com/looplj/axonhub/internal/scopes"
 	"github.com/looplj/axonhub/internal/server/backup"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/samber/lo"
@@ -34,13 +36,9 @@ func (r *mutationResolver) Backup(ctx context.Context, input backup.BackupOption
 
 // Restore is the resolver for the restore field.
 func (r *mutationResolver) Restore(ctx context.Context, file graphql.Upload, input backup.RestoreOptions) (*RestorePayload, error) {
-	fileContent, err := io.ReadAll(file.File)
-	if err != nil {
-		return nil, err
-	}
-
-	err = r.backupService.Restore(ctx, fileContent, input)
-	if err != nil {
+	// Hand the upload stream straight to the service. Reading it into a []byte
+	// first would hold the whole backup in memory on top of the decoded form.
+	if err := r.backupService.Restore(ctx, file.File, input); err != nil {
 		return nil, err
 	}
 
@@ -53,7 +51,7 @@ func (r *mutationResolver) Restore(ctx context.Context, file graphql.Upload, inp
 // UpdateAutoBackupSettings is the resolver for the updateAutoBackupSettings field.
 func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input UpdateAutoBackupSettingsInput) (bool, error) {
 	user, ok := contexts.GetUser(ctx)
-	if !ok || user == nil || !user.IsOwner {
+	if !ok || user == nil || !scopes.IsDirectOwner(ctx) {
 		return false, ErrNotOwner
 	}
 
@@ -74,6 +72,10 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 		settings.DataStorageID = *input.DataStorageID
 	}
 
+	if input.IncludeSystemConfigs != nil {
+		settings.IncludeSystemConfigs = *input.IncludeSystemConfigs
+	}
+
 	if input.IncludeChannels != nil {
 		settings.IncludeChannels = *input.IncludeChannels
 	}
@@ -90,6 +92,14 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 		settings.IncludeModelPrices = *input.IncludeModelPrices
 	}
 
+	if input.IncludeUsageStats != nil {
+		settings.IncludeUsageStats = *input.IncludeUsageStats
+	}
+
+	if input.IncludeRequestLogs != nil {
+		settings.IncludeRequestLogs = *input.IncludeRequestLogs
+	}
+
 	if input.RetentionDays != nil {
 		settings.RetentionDays = *input.RetentionDays
 	}
@@ -98,22 +108,28 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 		return false, err
 	}
 
+	r.backupService.Reschedule(ctx, r.scheduler)
+
 	return true, nil
 }
 
 // TriggerAutoBackup is the resolver for the triggerAutoBackup field.
 func (r *mutationResolver) TriggerAutoBackup(ctx context.Context) (*TriggerBackupPayload, error) {
 	user, ok := contexts.GetUser(ctx)
-	if !ok || user == nil || !user.IsOwner {
+	if !ok || user == nil || !scopes.IsDirectOwner(ctx) {
 		return nil, ErrNotOwner
 	}
 
-	if err := r.backupService.RunBackupNow(ctx); err != nil {
-		return &TriggerBackupPayload{
-			Success: false,
-			Message: lo.ToPtr(err.Error()),
-		}, nil
-	}
+	go func() {
+		// Use a detached context so the 30s HTTP request timeout
+		// doesn't cancel the long-running WebDAV upload.
+		// RunBackupNow internally injects a fresh ent client (svc.db),
+		// so it does NOT depend on the HTTP request's transactional context.
+		bgCtx := context.WithoutCancel(ctx)
+		if err := r.backupService.RunBackupNow(bgCtx); err != nil {
+			log.Error(bgCtx, "Manual trigger autobackup failed", log.Cause(err))
+		}
+	}()
 
 	return &TriggerBackupPayload{
 		Success: true,
@@ -123,5 +139,9 @@ func (r *mutationResolver) TriggerAutoBackup(ctx context.Context) (*TriggerBacku
 
 // AutoBackupSettings is the resolver for the autoBackupSettings field.
 func (r *queryResolver) AutoBackupSettings(ctx context.Context) (*biz.AutoBackupSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.AutoBackupSettings(ctx)
 }

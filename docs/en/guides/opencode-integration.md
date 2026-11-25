@@ -19,6 +19,8 @@ AxonHub can act as a drop-in replacement for Anthropic endpoints, letting OpenCo
 
 ## Configure OpenCode
 
+OpenCode V1 and V2 use different plugin APIs and configuration keys. Keep the configuration that matches your OpenCode version, then configure the tracing plugin in the version-specific section below.
+
 ### 1. Create OpenCode Configuration File
 
 Create or edit your OpenCode configuration file at `~/.config/opencode/opencode.json`:
@@ -26,9 +28,6 @@ Create or edit your OpenCode configuration file at `~/.config/opencode/opencode.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "opencode-axonhub-tracing"
-  ],
   "provider": {
     "axonhub": {
       "npm": "@ai-sdk/anthropic",
@@ -160,29 +159,81 @@ Route to specialized models:
 
 ## OpenCode Tracing Plugin
 
-The `opencode-axonhub-tracing` plugin enhances your development experience by providing:
-- Request/response logging
-- Performance metrics
-- Error tracking
-- Session correlation
+The `opencode-axonhub-tracing` plugin injects trace headers for every LLM request, enabling request aggregation and tracing in AxonHub.
 
-### Installation
+OpenCode V1 and V2 use different plugin APIs. Choose the section that matches your OpenCode version; the two plugin versions are not interchangeable.
 
-The plugin is specified in the configuration file:
+### Default Headers
+
+| Header Key     | OpenCode V1 Source       | OpenCode V2 Source        | Description                                      |
+| -------------- | ------------------------ | ------------------------- | ------------------------------------------------ |
+| `AH-Thread-Id` | OpenCode `sessionID`      | OpenCode `sessionID`       | Groups requests from the same session            |
+| `AH-Trace-Id`  | OpenCode `message.id`     | OpenCode prompt `messageID` | Identifies the current message or latest prompt |
+
+### Enable the Plugin
+
+#### OpenCode V1
+
+OpenCode V1 uses the legacy plugin API. Use the V1 plugin version, and pin it to `1.1.0` to avoid loading the incompatible V2 plugin:
 
 ```json
 {
-  "plugin": [
-    "opencode-axonhub-tracing"
-  ]
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-axonhub-tracing@1.1.0"]
 }
 ```
 
+#### OpenCode V2
+
+OpenCode V2 uses `@opencode/plugin` and the `plugins` configuration key. Use `opencode-axonhub-tracing` version `2.0.0` or later:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-axonhub-tracing@2.0.0"]
+}
+```
+
+OpenCode will automatically install the configured plugin when needed.
+
+### Custom Header Configuration (Optional)
+
+By default, the plugin uses `AH-Thread-Id` and `AH-Trace-Id` header keys. You can override these with environment variables:
+
+| Environment Variable                     | Default Value  | Description              |
+| ---------------------------------------- | -------------- | ------------------------ |
+| `OPENCODE_AXONHUB_TRACING_THREAD_HEADER` | `AH-Thread-Id` | Custom thread header key |
+| `OPENCODE_AXONHUB_TRACING_TRACE_HEADER`  | `AH-Trace-Id`  | Custom trace header key  |
+
+Example:
+
+```bash
+export OPENCODE_AXONHUB_TRACING_THREAD_HEADER="X-Thread-Id"
+export OPENCODE_AXONHUB_TRACING_TRACE_HEADER="X-Trace-Id"
+```
+
+> **Note**: Empty string values will fall back to the default keys.
+
+### Behavior Details
+
+#### OpenCode V1
+
+- **Thread ID**: Uses OpenCode's `sessionID` to group related requests
+- **Trace ID**: Uses the current user message's `message.id` for unique identification
+- If the current message has no `id`, only the thread header is injected
+
+#### OpenCode V2
+
+- **Thread ID**: Uses OpenCode's `sessionID` to group related requests
+- **Trace ID**: Records the `messageID` from the latest prompt in the session
+- If the session has no prompt yet, or the request has no corresponding message ID, only the thread header is injected
+- Uses `session.hook("prompt")` and `session.hook("model.request")` to inject request headers
+
 ### Benefits
-- **Debugging**: Easily trace issues in your AI interactions
-- **Performance**: Monitor response times and identify bottlenecks
-- **Cost Tracking**: See token usage and costs per request
-- **Session Management**: Group related requests for better analysis
+
+- **Session Aggregation**: Group related requests from the same OpenCode session in AxonHub traces
+- **Request Correlation**: Track individual messages across your AI infrastructure
+- **Flexible Configuration**: Customize header keys to match your existing tracing infrastructure
 
 ---
 
@@ -329,4 +380,4 @@ OpenCode can also use AxonHub's OpenAI-compatible endpoint:
 - [Model Management Guide](model-management.md)
 - [Channel Management Guide](channel-management.md)
 - [Anthropic API Reference](../api-reference/anthropic-api.md)
-- README sections on [Usage Guide](../../../README.md#usage-guide)
+- README sections on [Usage Guide](../../../README.en-US.md#usage-guide)

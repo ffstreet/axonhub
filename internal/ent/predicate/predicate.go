@@ -9,6 +9,9 @@ import (
 // APIKey is the predicate function for apikey builders.
 type APIKey func(*sql.Selector)
 
+// APIKeyProfileTemplate is the predicate function for apikeyprofiletemplate builders.
+type APIKeyProfileTemplate func(*sql.Selector)
+
 // Channel is the predicate function for channel builders.
 type Channel func(*sql.Selector)
 
@@ -27,8 +30,32 @@ type ChannelProbe func(*sql.Selector)
 // DataStorage is the predicate function for datastorage builders.
 type DataStorage func(*sql.Selector)
 
+// Invitation is the predicate function for invitation builders.
+type Invitation func(*sql.Selector)
+
 // Model is the predicate function for model builders.
 type Model func(*sql.Selector)
+
+// OIDCIdentity is the predicate function for oidcidentity builders.
+type OIDCIdentity func(*sql.Selector)
+
+// Plugin is the predicate function for plugin builders.
+type Plugin func(*sql.Selector)
+
+// PluginSchedule is the predicate function for pluginschedule builders.
+type PluginSchedule func(*sql.Selector)
+
+// PluginScheduleRun is the predicate function for pluginschedulerun builders.
+type PluginScheduleRun func(*sql.Selector)
+
+// PluginStorage is the predicate function for pluginstorage builders.
+type PluginStorage func(*sql.Selector)
+
+// PluginTableOperation is the predicate function for plugintableoperation builders.
+type PluginTableOperation func(*sql.Selector)
+
+// PluginTableStorage is the predicate function for plugintablestorage builders.
+type PluginTableStorage func(*sql.Selector)
 
 // Project is the predicate function for project builders.
 type Project func(*sql.Selector)
@@ -36,11 +63,20 @@ type Project func(*sql.Selector)
 // Prompt is the predicate function for prompt builders.
 type Prompt func(*sql.Selector)
 
+// PromptProtectionRule is the predicate function for promptprotectionrule builders.
+type PromptProtectionRule func(*sql.Selector)
+
 // ProviderQuotaStatus is the predicate function for providerquotastatus builders.
 type ProviderQuotaStatus func(*sql.Selector)
 
 // Request is the predicate function for request builders.
 type Request func(*sql.Selector)
+
+// RequestBodyChunk is the predicate function for requestbodychunk builders.
+type RequestBodyChunk func(*sql.Selector)
+
+// RequestBodyChunkRef is the predicate function for requestbodychunkref builders.
+type RequestBodyChunkRef func(*sql.Selector)
 
 // RequestExecution is the predicate function for requestexecution builders.
 type RequestExecution func(*sql.Selector)

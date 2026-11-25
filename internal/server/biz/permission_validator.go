@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/authz/identity"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/privacy"
 	entuser "github.com/looplj/axonhub/internal/ent/user"
+	"github.com/looplj/axonhub/internal/scopes"
 )
 
 // PermissionValidator provides methods to validate permission hierarchies.
@@ -99,6 +102,18 @@ func (v *PermissionValidator) CanGrantScopes(ctx context.Context, scopesToGrant 
 		return fmt.Errorf("user not found in context")
 	}
 
+	if identity.IsPlugin(ctx) {
+		for _, scope := range scopesToGrant {
+			allowed := scopes.EffectiveSystemScope(ctx, currentUser, scopes.ScopeSlug(scope))
+			if projectID != nil {
+				allowed = allowed || scopes.EffectiveProjectScope(ctx, currentUser, *projectID, scopes.ScopeSlug(scope))
+			}
+			if !allowed {
+				return fmt.Errorf("plugin cannot grant scope %s", scope)
+			}
+		}
+		return nil
+	}
 	// Owners can grant any scopes
 	isOwner, err := v.isProjectOwner(ctx, currentUser, projectID)
 	if err != nil {
@@ -130,6 +145,29 @@ func (v *PermissionValidator) CanGrantScopes(ctx context.Context, scopesToGrant 
 	return nil
 }
 
+// CanGrantAPIKeyScopes checks whether user may attach scopesToGrant to a
+// service-account API key that belongs to projectID.
+//
+// API key scopes are evaluated at authorization time without a project
+// dimension, so a project-level grant becomes a system-wide grant once it is
+// carried by a key. System-only scopes therefore require a system-level grant;
+// project-capable scopes follow the regular CanGrantScopes rule. Without this
+// split a project owner (or any member holding a project role) could mint a key
+// with scopes they never held at system level.
+func (v *PermissionValidator) CanGrantAPIKeyScopes(ctx context.Context, user *ent.User, scopesToGrant []string, projectID int) error {
+	for _, scope := range scopesToGrant {
+		if !scopes.IsValidScope(scope) {
+			return fmt.Errorf("invalid scope '%s'", scope)
+		}
+
+		if scopes.IsSystemOnlyScope(scope) && !scopes.EffectiveSystemScope(ctx, user, scopes.ScopeSlug(scope)) {
+			return fmt.Errorf("insufficient permissions: cannot grant system scope '%s' that you don't possess at system level", scope)
+		}
+	}
+
+	return v.CanGrantScopes(contexts.WithUser(ctx, user), scopesToGrant, &projectID)
+}
+
 // CanGrantRole checks if the current user can grant a role with the specified scopes.
 func (v *PermissionValidator) CanGrantRole(ctx context.Context, roleScopes []string, projectID *int) error {
 	return v.CanGrantScopes(ctx, roleScopes, projectID)
@@ -138,52 +176,51 @@ func (v *PermissionValidator) CanGrantRole(ctx context.Context, roleScopes []str
 // CanEditUserPermissions checks if the current user can edit another user's permissions.
 // Rule: Cannot edit users with higher or equal permissions, unless you are an owner.
 func (v *PermissionValidator) CanEditUserPermissions(ctx context.Context, targetUserID int, projectID *int) error {
+	_, err := v.editableUser(ctx, targetUserID, projectID)
+	return err
+}
+
+func (v *PermissionValidator) editableUser(ctx context.Context, targetUserID int, projectID *int) (*ent.User, error) {
 	currentUser, ok := contexts.GetUser(ctx)
 	if !ok || currentUser == nil {
-		return fmt.Errorf("user not found in context")
+		return nil, fmt.Errorf("user not found in context")
 	}
 
 	// Get target user
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := v.entFromContext(ctx)
+	targetUser, err := authz.RunAsHost(ctx, v.entFromContext(ctx), "permission-check", func(bypassCtx context.Context) (*ent.User, error) {
+		client := v.entFromContext(bypassCtx)
 
-	targetUser, err := client.User.Query().
-		Where(entuser.IDEQ(targetUserID)).
-		WithRoles().
-		WithProjectUsers().
-		Only(ctx)
+		return client.User.Query().
+			Where(entuser.IDEQ(targetUserID)).
+			WithRoles().
+			WithProjectUsers().
+			Only(bypassCtx)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to get target user: %w", err)
+		return nil, fmt.Errorf("failed to get target user: %w", err)
 	}
 
-	// Check if target is an owner
-	targetIsOwner, err := v.isProjectOwner(ctx, targetUser, projectID)
-	if err != nil {
-		return err
+	if err := v.checkUserHierarchy(ctx, currentUser, targetUser, projectID); err != nil {
+		return nil, err
 	}
+	return targetUser, nil
+}
 
-	// Current user must be owner to edit another owner
-	if targetIsOwner {
-		currentIsOwner, err := v.isProjectOwner(ctx, currentUser, projectID)
-		if err != nil {
-			return err
-		}
-
-		if !currentIsOwner {
-			return fmt.Errorf("insufficient permissions: cannot edit owner users")
-		}
-
-		return nil
-	}
-
-	// Owners can edit anyone
+func (v *PermissionValidator) checkUserHierarchy(ctx context.Context, currentUser, targetUser *ent.User, projectID *int) error {
 	currentIsOwner, err := v.isProjectOwner(ctx, currentUser, projectID)
 	if err != nil {
 		return err
 	}
-
 	if currentIsOwner {
 		return nil
+	}
+
+	targetIsOwner, err := v.isProjectOwner(ctx, targetUser, projectID)
+	if err != nil {
+		return err
+	}
+	if targetIsOwner {
+		return privacy.Denyf("insufficient permissions: cannot edit owner users")
 	}
 
 	// Get both users' scopes
@@ -205,22 +242,111 @@ func (v *PermissionValidator) CanEditUserPermissions(ctx context.Context, target
 	// Check if all target user's scopes are within current user's permissions
 	for _, scope := range targetUserScopes {
 		if !currentScopeSet[scope] {
-			return fmt.Errorf("insufficient permissions: target user has scope '%s' that you don't possess", scope)
+			return privacy.Denyf("insufficient permissions: target user has scope '%s' that you don't possess", scope)
 		}
 	}
 
 	return nil
 }
 
+// canManageUserAccount checks the permissions acquired or interrupted by changes
+// to login credentials or account status, including the target's project access.
+func (v *PermissionValidator) canManageUserAccount(ctx context.Context, target *ent.User) error {
+	caller, ok := contexts.GetUser(ctx)
+	if !ok || caller == nil {
+		return privacy.Denyf("user not found in context")
+	}
+	for _, membership := range target.Edges.ProjectUsers {
+		if err := v.checkUserHierarchy(ctx, caller, target, &membership.ProjectID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CanEditRole checks if the current user can edit a role.
 func (v *PermissionValidator) CanEditRole(ctx context.Context, roleID int, projectID *int) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := v.entFromContext(ctx)
-
-	role, err := client.Role.Get(ctx, roleID)
+	role, err := authz.RunAsHost(ctx, v.entFromContext(ctx), "permission-check", func(bypassCtx context.Context) (*ent.Role, error) {
+		client := v.entFromContext(bypassCtx)
+		return client.Role.Get(bypassCtx, roleID)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get role: %w", err)
 	}
+	if projectID != nil && (role.IsSystemRole() || *role.ProjectID != *projectID) {
+		return privacy.Denyf("role does not belong to the project")
+	}
+	if projectID == nil && !role.IsSystemRole() {
+		projectID = role.ProjectID
+	}
 
 	return v.CanGrantRole(ctx, role.Scopes, projectID)
+}
+
+// CanDeleteProject checks if the current user can delete a project.
+// Rule: Only system owners can delete a project.
+func (v *PermissionValidator) CanDeleteProject(ctx context.Context, projectID int) error {
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return fmt.Errorf("user not found in context")
+	}
+
+	// Only system owners can delete projects
+	if !scopes.IsDirectOwner(ctx) {
+		return fmt.Errorf("insufficient permissions: only system owners can delete projects")
+	}
+
+	return nil
+}
+
+// CanDeleteUser checks if the current user can delete a user.
+// Rule: Only system owners can delete users, and cannot delete themselves.
+func (v *PermissionValidator) CanDeleteUser(ctx context.Context, targetUserID int) error {
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return fmt.Errorf("user not found in context")
+	}
+
+	// Cannot delete yourself
+	if currentUser.ID == targetUserID {
+		return fmt.Errorf("cannot delete yourself")
+	}
+
+	// Only system owners can delete users
+	if !scopes.IsDirectOwner(ctx) {
+		return fmt.Errorf("insufficient permissions: only system owners can delete users")
+	}
+
+	return nil
+}
+
+// ownerChange returns the owner value authorized for persistence. An unchanged
+// value must be omitted from the write so it cannot overwrite a concurrent change.
+func (v *PermissionValidator) ownerChange(ctx context.Context, projectID *int, requested *bool, current bool) (*bool, error) {
+	if requested == nil {
+		return nil, nil
+	}
+	if identity.IsPlugin(ctx) {
+		return nil, privacy.Denyf("plugin cannot change owner authority")
+	}
+	if *requested == current {
+		return nil, nil
+	}
+	if scopes.IsDirectOwner(ctx) {
+		return requested, nil
+	}
+	if projectID == nil {
+		return nil, privacy.Denyf("only system owners can change system ownership")
+	}
+
+	if caller, ok := contexts.GetUser(ctx); ok && caller != nil {
+		isOwner, err := v.isProjectOwner(ctx, caller, projectID)
+		if err != nil {
+			return nil, err
+		}
+		if isOwner {
+			return requested, nil
+		}
+	}
+	return nil, privacy.Denyf("only owners of this project or system owners can change project ownership")
 }

@@ -7,6 +7,13 @@ import tanstackRouter from '@tanstack/router-plugin/vite';
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: './',
+  experimental: {
+    // Keep Vite preview working on deep routes. The server prefixes these URLs when it serves index.html.
+    renderBuiltUrl(filename, { hostType }) {
+      if (hostType === 'html') return `/${filename}`;
+    },
+  },
   plugins: [
     tanstackRouter({
       target: 'react',
@@ -36,6 +43,15 @@ export default defineConfig({
       '/admin': {
         target: process.env.VITE_API_URL || 'http://localhost:8090',
         changeOrigin: true,
+      },
+      '/oauth': {
+        target: process.env.VITE_API_URL || 'http://localhost:8090',
+        changeOrigin: true,
+        bypass: (req) => {
+          if (req.url?.includes('idp-callback')) {
+            return req.url;
+          }
+        },
       },
       '/v1': {
         target: process.env.VITE_API_URL || 'http://localhost:8090',

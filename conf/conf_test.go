@@ -1,0 +1,410 @@
+package conf
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	"go.uber.org/zap/zapcore"
+)
+
+func TestExplicitConfigFileSkipsSearchPaths(t *testing.T) {
+	t.Cleanup(func() { SetConfigFile("") })
+
+	searchDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(searchDir, "config.yml"), []byte("server:\n  port: 1111\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(searchDir)
+
+	explicit := writeTestConfig(t, "server:\n  host: 127.0.0.1\n  port: 18090\n")
+	SetConfigFile(explicit)
+
+	cfg, loader, err := NewLoader()
+	if err != nil {
+		t.Fatalf("NewLoader() error = %v", err)
+	}
+	if cfg.APIServer.Host != "127.0.0.1" || cfg.APIServer.Port != 18090 {
+		t.Fatalf("explicit file host = %q port = %d, want 127.0.0.1:18090", cfg.APIServer.Host, cfg.APIServer.Port)
+	}
+	abs, err := filepath.Abs(explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loader.ConfigFile() != abs {
+		t.Fatalf("ConfigFile() = %q, want %q", loader.ConfigFile(), abs)
+	}
+
+	SetConfigFile("")
+	searched, _, err := NewLoader()
+	if err != nil {
+		t.Fatalf("search NewLoader() error = %v", err)
+	}
+	if searched.APIServer.Port != 1111 {
+		t.Fatalf("search port = %d, want 1111", searched.APIServer.Port)
+	}
+}
+
+func TestExplicitConfigFileMissingDoesNotSearch(t *testing.T) {
+	t.Cleanup(func() { SetConfigFile("") })
+
+	searchDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(searchDir, "config.yml"), []byte("server:\n  port: 2222\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(searchDir)
+
+	SetConfigFile(filepath.Join(t.TempDir(), "missing.yml"))
+	if _, _, err := NewLoader(); err == nil {
+		t.Fatal("missing explicit config file was ignored and a search path was used")
+	}
+}
+
+func TestLoaderReloadUsesFreshViper(t *testing.T) {
+	configFile := writeTestConfig(t, `
+log:
+  level: info
+`)
+	loader := &Loader{configFile: configFile}
+
+	initial, err := loader.Reload()
+	if err != nil {
+		t.Fatalf("initial Reload() error = %v", err)
+	}
+	if initial.Log.Level != zapcore.InfoLevel {
+		t.Fatalf("initial log level = %s, want %s", initial.Log.Level, zapcore.InfoLevel)
+	}
+
+	if err := os.WriteFile(configFile, []byte(`
+log:
+  level: debug
+`), 0o600); err != nil {
+		t.Fatalf("rewrite test config: %v", err)
+	}
+
+	reloaded, err := loader.Reload()
+	if err != nil {
+		t.Fatalf("reloaded Reload() error = %v", err)
+	}
+	if reloaded.Log.Level != zapcore.DebugLevel {
+		t.Fatalf("reloaded log level = %s, want %s", reloaded.Log.Level, zapcore.DebugLevel)
+	}
+}
+
+func TestSSEKeepAliveConfig(t *testing.T) {
+	configFile := writeTestConfig(t, `
+server:
+  sse_keep_alive:
+    enabled: true
+    interval: 30s
+`)
+
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if !cfg.APIServer.SSEKeepAlive.Enabled {
+		t.Fatal("SSE keep-alive should be enabled")
+	}
+	if cfg.APIServer.SSEKeepAlive.Interval != 30*time.Second {
+		t.Fatalf("SSE keep-alive interval = %s, want 30s", cfg.APIServer.SSEKeepAlive.Interval)
+	}
+}
+
+func TestSSEKeepAliveDefaultsToDisabled(t *testing.T) {
+	configFile := writeTestConfig(t, "")
+
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.APIServer.SSEKeepAlive.Enabled {
+		t.Fatal("SSE keep-alive should default to disabled")
+	}
+	if cfg.APIServer.SSEKeepAlive.Interval != 15*time.Second {
+		t.Fatalf("SSE keep-alive interval = %s, want 15s", cfg.APIServer.SSEKeepAlive.Interval)
+	}
+}
+
+func TestMetricsExporterConfigFromEnvironment(t *testing.T) {
+	t.Setenv("AXONHUB_METRICS_ENABLED", "true")
+	t.Setenv("AXONHUB_METRICS_EXPORTER_TYPE", "otlphttp")
+	t.Setenv("AXONHUB_METRICS_EXPORTER_ENDPOINT", "alloy.alloy.svc.cluster.local:4318")
+	t.Setenv("AXONHUB_METRICS_EXPORTER_INSECURE", "true")
+
+	configFile := writeTestConfig(t, "")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if !cfg.Metrics.Enabled {
+		t.Fatal("metrics should be enabled")
+	}
+	if cfg.Metrics.Exporter.Type != "otlphttp" {
+		t.Fatalf("metrics exporter type = %q, want %q", cfg.Metrics.Exporter.Type, "otlphttp")
+	}
+	if cfg.Metrics.Exporter.Endpoint != "alloy.alloy.svc.cluster.local:4318" {
+		t.Fatalf(
+			"metrics exporter endpoint = %q, want %q",
+			cfg.Metrics.Exporter.Endpoint,
+			"alloy.alloy.svc.cluster.local:4318",
+		)
+	}
+	if !cfg.Metrics.Exporter.Insecure {
+		t.Fatal("metrics exporter should use an insecure connection")
+	}
+}
+
+func TestPprofDefaultsToDisabledOnLoopback(t *testing.T) {
+	configFile := writeTestConfig(t, "")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.APIServer.Pprof.Enabled {
+		t.Fatal("pprof should default to disabled")
+	}
+	if cfg.APIServer.Pprof.Addr != "127.0.0.1:6060" {
+		t.Fatalf("pprof addr = %q, want %q", cfg.APIServer.Pprof.Addr, "127.0.0.1:6060")
+	}
+}
+
+func TestPprofConfigFromEnvironment(t *testing.T) {
+	t.Setenv("AXONHUB_SERVER_PPROF_ENABLED", "true")
+	t.Setenv("AXONHUB_SERVER_PPROF_ADDR", "127.0.0.1:7070")
+
+	configFile := writeTestConfig(t, "")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if !cfg.APIServer.Pprof.Enabled {
+		t.Fatal("pprof should be enabled from environment")
+	}
+	if cfg.APIServer.Pprof.Addr != "127.0.0.1:7070" {
+		t.Fatalf("pprof addr = %q, want %q", cfg.APIServer.Pprof.Addr, "127.0.0.1:7070")
+	}
+}
+
+func TestTraceExtractionDefaultsToEnabled(t *testing.T) {
+	configFile := writeTestConfig(t, "")
+
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	trace := cfg.APIServer.Trace
+	if !trace.ClaudeCodeTraceEnabled {
+		t.Error("Claude Code trace extraction should default to enabled")
+	}
+	if !trace.CodexTraceEnabled {
+		t.Error("Codex trace extraction should default to enabled")
+	}
+	if !trace.OpenCodeTraceEnabled {
+		t.Error("OpenCode trace extraction should default to enabled")
+	}
+}
+
+func writeTestConfig(t *testing.T, contents string) string {
+	t.Helper()
+
+	configFile := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	return configFile
+}
+
+func TestSafeguardsConfigDefaults(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.APIServer.Safeguards
+	if got.Policy != "" || got.EscalateOnDenial || got.ClassifierModel != "" || len(got.FallbackModels) != 0 || got.AttemptTimeout != 0 || got.Timeout != 30*time.Second || got.MaxTokens != 4096 || got.TranscriptCharBudget != 24000 {
+		t.Fatalf("unexpected safeguards defaults: %+v", got)
+	}
+}
+
+func TestSafeguardsConfigEnvironmentOverridesYAML(t *testing.T) {
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_POLICY", "Allow feature branch updates.\nFlag secret disclosure.")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_ESCALATE_ON_DENIAL", "true")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_CLASSIFIER_MODEL", " gemini-3.8-flash ")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_FALLBACK_MODELS", `[" codex-auto-review ","backup"]`)
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_ATTEMPT_TIMEOUT", "4s")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_TIMEOUT", "12s")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_MAX_TOKENS", "2048")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_TRANSCRIPT_CHAR_BUDGET", "12000")
+	for _, source := range []string{"", `server:
+  safeguards:
+    classifier_model: other-model
+    policy: YAML policy
+    fallback_models: [other-backup]
+    attempt_timeout: 5s
+    timeout: 20s
+    max_tokens: 1024
+    transcript_char_budget: 6000
+`} {
+		cfg, _, err := loadConfig(writeTestConfig(t, source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := cfg.APIServer.Safeguards
+		if got.Policy != "Allow feature branch updates.\nFlag secret disclosure." {
+			t.Fatalf("policy environment override was not applied: %q", got.Policy)
+		}
+		if !got.EscalateOnDenial || got.ClassifierModel != "gemini-3.8-flash" || !slices.Equal(got.FallbackModels, []string{"codex-auto-review", "backup"}) || got.AttemptTimeout != 4*time.Second || got.Timeout != 12*time.Second || got.MaxTokens != 2048 || got.TranscriptCharBudget != 12000 {
+			t.Fatalf("environment overrides were not applied: %+v", got)
+		}
+	}
+}
+
+func TestSafeguardsPolicyYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, `server:
+  safeguards:
+    policy: |
+      Allow feature branch updates.
+      Flag secret disclosure.
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.APIServer.Safeguards.Policy; got != "Allow feature branch updates.\nFlag secret disclosure.\n" {
+		t.Fatalf("multiline policy was not preserved: %q", got)
+	}
+}
+
+func TestSafeguardsPolicyEmptyEnvironmentOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name, value, want string
+	}{
+		{name: "empty preserves YAML", value: "", want: "YAML policy"},
+		{name: "whitespace overrides YAML", value: " \n\t", want: " \n\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AXONHUB_SERVER_SAFEGUARDS_POLICY", tc.value)
+			cfg, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    policy: YAML policy\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.APIServer.Safeguards.Policy; got != tc.want {
+				t.Fatalf("unexpected policy for environment value %q: got %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSafeguardsConfigRejectsInvalidLimits(t *testing.T) {
+	for _, config := range []string{
+		"timeout: 0s", "timeout: -1s", "timeout: 121s", "timeout: invalid",
+		"max_tokens: 0", "max_tokens: 16385",
+		"attempt_timeout: -1s", "attempt_timeout: 121s", "attempt_timeout: invalid",
+		`fallback_models: [" "]`, `fallback_models: ["backup", " backup "]`,
+		"classifier_model: primary\n    fallback_models: [primary]",
+		"transcript_char_budget: 0", "transcript_char_budget: 1000001",
+	} {
+		t.Run(config, func(t *testing.T) {
+			_, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    "+config+"\n"))
+			if err == nil {
+				t.Fatalf("expected error for %s", config)
+			}
+		})
+	}
+}
+
+func TestSafeguardsFallbackYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, `server:
+  safeguards:
+    classifier_model: " codex-auto-review "
+    fallback_models:
+      - " gemini-3.8-flash "
+      - other-reviewer
+    attempt_timeout: 10s
+    timeout: 30s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.APIServer.Safeguards
+	if got.ClassifierModel != "codex-auto-review" || !slices.Equal(got.FallbackModels, []string{"gemini-3.8-flash", "other-reviewer"}) || got.AttemptTimeout != 10*time.Second || got.Timeout != 30*time.Second {
+		t.Fatalf("unexpected fallback configuration: %+v", got)
+	}
+}
+
+func TestSafeguardsEscalationYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    escalate_on_denial: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.APIServer.Safeguards.EscalateOnDenial {
+		t.Fatal("YAML escalation toggle ignored")
+	}
+}
+
+func TestLLMTimeoutConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name, config          string
+		request, stream, idle time.Duration
+		invalid               bool
+	}{
+		{"defaults", "", 600 * time.Second, 1800 * time.Second, 600 * time.Second, false},
+		{"disabled", "server:\n  llm_request_timeout: 0s\n  llm_stream_request_timeout: 0s\n  llm_stream_idle_timeout: 0s\n", 0, 0, 0, false},
+		{"custom", "server:\n  llm_request_timeout: 5m\n  llm_stream_request_timeout: 40m\n  llm_stream_idle_timeout: 20s\n", 5 * time.Minute, 40 * time.Minute, 20 * time.Second, false},
+		{"negative total", "server:\n  llm_request_timeout: -1s\n", 0, 0, 0, true},
+		{"negative streaming total", "server:\n  llm_stream_request_timeout: -1s\n", 0, 0, 0, true},
+		{"independent streaming disable", "server:\n  llm_stream_request_timeout: 0s\n", 600 * time.Second, 0, 600 * time.Second, false},
+		{"independent non-streaming disable", "server:\n  llm_request_timeout: 0s\n", 0, 1800 * time.Second, 600 * time.Second, false},
+		{"negative idle", "server:\n  llm_stream_idle_timeout: -1s\n", 0, 0, 0, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _, err := loadConfig(writeTestConfig(t, tt.config))
+			if tt.invalid {
+				if err == nil {
+					t.Fatal("expected invalid timeout error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if cfg.APIServer.LLMRequestTimeout != tt.request || cfg.APIServer.LLMStreamRequestTimeout != tt.stream || cfg.APIServer.LLMStreamIdleTimeout != tt.idle {
+				t.Fatalf("LLM timeouts = (%s, %s, %s), want (%s, %s, %s)", cfg.APIServer.LLMRequestTimeout, cfg.APIServer.LLMStreamRequestTimeout, cfg.APIServer.LLMStreamIdleTimeout, tt.request, tt.stream, tt.idle)
+			}
+		})
+	}
+}
+
+func TestLLMTimeoutConfigFromEnvironment(t *testing.T) {
+	t.Setenv("AXONHUB_SERVER_LLM_REQUEST_TIMEOUT", "0s")
+	t.Setenv("AXONHUB_SERVER_LLM_STREAM_IDLE_TIMEOUT", "45s")
+	t.Setenv("AXONHUB_SERVER_LLM_STREAM_REQUEST_TIMEOUT", "25m")
+	cfg, _, err := loadConfig(writeTestConfig(t, ""))
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.APIServer.LLMRequestTimeout != 0 || cfg.APIServer.LLMStreamRequestTimeout != 25*time.Minute || cfg.APIServer.LLMStreamIdleTimeout != 45*time.Second {
+		t.Fatalf("LLM timeouts = (%s, %s, %s), want (0s, 25m, 45s)", cfg.APIServer.LLMRequestTimeout, cfg.APIServer.LLMStreamRequestTimeout, cfg.APIServer.LLMStreamIdleTimeout)
+	}
+}
+
+func TestServerBasePathConfig(t *testing.T) {
+	configFile := writeTestConfig(t, "server:\n  base_path: /tools/axonhub/\n")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil || cfg.APIServer.BasePath != "/tools/axonhub" {
+		t.Fatalf("YAML base_path = %q, error = %v", cfg.APIServer.BasePath, err)
+	}
+
+	t.Setenv("AXONHUB_SERVER_BASE_PATH", "/gateway/")
+	cfg, _, err = loadConfig(configFile)
+	if err != nil || cfg.APIServer.BasePath != "/gateway" {
+		t.Fatalf("environment base_path = %q, error = %v", cfg.APIServer.BasePath, err)
+	}
+
+	t.Setenv("AXONHUB_SERVER_BASE_PATH", "https://example.com")
+	if _, _, err = loadConfig(configFile); err == nil {
+		t.Fatal("invalid base_path was accepted")
+	}
+}

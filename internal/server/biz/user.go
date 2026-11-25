@@ -3,16 +3,20 @@ package biz
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/samber/lo"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/ent/userproject"
+	"github.com/looplj/axonhub/internal/ent/userrole"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
@@ -21,14 +25,16 @@ import (
 type UserServiceParams struct {
 	fx.In
 
-	CacheConfig xcache.Config
-	Ent         *ent.Client
+	CacheConfig   xcache.Config
+	Ent           *ent.Client
+	APIKeyService *APIKeyService
 }
 
 type UserService struct {
 	*AbstractService
 
 	UserCache           xcache.Cache[ent.User]
+	apiKeyService       *APIKeyService
 	permissionValidator *PermissionValidator
 }
 
@@ -38,19 +44,37 @@ func NewUserService(params UserServiceParams) *UserService {
 			db: params.Ent,
 		},
 		UserCache:           xcache.NewFromConfig[ent.User](params.CacheConfig),
+		apiKeyService:       params.APIKeyService,
 		permissionValidator: NewPermissionValidator(),
 	}
 }
 
 // CreateUser creates a new user with hashed password.
 func (s *UserService) CreateUser(ctx context.Context, input ent.CreateUserInput) (*ent.User, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	if len(input.Scopes) > 0 {
+		if err := s.permissionValidator.CanGrantScopes(ctx, input.Scopes, nil); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
+		}
+	}
+	for _, roleID := range input.RoleIDs {
+		if err := s.permissionValidator.CanEditRole(ctx, roleID, nil); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
+		}
+	}
+
 	client := s.entFromContext(ctx)
 
 	// Hash the password
-	hashedPassword, err := HashPassword(input.Password)
-	if err != nil {
-		return nil, err
+	var hashedPassword string
+	if input.Password == OIDC_ONLY_PLACEHOLDER {
+		hashedPassword = OIDC_ONLY_PLACEHOLDER
+	} else {
+		var err error
+
+		hashedPassword, err = HashPassword(input.Password)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	mut := client.User.Create().
@@ -74,8 +98,20 @@ func (s *UserService) CreateUser(ctx context.Context, input ent.CreateUserInput)
 
 // UpdateUser updates an existing user.
 func (s *UserService) UpdateUser(ctx context.Context, id int, input ent.UpdateUserInput) (*ent.User, error) {
-	// Validate permissions before updating
-	if err := s.permissionValidator.CanEditUserPermissions(ctx, id, nil); err != nil {
+	targetUser, err := s.permissionValidator.editableUser(ctx, id, nil)
+	if err != nil {
+		return nil, fmt.Errorf("permission denied: %w", err)
+	}
+	if input.Email != nil && *input.Email == targetUser.Email {
+		input.Email = nil
+	}
+	if input.Password != nil || input.Email != nil {
+		if err := s.permissionValidator.canManageUserAccount(ctx, targetUser); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
+		}
+	}
+	ownerChange, err := s.permissionValidator.ownerChange(ctx, nil, input.IsOwner, targetUser.IsOwner)
+	if err != nil {
 		return nil, fmt.Errorf("permission denied: %w", err)
 	}
 
@@ -86,23 +122,31 @@ func (s *UserService) UpdateUser(ctx context.Context, id int, input ent.UpdateUs
 		}
 	}
 
-	// Validate role grants if roles are being added
-	if input.AddRoleIDs != nil {
-		for _, roleID := range input.AddRoleIDs {
-			if err := s.permissionValidator.CanEditRole(ctx, roleID, nil); err != nil {
-				return nil, fmt.Errorf("permission denied: %w", err)
-			}
+	if len(input.AppendScopes) > 0 {
+		if err := s.permissionValidator.CanGrantScopes(ctx, input.AppendScopes, nil); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
 		}
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	roleIDsToAdd := lo.Without(input.AddRoleIDs, input.RemoveRoleIDs...)
+	roleIDsToRemove := input.RemoveRoleIDs
+	if input.ClearRoles {
+		// Remove only the assignments covered by this permission check.
+		roleIDsToRemove = lo.Map(targetUser.Edges.Roles, func(role *ent.Role, _ int) int { return role.ID })
+	}
+	for _, roleID := range lo.Uniq(slices.Concat(input.AddRoleIDs, roleIDsToRemove)) {
+		if err := s.permissionValidator.CanEditRole(ctx, roleID, nil); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
+		}
+	}
+
 	client := s.entFromContext(ctx)
 
 	mut := client.User.UpdateOneID(id).
 		SetNillableEmail(input.Email).
 		SetNillableFirstName(input.FirstName).
 		SetNillableLastName(input.LastName).
-		SetNillableIsOwner(input.IsOwner).
+		SetNillableIsOwner(ownerChange).
 		SetNillablePreferLanguage(input.PreferLanguage)
 
 	if input.ClearAvatar {
@@ -132,16 +176,11 @@ func (s *UserService) UpdateUser(ctx context.Context, id int, input ent.UpdateUs
 		mut.ClearScopes()
 	}
 
-	if input.AddRoleIDs != nil {
-		mut.AddRoleIDs(input.AddRoleIDs...)
+	if len(roleIDsToRemove) > 0 {
+		mut.RemoveRoleIDs(roleIDsToRemove...)
 	}
-
-	if input.RemoveRoleIDs != nil {
-		mut.RemoveRoleIDs(input.RemoveRoleIDs...)
-	}
-
-	if input.ClearRoles {
-		mut.ClearRoles()
+	if len(roleIDsToAdd) > 0 {
+		mut.AddRoleIDs(roleIDsToAdd...)
 	}
 
 	user, err := mut.Save(ctx)
@@ -149,34 +188,104 @@ func (s *UserService) UpdateUser(ctx context.Context, id int, input ent.UpdateUs
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
-	// Invalidate cache
-	s.invalidateUserCache(ctx, id)
+	runAfterCommit(ctx, func(ctx context.Context) {
+		s.invalidateUserCache(ctx, id)
+	})
 
 	return user, nil
+}
+
+// UpdateOwnProfile updates fields users are allowed to change for their own account.
+func (s *UserService) UpdateOwnProfile(ctx context.Context, input ent.UpdateUserInput) (*ent.User, error) {
+	if err := authz.RequireDirectUser(ctx); err != nil {
+		return nil, err
+	}
+
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return nil, fmt.Errorf("user not found in context")
+	}
+
+	id := currentUser.ID
+
+	return authz.RunWithSystemBypass(ctx, "update-own-profile", func(ctx context.Context) (*ent.User, error) {
+		client := s.entFromContext(ctx)
+
+		mut := client.User.UpdateOneID(id).
+			SetNillableFirstName(input.FirstName).
+			SetNillableLastName(input.LastName).
+			SetNillablePreferLanguage(input.PreferLanguage)
+
+		if input.ClearAvatar {
+			mut.ClearAvatar()
+		} else {
+			mut.SetNillableAvatar(input.Avatar)
+		}
+
+		if input.Password != nil {
+			hashedPassword, err := HashPassword(*input.Password)
+			if err != nil {
+				return nil, err
+			}
+
+			mut.SetPassword(hashedPassword)
+		}
+
+		user, err := mut.Save(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update user profile: %w", err)
+		}
+
+		// Invalidate cache
+		s.invalidateUserCache(ctx, id)
+
+		return user, nil
+	})
 }
 
 // UpdateUserStatus updates the status of a user.
 func (s *UserService) UpdateUserStatus(ctx context.Context, id int, status user.Status) (*ent.User, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := s.entFromContext(ctx)
+	var updatedUser *ent.User
 
-	user, err := client.User.UpdateOneID(id).
-		SetStatus(status).
-		Save(ctx)
+	err := s.RunInTransaction(ctx, func(ctx context.Context) error {
+		target, err := s.permissionValidator.editableUser(ctx, id, nil)
+		if err != nil {
+			return fmt.Errorf("permission denied: %w", err)
+		}
+		if err := s.permissionValidator.canManageUserAccount(ctx, target); err != nil {
+			return fmt.Errorf("permission denied: %w", err)
+		}
+		client := s.entFromContext(ctx)
+
+		result, err := client.User.UpdateOneID(id).
+			SetStatus(status).
+			Save(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to update user status: %w", err)
+		}
+		updatedUser = result
+
+		if status == user.StatusDeactivated {
+			if err := s.apiKeyService.disablePersonalAPIKeysByUser(ctx, id); err != nil {
+				return fmt.Errorf("failed to disable user personal API keys: %w", err)
+			}
+		}
+
+		runAfterCommit(ctx, func(ctx context.Context) {
+			s.invalidateUserCache(ctx, id)
+		})
+
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update user status: %w", err)
+		return nil, err
 	}
 
-	// Invalidate cache
-	s.invalidateUserCache(ctx, id)
-
-	return user, nil
+	return updatedUser, nil
 }
 
 // GetUserByID gets a user by ID with caching.
 func (s *UserService) GetUserByID(ctx context.Context, id int) (*ent.User, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
 	// Try cache first
 	cacheKey := buildUserCacheKey(id)
 	if user, err := s.UserCache.Get(ctx, cacheKey); err == nil {
@@ -194,6 +303,7 @@ func (s *UserService) GetUserByID(ctx context.Context, id int) (*ent.User, error
 		WithRoles().
 		WithProjects().
 		WithProjectUsers().
+		WithOidcIdentities().
 		Only(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
@@ -270,19 +380,39 @@ func ConvertUserToUserInfo(ctx context.Context, u *ent.User) *objects.UserInfo {
 	for _, up := range u.Edges.ProjectUsers {
 		// Convert project roles to objects.RoleInfo
 		roles := projectRoles[up.ProjectID]
+		effectiveScopeSet := make(map[string]bool, len(up.Scopes))
+		for _, scope := range up.Scopes {
+			effectiveScopeSet[scope] = true
+		}
 
 		projectRoleInfos := make([]objects.RoleInfo, 0, len(roles))
 		for _, r := range roles {
 			projectRoleInfos = append(projectRoleInfos, objects.RoleInfo{
 				Name: r.Name,
 			})
+			for _, scope := range r.Scopes {
+				effectiveScopeSet[scope] = true
+			}
 		}
 
 		userProjects = append(userProjects, objects.UserProjectInfo{
-			ProjectID: objects.GUID{Type: ent.TypeProject, ID: up.ProjectID},
-			IsOwner:   up.IsOwner,
-			Scopes:    up.Scopes,
-			Roles:     projectRoleInfos,
+			ProjectID:       objects.GUID{Type: ent.TypeProject, ID: up.ProjectID},
+			IsOwner:         up.IsOwner,
+			Scopes:          up.Scopes,
+			EffectiveScopes: lo.Keys(effectiveScopeSet),
+			Roles:           projectRoleInfos,
+		})
+	}
+
+	// Convert OIDC identities
+	oidcIdentities := make([]objects.OIDCIdentityInfo, 0, len(u.Edges.OidcIdentities))
+	for _, identity := range u.Edges.OidcIdentities {
+		oidcIdentities = append(oidcIdentities, objects.OIDCIdentityInfo{
+			ID:      objects.GUID{Type: ent.TypeOIDCIdentity, ID: identity.ID},
+			IdpName: identity.IdpName,
+			Issuer:  identity.Issuer,
+			Subject: identity.Subject,
+			Email:   identity.Email,
 		})
 	}
 
@@ -297,89 +427,107 @@ func ConvertUserToUserInfo(ctx context.Context, u *ent.User) *objects.UserInfo {
 		Scopes:         lo.Keys(allScopes),
 		Roles:          userRoles,
 		Projects:       userProjects,
+		OIDCIdentities: oidcIdentities,
+		HasPassword:    u.Password != OIDC_ONLY_PLACEHOLDER,
 	}
 }
 
 // AddUserToProject adds a user to a project with optional owner status, scopes, and roles.
 func (s *UserService) AddUserToProject(ctx context.Context, userID, projectID int, isOwner *bool, scopes []string, roleIDs []int) (*ent.UserProject, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := s.entFromContext(ctx)
-
-	// Create the project user relationship
-	mut := client.UserProject.Create().
-		SetUserID(userID).
-		SetProjectID(projectID)
-
-	if isOwner != nil {
-		mut.SetIsOwner(*isOwner)
-	}
-
-	if scopes != nil {
-		mut.SetScopes(scopes)
-	}
-
-	userProject, err := mut.Save(ctx)
+	ownerChange, err := s.permissionValidator.ownerChange(ctx, &projectID, isOwner, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to add user to project: %w", err)
+		return nil, fmt.Errorf("permission denied: %w", err)
+	}
+	principal, hasPrincipal := authz.GetPrincipal(ctx)
+	if !hasPrincipal || !principal.IsTest() {
+		if scopes != nil {
+			if err := s.permissionValidator.CanGrantScopes(ctx, scopes, &projectID); err != nil {
+				return nil, fmt.Errorf("permission denied: %w", err)
+			}
+		}
+		for _, roleID := range roleIDs {
+			projectRole, err := authz.RunAsHost(ctx, s.entFromContext(ctx), "project-role-assignment", func(ctx context.Context) (*ent.Role, error) {
+				return s.entFromContext(ctx).Role.Query().Where(role.IDEQ(roleID), role.ProjectIDEQ(projectID)).Only(ctx)
+			})
+			if err != nil {
+				if ent.IsNotFound(err) {
+					return nil, fmt.Errorf("project role %d not found", roleID)
+				}
+				return nil, fmt.Errorf("failed to load project role %d: %w", roleID, err)
+			}
+			if err := s.permissionValidator.CanGrantRole(ctx, projectRole.Scopes, &projectID); err != nil {
+				return nil, fmt.Errorf("permission denied: %w", err)
+			}
+		}
 	}
 
-	// Add roles if provided
-	if len(roleIDs) > 0 {
-		user, err := client.User.Get(ctx, userID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get user: %w", err)
+	var userProject *ent.UserProject
+	err = s.RunInTransaction(ctx, func(ctx context.Context) error {
+		client := s.entFromContext(ctx)
+		mut := client.UserProject.Create().
+			SetUserID(userID).
+			SetProjectID(projectID).
+			SetNillableIsOwner(ownerChange)
+
+		if scopes != nil {
+			mut.SetScopes(scopes)
 		}
 
-		err = user.Update().AddRoleIDs(roleIDs...).Exec(ctx)
+		created, err := mut.Save(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to add roles to user: %w", err)
+			return fmt.Errorf("failed to add user to project: %w", err)
 		}
+		userProject = created
+
+		return updateAuthorizedProjectUserRoles(ctx, client, userID, roleIDs, nil)
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	// Invalidate user cache
-	s.invalidateUserCache(ctx, userID)
+	runAfterCommit(ctx, func(ctx context.Context) {
+		s.invalidateUserCache(ctx, userID)
+	})
 
 	return userProject, nil
 }
 
 // RemoveUserFromProject removes a user from a project.
 func (s *UserService) RemoveUserFromProject(ctx context.Context, userID, projectID int) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := s.entFromContext(ctx)
+	return s.RunInTransaction(ctx, func(ctx context.Context) error {
+		target, err := s.permissionValidator.editableUser(ctx, userID, &projectID)
+		if err != nil {
+			return fmt.Errorf("permission denied: %w", err)
+		}
 
-	// Delete the relationship (soft delete if enabled)
-	rowsAffected, err := client.UserProject.Delete().Where(
-		userproject.ProjectIDEQ(projectID),
-		userproject.UserIDEQ(userID),
-	).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to remove user from project: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		return nil
-	}
-
-	projectRoleIDs, err := client.Role.Query().
-		Where(
-			role.ProjectIDEQ(projectID),
-			role.HasUsersWith(user.IDEQ(userID)),
-		).
-		IDs(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to query user project roles: %w", err)
-	}
-
-	if len(projectRoleIDs) > 0 {
-		if err := client.User.UpdateOneID(userID).RemoveRoleIDs(projectRoleIDs...).Exec(ctx); err != nil {
+		membership, ok := lo.Find(target.Edges.ProjectUsers, func(m *ent.UserProject) bool {
+			return m.ProjectID == projectID
+		})
+		if !ok {
+			return nil
+		}
+		client := s.entFromContext(ctx)
+		rows, err := client.UserProject.Delete().Where(
+			userproject.IDEQ(membership.ID),
+			userproject.IsOwnerEQ(membership.IsOwner),
+		).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to remove user from project: %w", err)
+		}
+		if rows != 1 {
+			return privacy.Denyf("project member could not be removed or changed concurrently")
+		}
+		if _, err := client.UserRole.Delete().Where(
+			userrole.UserIDEQ(userID),
+			userrole.HasRoleWith(role.ProjectIDEQ(projectID)),
+		).Exec(ctx); err != nil {
 			return fmt.Errorf("failed to remove user project roles: %w", err)
 		}
-	}
-
-	// Invalidate user cache
-	s.invalidateUserCache(ctx, userID)
-
-	return nil
+		runAfterCommit(ctx, func(ctx context.Context) {
+			s.invalidateUserCache(ctx, userID)
+		})
+		return nil
+	})
 }
 
 // UpdateProjectUser updates a user's project relationship including scopes and roles.
@@ -396,68 +544,140 @@ func (s *UserService) UpdateProjectUser(ctx context.Context, userID, projectID i
 		}
 	}
 
-	// Validate role grants if roles are being added
-	if len(addRoleIDs) > 0 {
-		for _, roleID := range addRoleIDs {
-			if err := s.permissionValidator.CanEditRole(ctx, roleID, &projectID); err != nil {
-				return nil, fmt.Errorf("permission denied: %w", err)
-			}
+	for _, roleID := range slices.Concat(addRoleIDs, removeRoleIDs) {
+		if err := s.permissionValidator.CanEditRole(ctx, roleID, &projectID); err != nil {
+			return nil, fmt.Errorf("permission denied: %w", err)
 		}
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := s.entFromContext(ctx)
+	var updated *ent.UserProject
+	outerTx := ent.TxFromContext(ctx)
+	var unwrap bool
+	err := s.RunInTransaction(ctx, func(ctx context.Context) error {
+		unwrap = outerTx == nil && ent.TxFromContext(ctx) != nil
+		client := s.entFromContext(ctx)
+		membership, err := client.UserProject.Query().
+			Where(userproject.UserIDEQ(userID), userproject.ProjectIDEQ(projectID)).
+			Only(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to find user project relationship: %w", err)
+		}
 
-	// Find the UserProject relationship
-	userProject, err := client.UserProject.Query().
-		Where(
-			userproject.UserID(userID),
-			userproject.ProjectID(projectID),
-		).
-		Only(ctx)
+		ownerChange, err := s.permissionValidator.ownerChange(ctx, &projectID, isOwner, membership.IsOwner)
+		if err != nil {
+			return fmt.Errorf("permission denied: %w", err)
+		}
+
+		mut := membership.Update().SetNillableIsOwner(ownerChange)
+		if scopes != nil {
+			mut.SetScopes(scopes)
+		}
+		updated, err = mut.Save(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to update project user: %w", err)
+		}
+
+		return updateAuthorizedProjectUserRoles(ctx, client, userID, addRoleIDs, removeRoleIDs)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to find user project relationship: %w", err)
+		return nil, err
+	}
+	if unwrap {
+		updated.Unwrap()
+	}
+	runAfterCommit(ctx, func(ctx context.Context) {
+		s.invalidateUserCache(ctx, userID)
+	})
+	return updated, nil
+}
+
+// updateAuthorizedProjectUserRoles applies validated role changes after the
+// membership write has passed project authorization in the same transaction.
+func updateAuthorizedProjectUserRoles(ctx context.Context, client *ent.Client, userID int, addRoleIDs, removeRoleIDs []int) error {
+	if len(addRoleIDs) == 0 && len(removeRoleIDs) == 0 {
+		return nil
 	}
 
-	// Update the UserProject (including isOwner, scopes, and roles)
-	mut := userProject.Update()
-
-	if isOwner != nil {
-		mut.SetIsOwner(*isOwner)
-	}
-
-	if scopes != nil {
-		mut.SetScopes(scopes)
-	}
-
-	userProject, err = mut.Save(ctx)
+	_, err := authz.RunAsHost(ctx, client, "update-project-user-roles", func(hostCtx context.Context) (struct{}, error) {
+		user, err := client.User.Get(hostCtx, userID)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("failed to get user: %w", err)
+		}
+		mut := user.Update()
+		if len(addRoleIDs) > 0 {
+			mut.AddRoleIDs(addRoleIDs...)
+		}
+		if len(removeRoleIDs) > 0 {
+			mut.RemoveRoleIDs(removeRoleIDs...)
+		}
+		return struct{}{}, mut.Exec(hostCtx)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update project user: %w", err)
+		return fmt.Errorf("failed to update user roles: %w", err)
+	}
+	return nil
+}
+
+// DeleteUser soft deletes a user and handles all related data.
+// This method performs the following operations:
+// 1. Validates permissions
+// 2. Checks if user is owner (cannot delete owner)
+// 3. Removes user from all projects (UserProject)
+// 4. Removes all user roles (UserRole)
+// 5. Archives the user's personal API keys
+// 6. Soft deletes the user
+// 7. Invalidates user cache.
+func (s *UserService) DeleteUser(ctx context.Context, id int) error {
+	// Validate permissions before deleting
+	if err := s.permissionValidator.CanDeleteUser(ctx, id); err != nil {
+		return fmt.Errorf("permission denied: %w", err)
 	}
 
-	// Update roles if provided
-	user, err := client.User.Get(ctx, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user: %w", err)
-	}
+	return s.RunInTransaction(ctx, func(ctx context.Context) error {
+		client := s.entFromContext(ctx)
 
-	userMut := user.Update()
+		// Get user to check if it's an owner
+		u, err := client.User.Get(ctx, id)
+		if err != nil {
+			return fmt.Errorf("failed to get user: %w", err)
+		}
 
-	if len(addRoleIDs) > 0 {
-		userMut.AddRoleIDs(addRoleIDs...)
-	}
+		// Cannot delete owner users
+		if u.IsOwner {
+			return fmt.Errorf("cannot delete owner user, transfer ownership first")
+		}
 
-	if len(removeRoleIDs) > 0 {
-		userMut.RemoveRoleIDs(removeRoleIDs...)
-	}
+		// 1. Delete UserProject relationships
+		_, err = client.UserProject.Delete().
+			Where(userproject.UserIDEQ(id)).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete user projects: %w", err)
+		}
 
-	err = userMut.Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to update user roles: %w", err)
-	}
+		// 2. Delete UserRole relationships
+		_, err = client.UserRole.Delete().
+			Where(userrole.UserIDEQ(id)).
+			Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete user roles: %w", err)
+		}
 
-	// Invalidate user cache
-	s.invalidateUserCache(ctx, userID)
+		// 3. Archive the user's personal API keys
+		if err = s.apiKeyService.archivePersonalAPIKeysByUser(ctx, id); err != nil {
+			return fmt.Errorf("failed to archive user personal API keys: %w", err)
+		}
 
-	return userProject, nil
+		// 4. Soft delete the user
+		err = client.User.DeleteOneID(id).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete user: %w", err)
+		}
+
+		runAfterCommit(ctx, func(ctx context.Context) {
+			s.invalidateUserCache(ctx, id)
+		})
+
+		return nil
+	})
 }

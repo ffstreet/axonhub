@@ -1,7 +1,20 @@
+// 职责: 提供全局命令菜单，并从侧边栏数据列出可跳转的页面。
+// 关联文件:
+//   frontend/src/sidebar.ts
+//   frontend/src/features/plugins/data/plugin-ui.ts
+//   frontend/src/lib/auth-redirect.ts
+//   frontend/src/routes/__root.tsx
+//   frontend/src/locales/en.json
+//   frontend/src/locales/zh.json
+// 遵循的 Rules:
+//   .agents/rules/frontend-ui.md
+// 注意事项:
+//   /oauth/ 不能挂载本组件。挂载后会请求 PluginUIEntries，401 会把 OIDC 回调页带走。
 import React from 'react';
-import { useNavigate, useRouter } from '@tanstack/react-router';
+import { useLocation, useNavigate, useRouter } from '@tanstack/react-router';
 import { IconArrowRightDashed, IconChevronRight, IconDeviceLaptop, IconMoon, IconSun } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
+import { isAuthExchangePath } from '@/lib/auth-redirect';
 import { useSearch } from '@/context/search-context';
 import { useTheme } from '@/context/theme-context';
 import {
@@ -16,19 +29,31 @@ import {
 import { useSidebarData } from '../sidebar';
 import { ScrollArea } from './ui/scroll-area';
 
-export function CommandMenu() {
-  const router = useRouter();
+// Inner component that uses sidebar data
+function CommandMenuContent({
+  open,
+  setOpen,
+}: {
+  open: boolean;
+  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  const navigate = useNavigate();
   const { setTheme } = useTheme();
-  const { open, setOpen } = useSearch();
   const sidebarData = useSidebarData();
   const { t } = useTranslation();
 
-  // Don't render if router is not available
-  if (!router) {
-    return null;
-  }
-
-  const navigate = useNavigate();
+  // Search every module, not only the one shown in the sidebar.
+  const navGroups = React.useMemo(
+    () =>
+      sidebarData.modules.flatMap((module) =>
+        module.groups.map((group) => ({
+          ...group,
+          key: `${module.id}-${group.id ?? group.title}`,
+          title: [sidebarData.modules.length > 1 ? module.title : '', group.title].filter(Boolean).join(' · '),
+        }))
+      ),
+    [sidebarData.modules]
+  );
 
   const runCommand = React.useCallback(
     (command: () => unknown) => {
@@ -44,16 +69,22 @@ export function CommandMenu() {
       <CommandList>
         <ScrollArea type='hover' className='h-72 pr-1'>
           <CommandEmpty>{t('command.noResults')}</CommandEmpty>
-          {sidebarData.navGroups.map((group) => (
-            <CommandGroup key={group.title} heading={group.title}>
+          {navGroups.map((group) => (
+            <CommandGroup key={group.key} heading={group.title}>
               {group.items.map((navItem, i) => {
                 if (navItem.url)
                   return (
                     <CommandItem
-                      key={`${navItem.url}-${i}`}
-                      value={navItem.title}
+                      key={`${navItem.matchPath || navItem.url}-${i}`}
+                      value={`${navItem.title} ${navItem.matchPath || navItem.url}`}
                       onSelect={() => {
-                        runCommand(() => navigate({ to: navItem.url }));
+                        runCommand(() => {
+                          if (navItem.params) {
+                            void navigate({ to: navItem.url, params: navItem.params } as never);
+                            return;
+                          }
+                          void navigate({ to: navItem.url });
+                        });
                       }}
                     >
                       <div className='mr-2 flex h-4 w-4 items-center justify-center'>
@@ -98,4 +129,31 @@ export function CommandMenu() {
       </CommandList>
     </CommandDialog>
   );
+}
+
+export function CommandMenu() {
+  const router = useRouter();
+  const currentPath = useLocation({ select: (location) => location.pathname });
+  const { open, setOpen } = useSearch();
+
+  // Don't render if router is not available
+  if (!router) {
+    return null;
+  }
+
+  // Don't render on auth pages. The command menu loads plugin navigation
+  // from /admin/graphql, and a 401 there would leave the OIDC callback
+  // before /oauth/oidc/exchange runs.
+  if (
+    currentPath.startsWith('/sign-in') ||
+    currentPath.startsWith('/sign-up') ||
+    currentPath.startsWith('/initialization') ||
+    currentPath.startsWith('/forgot-password') ||
+    currentPath.startsWith('/otp') ||
+    isAuthExchangePath(currentPath)
+  ) {
+    return null;
+  }
+
+  return <CommandMenuContent open={open} setOpen={setOpen} />;
 }

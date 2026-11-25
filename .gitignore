@@ -8,6 +8,7 @@
 !*.*
 !Makefile
 !LICENSE
+!/NOTICE
 !Dockerfile
 !VERSION
 
@@ -106,7 +107,7 @@ bun.lock
 
 # Task files
 # tasks.json
-# tasks/ 
+# tasks/
 
 .kiro
 openspec
@@ -130,9 +131,16 @@ dumps
 .gocache
 
 config.yml
-internal/server/static/dist
+internal/server/static/dist/*
+!internal/server/static/dist/.gitkeep
 *.b64
+*.axplugin
+__pycache__/
 coverage.out
+*.test
+*.backup
+
+.playwright-cli/
 
 # E2E testing artifacts
 scripts/e2e/.e2e-backend.pid
@@ -148,3 +156,28 @@ tools
 mise.toml
 locales_backup
 .sisyphus
+
+# Chunkhound local database
+.chunkhound/
+.superset/
+.snow/
+config.schema.json
+*.db-shm
+*.db-wal
+.agents/summary
+.factory
+.omo/
+.omc/
+.playwright-mcp/
+.ace-tool/
+.omx/
+deploy_dev.sh
+
+# mygo update signing key. The public key lives in cmd/axonhub-desktop/mygo.config.ts.
+mygo-update.key
+
+docs/superpowers/
+docs/superpowers/**
+superpowers/
+superpowers/**
+build/**

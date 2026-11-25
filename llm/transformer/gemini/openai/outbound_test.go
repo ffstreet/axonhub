@@ -2,6 +2,7 @@ package geminioai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -13,6 +14,8 @@ import (
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
+	oaitransformer "github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestNewOutboundTransformer(t *testing.T) {
@@ -143,6 +146,44 @@ func TestNewOutboundTransformerWithConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_AccountIdentity(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		BaseURL:        "https://generativelanguage.googleapis.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gemini-2.5-pro",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
+}
+
+func TestOutboundTransformer_TransformRequest_OmitsMetadataWhenEmpty(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		BaseURL:        "https://generativelanguage.googleapis.com",
+		APIKeyProvider: auth.NewStaticKeyProvider(""),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gemini-2.5-pro",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
 }
 
 func TestThinkingBudget_MarshalJSON(t *testing.T) {
@@ -553,6 +594,228 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 	}
 }
 
+func TestOutboundTransformer_TransformRequest_PreservesGeminiThoughtSignature(t *testing.T) {
+	transformerInterface, err := NewOutboundTransformer("https://generativelanguage.googleapis.com", "test-api-key")
+	require.NoError(t, err)
+
+	transformer := transformerInterface.(*OutboundTransformer)
+
+	httpReq, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model: "gemini-3-pro",
+		Messages: []llm.Message{
+			{
+				Role:               "assistant",
+				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("CgR0ZXN0")),
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "get_weather",
+							Arguments: `{"city":"Shanghai"}`,
+						},
+						Index: 0,
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, httpReq)
+
+	var geminiReq Request
+	require.NoError(t, json.Unmarshal(httpReq.Body, &geminiReq))
+	require.Len(t, geminiReq.Messages, 1)
+	require.Len(t, geminiReq.Messages[0].ToolCalls, 1)
+	require.NotNil(t, geminiReq.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, geminiReq.Messages[0].ToolCalls[0].ExtraContent.Google)
+	require.Equal(
+		t,
+		"CgR0ZXN0",
+		geminiReq.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature,
+	)
+}
+
+func TestOutboundTransformer_TransformRequest_KeepToolCallSignaturePosition(t *testing.T) {
+	transformerInterface, err := NewOutboundTransformer("https://generativelanguage.googleapis.com", "test-api-key")
+	require.NoError(t, err)
+
+	transformer := transformerInterface.(*OutboundTransformer)
+
+	httpReq, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model: "gemini-3-pro",
+		Messages: []llm.Message{
+			{
+				Role:               "assistant",
+				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("CgR0ZXN0")),
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "tool_a",
+							Arguments: "{}",
+						},
+						Index: 0,
+					},
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "tool_b",
+							Arguments: "{}",
+						},
+						Index: 1,
+						TransformerMetadata: map[string]any{
+							oaitransformer.TransformerMetadataKeyGoogleThoughtSignature: *shared.EncodeGeminiThoughtSignature(lo.ToPtr("CgR0ZXN0")),
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, httpReq)
+
+	var geminiReq Request
+	require.NoError(t, json.Unmarshal(httpReq.Body, &geminiReq))
+	require.Len(t, geminiReq.Messages, 1)
+	require.Len(t, geminiReq.Messages[0].ToolCalls, 2)
+	require.Nil(t, geminiReq.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, geminiReq.Messages[0].ToolCalls[1].ExtraContent)
+	require.NotNil(t, geminiReq.Messages[0].ToolCalls[1].ExtraContent.Google)
+	require.Equal(t, "CgR0ZXN0", geminiReq.Messages[0].ToolCalls[1].ExtraContent.Google.ThoughtSignature)
+}
+
+func TestFillGeminiThoughtSignatureForGeminiOpenAIRequest_FallbackByToolCallID(t *testing.T) {
+	prefixed := shared.EncodeGeminiThoughtSignature(lo.ToPtr("CgR0ZXN0"))
+	require.NotNil(t, prefixed)
+
+	src := &llm.Request{
+		Messages: []llm.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "tool_a",
+							Arguments: "{}",
+						},
+						Index: 0,
+					},
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "tool_b",
+							Arguments: "{}",
+						},
+						Index: 1,
+						TransformerMetadata: map[string]any{
+							oaitransformer.TransformerMetadataKeyGoogleThoughtSignature: *prefixed,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	dst := &oaitransformer.Request{
+		Messages: []oaitransformer.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []oaitransformer.ToolCall{
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: oaitransformer.FunctionCall{
+							Name:      "tool_b",
+							Arguments: "{}",
+						},
+						Index: 0,
+					},
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: oaitransformer.FunctionCall{
+							Name:      "tool_a",
+							Arguments: "{}",
+						},
+						Index: 1,
+					},
+				},
+			},
+		},
+	}
+
+	fillGeminiThoughtSignatureForGeminiOpenAIRequest(src, dst)
+
+	require.Len(t, dst.Messages, 1)
+	require.Len(t, dst.Messages[0].ToolCalls, 2)
+	require.NotNil(t, dst.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, dst.Messages[0].ToolCalls[0].ExtraContent.Google)
+	// The raw encoded value is passed through as-is (no prefix decode)
+	require.Equal(t, *prefixed, dst.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
+	require.Nil(t, dst.Messages[0].ToolCalls[1].ExtraContent)
+}
+
+func TestFillGeminiThoughtSignatureForGeminiOpenAIRequest_PreservesValidMetadataSignature(t *testing.T) {
+	prefixed := shared.EncodeGeminiThoughtSignature(lo.ToPtr("CgR0ZXN0"))
+	require.NotNil(t, prefixed)
+
+	src := &llm.Request{
+		Messages: []llm.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "tool_a",
+							Arguments: "{}",
+						},
+						Index: 0,
+						TransformerMetadata: map[string]any{
+							oaitransformer.TransformerMetadataKeyGoogleThoughtSignature: *prefixed,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	dst := &oaitransformer.Request{
+		Messages: []oaitransformer.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []oaitransformer.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: oaitransformer.FunctionCall{
+							Name:      "tool_a",
+							Arguments: "{}",
+						},
+						Index: 0,
+					},
+				},
+			},
+		},
+	}
+
+	fillGeminiThoughtSignatureForGeminiOpenAIRequest(src, dst)
+
+	require.Len(t, dst.Messages, 1)
+	require.Len(t, dst.Messages[0].ToolCalls, 1)
+	require.NotNil(t, dst.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, dst.Messages[0].ToolCalls[0].ExtraContent.Google)
+	// The raw encoded value is passed through as-is (no prefix decode)
+	require.Equal(t, *prefixed, dst.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
+}
+
 func TestTransformRequestWithExtraBody(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -929,4 +1192,67 @@ func TestParseExtraBody(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_FiltersThoughtSignatures(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://generativelanguage.googleapis.com", "test-api-key")
+	require.NoError(t, err)
+	for _, signature := range []struct {
+		name     string
+		value    string
+		accepted bool
+	}{
+		{"gemini", "CgR0ZXN0", true},
+		{"copilot", "V+l5RhjeGPTC", false},
+		{"anthropic", base64.StdEncoding.EncodeToString([]byte("claude-sonnet-5")), false},
+		{"openai", "gAAAA_encrypted", false},
+		{"unknown", "unknown_signature", false},
+	} {
+		for _, source := range []string{"message", "tool", "both"} {
+			t.Run(signature.name+"/"+source, func(t *testing.T) {
+				message := llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{
+					ID: "call_1", Type: "function", Function: llm.FunctionCall{Name: "Read", Arguments: "{}"},
+				}}}
+				if source != "tool" {
+					message.ReasoningSignature = lo.ToPtr(signature.value)
+				}
+				if source != "message" {
+					message.ToolCalls[0].TransformerMetadata = map[string]any{
+						oaitransformer.TransformerMetadataKeyGoogleThoughtSignature: signature.value,
+					}
+				}
+				req, err := transformer.TransformRequest(t.Context(), &llm.Request{Model: "gemini-3-pro", Messages: []llm.Message{message}})
+				require.NoError(t, err)
+				var body Request
+				require.NoError(t, json.Unmarshal(req.Body, &body))
+				extra := body.Messages[0].ToolCalls[0].ExtraContent
+				if signature.accepted {
+					require.NotNil(t, extra)
+					require.NotNil(t, extra.Google)
+					require.Equal(t, signature.value, extra.Google.ThoughtSignature)
+				} else {
+					require.Nil(t, extra)
+				}
+			})
+		}
+	}
+}
+
+func TestOutboundTransformer_TransformRequest_InvalidToolSignatureAllowsValidFallback(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://generativelanguage.googleapis.com", "test-api-key")
+	require.NoError(t, err)
+	req, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model: "gemini-3-pro", Messages: []llm.Message{{
+			Role: "assistant", ReasoningSignature: lo.ToPtr("CgR0ZXN0"), ToolCalls: []llm.ToolCall{{
+				ID: "call_1", Type: "function", Function: llm.FunctionCall{Name: "Read", Arguments: "{}"},
+				TransformerMetadata: map[string]any{oaitransformer.TransformerMetadataKeyGoogleThoughtSignature: "V+l5RhjeGPTC"},
+			}},
+		}},
+	})
+	require.NoError(t, err)
+	var body Request
+	require.NoError(t, json.Unmarshal(req.Body, &body))
+	require.NotNil(t, body.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, body.Messages[0].ToolCalls[0].ExtraContent.Google)
+	require.Equal(t, "CgR0ZXN0", body.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -8,8 +9,11 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/looplj/axonhub/internal/contexts"
+	entprivacy "github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
+	"github.com/looplj/axonhub/internal/server/safeguards"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
@@ -17,14 +21,22 @@ import (
 type AnthropicHandlersParams struct {
 	fx.In
 
-	ChannelService  *biz.ChannelService
-	ModelService    *biz.ModelService
-	RequestService  *biz.RequestService
-	SystemService   *biz.SystemService
-	UsageLogService *biz.UsageLogService
-	PromptService   *biz.PromptService
-	QuotaService    *biz.QuotaService
-	HttpClient      *httpclient.HttpClient
+	ChannelService              *biz.ChannelService
+	ModelService                *biz.ModelService
+	DefaultSelector             *orchestrator.DefaultSelector
+	RequestService              *biz.RequestService
+	SystemService               *biz.SystemService
+	UsageLogService             *biz.UsageLogService
+	PromptService               *biz.PromptService
+	PromptProtectionRuleService *biz.PromptProtectionRuleService
+	QuotaService                *biz.QuotaService
+	HttpClient                  *httpclient.HttpClient
+	LiveStreamRegistry          *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
+	PluginManager               *plugin.Manager
+	SSEKeepAliveConfig          SSEKeepAliveConfig
+	SafeguardsConfig            safeguards.Config `optional:"true"`
 }
 
 type AnthropicHandlers struct {
@@ -35,11 +47,11 @@ type AnthropicHandlers struct {
 }
 
 func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
-	return &AnthropicHandlers{
+	handlers := &AnthropicHandlers{
 		ChatCompletionHandlers: &ChatCompletionHandlers{
 			ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 				params.ChannelService,
-				params.ModelService,
+				params.DefaultSelector,
 				params.RequestService,
 				params.HttpClient,
 				anthropic.NewInboundTransformer(),
@@ -47,12 +59,23 @@ func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
 				params.UsageLogService,
 				params.PromptService,
 				params.QuotaService,
-			),
+				params.PromptProtectionRuleService,
+				params.LiveStreamRegistry,
+				params.ChannelLimiterManager,
+				params.ProviderQuotaStatusProvider,
+				orchestratorPlugins(params.PluginManager)),
+			sseKeepAlive:             params.SSEKeepAliveConfig,
+			sseHeartbeatFormat:       sseHeartbeatAnthropic,
+			safeguardsConfig:         params.SafeguardsConfig,
+			safeguardsConfigProvider: params.SystemService.ClaudeCodeSafeguardsConfig,
+			inputUsageCache:          newInputUsageCache(),
 		},
 		ChannelService: params.ChannelService,
 		ModelService:   params.ModelService,
 		SystemService:  params.SystemService,
 	}
+	handlers.ChatCompletionHandlers.reviewer = newSafeguardsClassifier(handlers.ChatCompletionHandlers.ChatCompletionOrchestrator)
+	return handlers
 }
 
 func (handlers *AnthropicHandlers) CreateMessage(c *gin.Context) {
@@ -74,12 +97,19 @@ func (handlers *AnthropicHandlers) ListModels(c *gin.Context) {
 	models, err := handlers.ModelService.ListEnabledModels(ctx)
 	if err != nil {
 		requestID, _ := contexts.GetRequestID(ctx)
-		c.JSON(http.StatusInternalServerError, anthropic.AnthropicError{
-			StatusCode: http.StatusInternalServerError,
-			Type:       "internal_server_error",
+		status := http.StatusInternalServerError
+		errorType := "internal_server_error"
+		if errors.Is(err, entprivacy.Deny) {
+			status = http.StatusForbidden
+			errorType = "permission_error"
+		}
+		_ = c.Error(err)
+		c.JSON(status, anthropic.AnthropicError{
+			StatusCode: status,
+			Type:       errorType,
 			RequestID:  requestID,
 			Error: anthropic.ErrorDetail{
-				Type:    "internal_server_error",
+				Type:    errorType,
 				Message: err.Error(),
 			},
 		})

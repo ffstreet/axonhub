@@ -3,11 +3,12 @@ package responses
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
@@ -28,6 +29,17 @@ func convertToTextOptions(chatReq *llm.Request) *TextOptions {
 	if chatReq.ResponseFormat != nil {
 		result.Format = &TextFormat{
 			Type: chatReq.ResponseFormat.Type,
+		}
+
+		// Extract name, schema, strict, and description from json_schema
+		if chatReq.ResponseFormat.Type == "json_schema" && len(chatReq.ResponseFormat.JSONSchema) > 0 {
+			var jsonSchema rawJSONSchema
+			if err := json.Unmarshal(chatReq.ResponseFormat.JSONSchema, &jsonSchema); err == nil {
+				result.Format.Name = jsonSchema.Name
+				result.Format.Description = jsonSchema.Description
+				result.Format.Schema = jsonSchema.Schema
+				result.Format.Strict = jsonSchema.Strict
+			}
 		}
 	}
 
@@ -93,20 +105,150 @@ func convertInputFromMessages(msgs []llm.Message, transformOptions llm.Transform
 
 	var items []Item
 
+	// Track tool call types so tool result messages can be encoded correctly.
+	// callID -> item type (function_call_output or custom_tool_call_output)
+	toolResultItemTypeByCallID := map[string]string{}
+
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "user", "developer":
 			items = append(items, convertUserMessage(msg))
 		case "assistant":
-			items = append(items, convertAssistantMessage(msg)...)
+			assistantItems := convertAssistantMessage(msg)
+			items = append(items, assistantItems...)
+
+			// Record tool call types for later tool result encoding.
+			for _, it := range assistantItems {
+				switch it.Type {
+				case "function_call":
+					if it.CallID != "" {
+						toolResultItemTypeByCallID[it.CallID] = "function_call_output"
+					}
+				case "custom_tool_call":
+					if it.CallID != "" {
+						toolResultItemTypeByCallID[it.CallID] = "custom_tool_call_output"
+					}
+				}
+			}
 		case "tool":
-			items = append(items, convertToolMessage(msg))
+			itemType := "function_call_output"
+
+			if msg.ToolCallID != nil {
+				if mapped, ok := toolResultItemTypeByCallID[*msg.ToolCallID]; ok {
+					itemType = mapped
+				}
+			}
+
+			items = append(items, convertToolMessageWithType(msg, itemType))
 		}
 	}
 
 	return Input{
 		Items: items,
 	}
+}
+
+// jsonObjectKeywordPrompt is the minimal reminder prepended to input. It must
+// keep the word "json" in lower case so a case-sensitive upstream check passes.
+const jsonObjectKeywordPrompt = "Respond with a json object."
+
+// ensureJSONObjectKeyword satisfies the Responses API precondition for
+// text.format.type json_object: an input item has to mention "json", while
+// instructions are not inspected. Chat Completions clients often satisfy their
+// own precondition through a system message, which this conversion moves into
+// instructions, so the keyword can disappear from input even though the request
+// is valid as sent. Prepend the keyword instead of duplicating the system prompt.
+func ensureJSONObjectKeyword(input Input, responseFormat *llm.ResponseFormat) Input {
+	if responseFormat == nil || responseFormat.Type != "json_object" || inputMentionsJSON(input) {
+		return input
+	}
+
+	if input.Text != nil {
+		text := jsonObjectKeywordPrompt
+		if *input.Text != "" {
+			text += "\n\n" + *input.Text
+		}
+
+		return Input{Text: &text}
+	}
+
+	// The reminder must be the first input item on every turn: WebSocket
+	// connection reuse matches the previous turn's input as a prefix of the
+	// new one, and a trailing reminder breaks that prefix after the first
+	// turn. It is carried in Input.Reminder and prepended by
+	// marshalRequestPayload AFTER the raw-only items are merged back in,
+	// because a raw item's OriginalIndex addresses the input as it was
+	// received, before this reminder existed.
+	return Input{
+		Items: input.Items,
+		Reminder: &Item{
+			Type: "message",
+			Role: "developer",
+			Content: &Input{Items: []Item{{
+				Type: "input_text",
+				Text: lo.ToPtr(jsonObjectKeywordPrompt),
+			}}},
+		},
+	}
+}
+
+func inputMentionsJSON(input Input) bool {
+	if input.Text != nil && containsJSONKeyword(*input.Text) {
+		return true
+	}
+
+	for _, item := range input.Items {
+		// Only message text counts. The upstream check reads input messages, so
+		// treating tool arguments or outputs as sufficient could leave the
+		// request failing; adding a reminder they would have suppressed is
+		// harmless by comparison.
+		if item.Type != "message" && item.Role == "" {
+			continue
+		}
+
+		// Assistant items are the previous turn's response, not client input.
+		// They can mention "json" (for example explanatory prose alongside
+		// JSON output), and letting them suppress the reminder would flip the
+		// decision between turns, breaking the input prefix stability the
+		// pooled WebSocket executor relies on for connection reuse.
+		if item.Role == "assistant" {
+			continue
+		}
+
+		if item.Content != nil && messageContentMentionsJSON(*item.Content) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func messageContentMentionsJSON(content Input) bool {
+	if content.Text != nil && containsJSONKeyword(*content.Text) {
+		return true
+	}
+
+	for _, part := range content.Items {
+		if part.Text != nil && containsJSONKeyword(*part.Text) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// containsJSONKeyword reports whether s mentions "json" in any letter case.
+// It scans instead of lowercasing so large prompts are not copied.
+func containsJSONKeyword(s string) bool {
+	const keyword = "json"
+
+	for i := 0; i+len(keyword) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(keyword)], keyword) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // convertUserMessage converts a user message to Responses API Item format.
@@ -136,6 +278,14 @@ func convertUserMessage(msg llm.Message) Item {
 						Detail:   p.ImageURL.Detail,
 					})
 				}
+			case "document":
+				if p.Document != nil {
+					contentItems = append(contentItems, responseInputFile(p.Document))
+				}
+			case "compaction", "compaction_summary":
+				if p.Compact != nil {
+					contentItems = append(contentItems, compactionItemFromPart(p, p.Type))
+				}
 			}
 		}
 	}
@@ -147,79 +297,173 @@ func convertUserMessage(msg llm.Message) Item {
 	}
 }
 
+func responseInputFile(document *llm.DocumentURL) Item {
+	item := Item{
+		Type: "input_file",
+	}
+	if document.FileID != "" {
+		item.FileID = &document.FileID
+	}
+	if document.Filename != "" {
+		item.Filename = &document.Filename
+	} else if document.MIMEType == "application/pdf" {
+		item.Filename = lo.ToPtr("document.pdf")
+	}
+	if document.URL != "" {
+		if strings.HasPrefix(document.URL, "data:") {
+			item.FileData = &document.URL
+		} else {
+			item.FileURL = &document.URL
+		}
+	}
+
+	return item
+}
+
 // convertAssistantMessage converts an assistant message to Responses API Item(s) format.
 // Returns multiple items if the message contains tool calls.
 func convertAssistantMessage(msg llm.Message) []Item {
-	var items []Item
+	var (
+		items         []Item
+		toolCallItems []Item
+	)
 
 	// Handle reasoning content first.
 	// For Requests, reasoning is represented as an `input` item with type="reasoning".
 	// The Responses API uses the `summary` field to hold the reasoning summary text.
-	if (msg.ReasoningContent != nil && *msg.ReasoningContent != "") || msg.ReasoningSignature != nil {
+	reasoningItems := msg.ReasoningItems
+	if len(reasoningItems) == 0 && msg.ReasoningSignature != nil {
+		reasoningItems = []llm.ReasoningItem{{
+			Content:   lo.FromPtr(msg.ReasoningContent),
+			Signature: *msg.ReasoningSignature,
+		}}
+	}
+
+	for _, reasoningItem := range reasoningItems {
+		encryptedContent := shared.DecodeOpenAIEncryptedContent(&reasoningItem.Signature)
+		if encryptedContent == nil {
+			continue
+		}
+
 		summary := []ReasoningSummary{}
-		if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+		if reasoningItem.Content != "" {
 			summary = append(summary, ReasoningSummary{
 				Type: "summary_text",
-				Text: *msg.ReasoningContent,
+				Text: reasoningItem.Content,
 			})
 		}
 
-		var encryptedContent *string
-		if msg.ReasoningSignature != nil {
-			encryptedContent = shared.DecodeOpenAIEncryptedContent(msg.ReasoningSignature)
-		}
-
 		items = append(items, Item{
+			ID:               reasoningItem.ID,
 			Type:             "reasoning",
 			EncryptedContent: encryptedContent,
 			Summary:          summary,
 		})
 	}
 
-	// Handle tool calls
+	// Native Anthropic searches are already executed. Preserve their history
+	// as assistant text instead of replaying them as pending client functions.
+	var searchHistory strings.Builder
+	searchResults := make(map[string]bool)
 	for _, tc := range msg.ToolCalls {
+		if tc.Function.Name != "web_search" || tc.TransformerMetadata["anthropic_type"] != "server_tool_use" {
+			continue
+		}
+		searchHistory.WriteString("Web search " + tc.ID + ": " + tc.Function.Arguments + "\n")
+		for _, result := range msg.InlineToolResults {
+			if result.ToolCallID == tc.ID && result.TransformerMetadata["anthropic_type"] == "web_search_tool_result" {
+				searchHistory.WriteString("Web search result " + result.ToolCallID + ": " + result.Output + "\n")
+				searchResults[result.ToolCallID] = true
+			}
+		}
+	}
+	for _, result := range msg.InlineToolResults {
+		if result.TransformerMetadata["anthropic_type"] == "web_search_tool_result" && !searchResults[result.ToolCallID] {
+			searchHistory.WriteString("Web search result " + result.ToolCallID + ": " + result.Output + "\n")
+		}
+	}
+	if searchHistory.Len() > 0 {
 		items = append(items, Item{
-			Type:      "function_call",
-			CallID:    tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
+			Type: "message", Role: "assistant", Status: lo.ToPtr("completed"),
+			Content: &Input{Items: []Item{{Type: "output_text", Text: lo.ToPtr(searchHistory.String())}}},
 		})
+	}
+
+	// Handle client tool calls separately, including functions named web_search.
+	for _, tc := range msg.ToolCalls {
+		if tc.Function.Name == "web_search" && tc.TransformerMetadata["anthropic_type"] == "server_tool_use" {
+			continue
+		}
+		if tc.ResponseCustomToolCall != nil {
+			toolCallItems = append(toolCallItems, Item{
+				Type:   "custom_tool_call",
+				CallID: tc.ResponseCustomToolCall.CallID,
+				Name:   tc.ResponseCustomToolCall.Name,
+				Input:  lo.ToPtr(tc.ResponseCustomToolCall.Input),
+			})
+		} else {
+			toolCallItems = append(toolCallItems, Item{
+				Type:      "function_call",
+				CallID:    tc.ID,
+				Name:      localFunctionName(tc.Function.Namespace, tc.Function.Name),
+				Namespace: tc.Function.Namespace,
+				Arguments: tc.Function.Arguments,
+			})
+		}
 	}
 
 	var contentItems []Item
 
-	if msg.Content.Content != nil {
-		contentItems = append(contentItems, Item{
-			Type:        "output_text",
-			Text:        msg.Content.Content,
-			Annotations: []Annotation{},
-		})
-	} else {
-		for _, p := range msg.Content.MultipleContent {
-			if p.Type == "text" && p.Text != nil {
-				contentItems = append(contentItems, Item{
-					Type:        "output_text",
-					Text:        p.Text,
-					Annotations: []Annotation{},
-				})
-			}
+	flushMessage := func() {
+		if len(contentItems) == 0 {
+			return
 		}
-	}
 
-	if len(contentItems) > 0 {
 		items = append(items, Item{
 			Type:    "message",
 			Role:    msg.Role,
 			Status:  lo.ToPtr("completed"),
 			Content: &Input{Items: contentItems},
 		})
+		contentItems = nil
 	}
+
+	if msg.Content.Content != nil {
+		contentItems = append(contentItems, Item{
+			Type: "output_text",
+			Text: msg.Content.Content,
+		})
+	} else {
+		for _, p := range msg.Content.MultipleContent {
+			switch p.Type {
+			case "text":
+				if p.Text != nil {
+					contentItems = append(contentItems, Item{
+						Type: "output_text",
+						Text: p.Text,
+					})
+				}
+			case "compaction", "compaction_summary":
+				if p.Compact != nil {
+					flushMessage()
+
+					items = append(items, compactionItemFromPart(p, p.Type))
+				}
+			}
+		}
+	}
+
+	// In the common assistant flow, the visible message content precedes any
+	// subsequent tool calls. Flush message segments before appending tool-call
+	// items so the encoded Responses item order matches that expectation.
+	flushMessage()
+
+	items = append(items, toolCallItems...)
 
 	return items
 }
 
-// convertToolMessage converts a tool result message to Responses API Item format.
-func convertToolMessage(msg llm.Message) Item {
+func convertToolMessageWithType(msg llm.Message, itemType string) Item {
 	var output Input
 
 	// Handle simple content first
@@ -227,11 +471,31 @@ func convertToolMessage(msg llm.Message) Item {
 		output.Text = msg.Content.Content
 	} else if len(msg.Content.MultipleContent) > 0 {
 		for _, p := range msg.Content.MultipleContent {
-			if p.Type == "text" && p.Text != nil {
-				output.Items = append(output.Items, Item{
-					Type: "input_text",
-					Text: p.Text,
-				})
+			switch p.Type {
+			case "text":
+				if p.Text != nil {
+					output.Items = append(output.Items, Item{
+						Type: "input_text",
+						Text: p.Text,
+					})
+				}
+			case "image_url":
+				// Tool results can carry images (Codex's view_image, MCP screenshot
+				// tools, ...); the Responses schema allows text/image/file content in
+				// function_call_output and custom_tool_call_output. Skipping them left
+				// output empty, which the fallback below turned into "" — a blank but
+				// successful tool result the model cannot distinguish from a real one.
+				if p.ImageURL != nil {
+					// `detail` is required by InputImageContent, which is what a
+					// custom_tool_call_output's content array resolves to; the
+					// function_call_output param schema makes it optional. Both
+					// document "auto" as the default, so always send one.
+					output.Items = append(output.Items, Item{
+						Type:     "input_image",
+						ImageURL: &p.ImageURL.URL,
+						Detail:   lo.ToPtr(lo.FromPtrOr(p.ImageURL.Detail, "auto")),
+					})
+				}
 			}
 		}
 	}
@@ -242,8 +506,10 @@ func convertToolMessage(msg llm.Message) Item {
 	}
 
 	return Item{
-		Type:   "function_call_output",
+		ID:     msg.ID,
+		Type:   itemType,
 		CallID: lo.FromPtr(msg.ToolCallID),
+		Name:   lo.FromPtr(msg.ToolCallName),
 		Output: &output,
 	}
 }
@@ -256,6 +522,7 @@ func convertImageGenerationToTool(src llm.Tool) Tool {
 		tool.Model = src.ImageGeneration.Model
 		tool.Background = src.ImageGeneration.Background
 		tool.InputFidelity = src.ImageGeneration.InputFidelity
+		tool.InputImageMask = src.ImageGeneration.InputImageMask
 		tool.Moderation = src.ImageGeneration.Moderation
 		tool.OutputCompression = src.ImageGeneration.OutputCompression
 		tool.OutputFormat = src.ImageGeneration.OutputFormat
@@ -267,11 +534,65 @@ func convertImageGenerationToTool(src llm.Tool) Tool {
 	return tool
 }
 
+func convertWebSearchToTool(src llm.Tool) Tool {
+	tool := Tool{
+		Type: "web_search",
+	}
+
+	if src.WebSearch == nil {
+		return tool
+	}
+
+	if len(src.WebSearch.AllowedDomains) > 0 {
+		tool.Filters = &WebSearchFilters{
+			AllowedDomains: append([]string(nil), src.WebSearch.AllowedDomains...),
+		}
+	}
+
+	location := src.WebSearch.UserLocation
+	if location.Type != "" || location.City != "" || location.Country != "" || location.Region != "" || location.Timezone != "" {
+		locationType := location.Type
+		if locationType == "" {
+			locationType = "approximate"
+		}
+		tool.UserLocation = &WebSearchUserLocation{
+			Type:     locationType,
+			City:     location.City,
+			Country:  location.Country,
+			Region:   location.Region,
+			Timezone: location.Timezone,
+		}
+	}
+
+	return tool
+}
+
+// convertCustomToTool converts an llm.Tool custom tool to Responses API Tool format.
+func convertCustomToTool(src llm.Tool) Tool {
+	tool := Tool{
+		Type: "custom",
+	}
+	if src.ResponseCustomTool != nil {
+		tool.Name = src.ResponseCustomTool.Name
+
+		tool.Description = src.ResponseCustomTool.Description
+		if src.ResponseCustomTool.Format != nil {
+			tool.Format = &CustomToolFormat{
+				Type:       src.ResponseCustomTool.Format.Type,
+				Syntax:     src.ResponseCustomTool.Format.Syntax,
+				Definition: src.ResponseCustomTool.Format.Definition,
+			}
+		}
+	}
+
+	return tool
+}
+
 // convertFunctionToTool converts an llm.Tool function to Responses API Tool format.
 func convertFunctionToTool(src llm.Tool) Tool {
 	tool := Tool{
 		Type:        "function",
-		Name:        src.Function.Name,
+		Name:        localFunctionName(src.Function.Namespace, src.Function.Name),
 		Description: src.Function.Description,
 		Strict:      src.Function.Strict,
 	}
@@ -280,6 +601,53 @@ func convertFunctionToTool(src llm.Tool) Tool {
 	if len(src.Function.Parameters) > 0 {
 		var params map[string]any
 		if err := json.Unmarshal(src.Function.Parameters, &params); err == nil {
+			// Handle nil map panic - initialize if nil
+			if params == nil {
+				params = map[string]any{}
+			}
+
+			// OpenAI rejects object schemas that omit properties entirely.
+			// Anthropic clients may send {"type":"object"} for no-arg tools, so normalize that here.
+			if typeName, ok := params["type"].(string); ok && typeName == "object" {
+				if _, ok := params["properties"].(map[string]any); !ok {
+					params["properties"] = map[string]any{}
+				}
+			}
+
+			// For strict mode, additionalProperties must be false and all properties must be required
+			// See: https://platform.openai.com/docs/guides/function-calling#strict-mode
+			if src.Function.Strict != nil && *src.Function.Strict {
+				// Always set additionalProperties: false for strict validation
+				// Overwrite any existing value (including true) to ensure false
+				params["additionalProperties"] = false
+
+				// When strict mode is enabled, ALL properties must be listed in "required"
+				if props, ok := params["properties"].(map[string]any); ok && len(props) > 0 {
+					required := make([]string, 0, len(props))
+					// First, check if there's an existing required array and preserve it
+					if existingRequired, ok := params["required"].([]any); ok {
+						for _, r := range existingRequired {
+							if s, ok := r.(string); ok {
+								required = append(required, s)
+							}
+						}
+					}
+					// Add any missing property keys to required
+					requiredSet := make(map[string]bool)
+					for _, r := range required {
+						requiredSet[r] = true
+					}
+
+					for key := range props {
+						if !requiredSet[key] {
+							required = append(required, key)
+						}
+					}
+
+					params["required"] = required
+				}
+			}
+
 			tool.Parameters = params
 		}
 	}
@@ -288,7 +656,7 @@ func convertFunctionToTool(src llm.Tool) Tool {
 }
 
 // convertToolChoice converts llm.ToolChoice to Responses API ToolChoice.
-func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
+func convertToolChoice(src *llm.ToolChoice, tools []llm.Tool) *ToolChoice {
 	if src == nil {
 		return nil
 	}
@@ -298,10 +666,32 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 	if src.ToolChoice != nil {
 		// String mode like "none", "auto", "required"
 		result.Mode = src.ToolChoice
-	} else if src.NamedToolChoice != nil {
+	}
+	if src.NamedToolChoice != nil {
+		// Anthropic names both native tools and functions in tool_choice.
+		// Resolve the declaration before emitting a Responses function choice.
+		if src.NamedToolChoice.Type == "function" && src.NamedToolChoice.Function.Name == "web_search" {
+			for _, tool := range tools {
+				if tool.Type == llm.ToolTypeFunction && tool.Function.Name == "web_search" {
+					return &ToolChoice{Type: lo.ToPtr("function"), Name: lo.ToPtr("web_search")}
+				}
+			}
+			for _, tool := range tools {
+				if tool.Type == llm.ToolTypeWebSearch {
+					return &ToolChoice{Type: lo.ToPtr(llm.ToolTypeWebSearch)}
+				}
+			}
+		}
 		// Specific tool choice
 		result.Type = &src.NamedToolChoice.Type
-		result.Name = &src.NamedToolChoice.Function.Name
+		if src.NamedToolChoice.Function.Name != "" {
+			name := src.NamedToolChoice.Function.Name
+			result.Name = &name
+		}
+	}
+
+	for _, opt := range src.Tools {
+		result.Tools = append(result.Tools, ToolOption{Type: opt.Type, Name: opt.Name})
 	}
 
 	return result
@@ -328,8 +718,14 @@ func convertStreamOptions(src *llm.StreamOptions, metadata map[string]any) *Stre
 // Only one of "reasoning.effort" and "reasoning.max_tokens" can be specified.
 // Priority is given to effort when both are present.
 func convertReasoning(req *llm.Request) *Reasoning {
+	reasoningContext := ""
+	if requestExt := openAIResponsesRequestExtensions(req); requestExt != nil {
+		reasoningContext = requestExt.ReasoningContext
+	}
+
 	// Check if any reasoning-related fields are present
-	hasReasoningFields := req.ReasoningEffort != "" ||
+	hasReasoningFields := reasoningContext != "" ||
+		req.ReasoningEffort != "" ||
 		req.ReasoningBudget != nil ||
 		req.ReasoningSummary != nil
 	if !hasReasoningFields {
@@ -337,6 +733,7 @@ func convertReasoning(req *llm.Request) *Reasoning {
 	}
 
 	reasoning := &Reasoning{
+		Context:   reasoningContext,
 		Effort:    req.ReasoningEffort,
 		MaxTokens: req.ReasoningBudget,
 	}
@@ -352,4 +749,291 @@ func convertReasoning(req *llm.Request) *Reasoning {
 	}
 
 	return reasoning
+}
+
+func annotationToLLM(a Annotation, textRuneOffset int64) llm.Annotation {
+	annotation := llm.Annotation{
+		Type: a.Type,
+	}
+
+	if a.StartIndex != nil {
+		annotation.StartIndex = lo.ToPtr(*a.StartIndex + textRuneOffset)
+	}
+
+	if a.EndIndex != nil {
+		annotation.EndIndex = lo.ToPtr(*a.EndIndex + textRuneOffset)
+	}
+
+	if a.URLCitation != nil {
+		annotation.URLCitation = &llm.URLCitation{
+			URL:   a.URLCitation.URL,
+			Title: a.URLCitation.Title,
+		}
+	}
+
+	return annotation
+}
+
+func appendOutputText(textContent *strings.Builder, visibleTextRuneCount *int64, annotations []llm.Annotation, outputItem Item) []llm.Annotation {
+	if outputItem.Text == nil {
+		return annotations
+	}
+
+	textRuneOffset := *visibleTextRuneCount
+	textContent.WriteString(*outputItem.Text)
+	*visibleTextRuneCount += int64(utf8.RuneCountInString(*outputItem.Text))
+
+	if len(outputItem.Annotations) == 0 {
+		return annotations
+	}
+
+	for _, annotation := range outputItem.Annotations {
+		annotations = append(annotations, annotationToLLM(annotation, textRuneOffset))
+	}
+
+	return annotations
+}
+
+func appendResponseWebSearchCallMetadata(metadata map[string]any, item Item) {
+	if metadata == nil || item.ID == "" {
+		return
+	}
+	call := Item{ID: item.ID, Type: item.Type, Status: item.Status}
+	if item.Action != nil && item.Action.WebSearch != nil {
+		action := *item.Action.WebSearch
+		action.Queries = append([]string(nil), action.Queries...)
+		action.Sources = append([]WebSearchSource(nil), action.Sources...)
+		call.Action = NewWebSearchAction(&action)
+	}
+	// Keep metadata snapshots immutable and update by ID: added, done and the
+	// terminal response can all describe the same server-side invocation.
+	previous, _ := metadata[responsesWebSearchCallsTransformerMetadataKey].([]Item)
+	calls := append([]Item(nil), previous...)
+	for i, existing := range calls {
+		if existing.ID != call.ID {
+			continue
+		}
+		if call.Action == nil {
+			call.Action = existing.Action
+		} else if existing.Action != nil && existing.Action.WebSearch != nil {
+			earlier := existing.Action.WebSearch
+			action := call.Action.WebSearch
+			if action.Type == "" {
+				action.Type = earlier.Type
+			}
+			if action.Query == "" {
+				action.Query = earlier.Query
+			}
+			if len(action.Queries) == 0 {
+				action.Queries = append([]string(nil), earlier.Queries...)
+			}
+			sources := append([]WebSearchSource(nil), earlier.Sources...)
+			for _, source := range action.Sources {
+				index := -1
+				for j, old := range sources {
+					if old.URL == source.URL {
+						index = j
+						break
+					}
+				}
+				if index < 0 {
+					sources = append(sources, source)
+				} else {
+					if source.Title != "" {
+						sources[index].Title = source.Title
+					}
+					if source.Type != "" {
+						sources[index].Type = source.Type
+					}
+				}
+			}
+			action.Sources = sources
+		}
+		if call.Status == nil || (existing.Status != nil && (*existing.Status == "completed" || *existing.Status == "failed")) {
+			call.Status = existing.Status
+		}
+		calls[i] = call
+		metadata[responsesWebSearchCallsTransformerMetadataKey] = calls
+		return
+	}
+	metadata[responsesWebSearchCallsTransformerMetadataKey] = append(calls, call)
+}
+
+// convertOutputToMessage converts Responses API output items into an llm.Message.
+// It aggregates text, reasoning, tool calls, image generation,
+// compaction and compaction_summary items from the response output.
+func convertOutputToMessage(output []Item, transformerMetadata map[string]any) llm.Message {
+	var (
+		contentParts         []llm.MessageContentPart
+		textContent          strings.Builder
+		reasoningContent     strings.Builder
+		reasoningSignature   *string
+		reasoningItems       []llm.ReasoningItem
+		messageID            string
+		toolCalls            []llm.ToolCall
+		annotations          []llm.Annotation
+		visibleTextRuneCount int64
+	)
+
+	flushText := func() {
+		if textContent.Len() == 0 {
+			return
+		}
+
+		contentParts = append(contentParts, llm.MessageContentPart{
+			Type: "text",
+			Text: lo.ToPtr(textContent.String()),
+		})
+		textContent.Reset()
+	}
+
+	for _, outputItem := range output {
+		switch outputItem.Type {
+		case "message":
+			if messageID == "" {
+				messageID = outputItem.ID
+			}
+
+			if outputItem.Content == nil {
+				continue
+			}
+			for _, contentItem := range outputItem.Content.Items {
+				if contentItem.Type == "output_text" {
+					annotations = appendOutputText(&textContent, &visibleTextRuneCount, annotations, contentItem)
+				}
+			}
+		case "output_text":
+			annotations = appendOutputText(&textContent, &visibleTextRuneCount, annotations, outputItem)
+		case "function_call":
+			toolCalls = append(toolCalls, llm.ToolCall{
+				ID:   outputItem.CallID,
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      flatFunctionName(outputItem.Namespace, outputItem.Name),
+					Namespace: outputItem.Namespace,
+					Arguments: outputItem.Arguments,
+				},
+			})
+		case "custom_tool_call":
+			inputStr := ""
+			if outputItem.Input != nil {
+				inputStr = *outputItem.Input
+			}
+
+			toolCalls = append(toolCalls, llm.ToolCall{
+				ID:   outputItem.CallID,
+				Type: llm.ToolTypeResponsesCustomTool,
+				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
+					CallID: outputItem.CallID,
+					Name:   outputItem.Name,
+					Input:  inputStr,
+				},
+			})
+		case "reasoning":
+			var itemReasoning strings.Builder
+			for _, summary := range outputItem.Summary {
+				reasoningContent.WriteString(summary.Text)
+				itemReasoning.WriteString(summary.Text)
+			}
+
+			itemSignature := ""
+			if outputItem.EncryptedContent != nil && *outputItem.EncryptedContent != "" {
+				reasoningSignature = shared.EncodeOpenAIEncryptedContent(outputItem.EncryptedContent)
+				itemSignature = lo.FromPtr(reasoningSignature)
+			}
+			if itemReasoning.Len() > 0 || itemSignature != "" {
+				reasoningItems = append(reasoningItems, llm.ReasoningItem{
+					ID:        outputItem.ID,
+					Content:   itemReasoning.String(),
+					Signature: itemSignature,
+				})
+			}
+		case "image_generation_call":
+			flushText()
+
+			imageOutputFormat := "png"
+
+			if transformerMetadata != nil {
+				if imgFmt, ok := transformerMetadata["image_output_format"].(string); ok && imgFmt != "" {
+					imageOutputFormat = imgFmt
+				}
+			}
+
+			if outputItem.Result != nil && *outputItem.Result != "" {
+				contentParts = append(contentParts, llm.MessageContentPart{
+					Type: "image_url",
+					ImageURL: &llm.ImageURL{
+						URL: `data:image/` + imageOutputFormat + `;base64,` + *outputItem.Result,
+					},
+					TransformerMetadata: map[string]any{
+						"background":    outputItem.Background,
+						"output_format": outputItem.OutputFormat,
+						"quality":       outputItem.Quality,
+						"size":          outputItem.Size,
+					},
+				})
+			}
+		case "web_search_call":
+			appendResponseWebSearchCallMetadata(transformerMetadata, outputItem)
+		case "compaction", "compaction_summary":
+			flushText()
+
+			encryptedContent := ""
+			if outputItem.EncryptedContent != nil {
+				encryptedContent = *outputItem.EncryptedContent
+			}
+
+			contentParts = append(contentParts, llm.MessageContentPart{
+				Type: outputItem.Type,
+				Compact: &llm.CompactContent{
+					ID:               outputItem.ID,
+					EncryptedContent: encryptedContent,
+					CreatedBy:        outputItem.CreatedBy,
+				},
+			})
+		case "input_image":
+			flushText()
+
+			if outputItem.ImageURL != nil && *outputItem.ImageURL != "" {
+				contentParts = append(contentParts, llm.MessageContentPart{
+					Type: "image_url",
+					ImageURL: &llm.ImageURL{
+						URL: *outputItem.ImageURL,
+					},
+				})
+			}
+		}
+	}
+
+	flushText()
+
+	msg := llm.Message{
+		ID:          messageID,
+		Role:        "assistant",
+		ToolCalls:   toolCalls,
+		Annotations: annotations,
+	}
+
+	if reasoningContent.Len() > 0 {
+		msg.ReasoningContent = lo.ToPtr(reasoningContent.String())
+	}
+
+	if reasoningSignature != nil {
+		msg.ReasoningSignature = reasoningSignature
+	}
+	if len(reasoningItems) > 0 {
+		msg.ReasoningItems = reasoningItems
+	}
+
+	if len(contentParts) == 1 && contentParts[0].Type == "text" && len(toolCalls) == 0 {
+		msg.Content = llm.MessageContent{
+			Content: contentParts[0].Text,
+		}
+	} else if len(contentParts) > 0 {
+		msg.Content = llm.MessageContent{
+			MultipleContent: contentParts,
+		}
+	}
+
+	return msg
 }

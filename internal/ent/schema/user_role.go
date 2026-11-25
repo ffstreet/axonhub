@@ -3,15 +3,22 @@ package schema
 import (
 	"entgo.io/contrib/entgql"
 	"entgo.io/ent"
+	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
 	"entgo.io/ent/schema/index"
+	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/pkg/xtime"
+	"github.com/looplj/axonhub/internal/scopes"
 )
 
 // UserRole holds the schema definition for the UserRole entity.
 type UserRole struct {
 	ent.Schema
+}
+
+func (UserRole) Policy() ent.Policy {
+	return privacy.Policy{Query: privacy.QueryPolicy{scopes.UserRoleReadRule()}}
 }
 
 func (UserRole) Mixin() []ent.Mixin {
@@ -43,6 +50,7 @@ func (UserRole) Fields() []ent.Field {
 			Annotations(
 				entgql.OrderField("CREATED_AT"),
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entsql.DefaultExpr("CURRENT_TIMESTAMP"),
 			),
 		field.Time("updated_at").
 			Optional().
@@ -52,6 +60,7 @@ func (UserRole) Fields() []ent.Field {
 			Annotations(
 				entgql.OrderField("UPDATED_AT"),
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entsql.DefaultExpr("CURRENT_TIMESTAMP"),
 			),
 	}
 }

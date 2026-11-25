@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { pageInfoSchema } from '@/gql/pagination';
 
-export const modelTypeSchema = z.enum(['chat', 'embedding', 'rerank']);
+export const modelTypeSchema = z.enum(['chat', 'embedding', 'rerank', 'image_generation', 'video_generation']);
 export type ModelType = z.infer<typeof modelTypeSchema>;
 
 export const modelStatusSchema = z.enum(['enabled', 'disabled', 'archived']);
@@ -26,6 +26,8 @@ export const modelCostSchema = z.object({
   cacheWrite: z.number().optional(),
 });
 export type ModelCost = z.infer<typeof modelCostSchema>;
+export const referencePriceFields = modelCostSchema.keyof().options;
+export type ReferencePriceField = keyof ModelCost;
 
 export const modelLimitSchema = z.object({
   context: z.number(),
@@ -35,6 +37,7 @@ export type ModelLimit = z.infer<typeof modelLimitSchema>;
 
 export const modelCardSchema = z.object({
   reasoning: modelReasoningSchema.optional(),
+  reasoningEfforts: z.array(z.string()).optional().nullable(),
   toolCall: z.boolean().optional(),
   temperature: z.boolean().optional(),
   modalities: modelModalitiesSchema.optional(),
@@ -90,10 +93,35 @@ export const channelTagsRegexAssociationSchema = z.object({
 });
 export type ChannelTagsRegexAssociation = z.infer<typeof channelTagsRegexAssociationSchema>;
 
+export type FilterCondition = {
+  type: 'condition' | 'group';
+  logic?: string;
+  conditions?: FilterCondition[];
+  field?: string;
+  operator?: string;
+  value?: string | number | boolean;
+};
+
+export const filterConditionSchema: z.ZodType<FilterCondition> = z.object({
+  type: z.enum(['condition', 'group']).default('condition'),
+  logic: z.string().optional(),
+  conditions: z.array(z.lazy(() => filterConditionSchema)).optional().default([]),
+  field: z.string().optional(),
+  operator: z.string().optional(),
+  value: z.any().optional(),
+});
+
+export const modelAssociationWhenSchema = z.object({
+  enabled: z.boolean().optional().default(false),
+  condition: filterConditionSchema.optional().nullable(),
+});
+export type ModelAssociationWhen = z.infer<typeof modelAssociationWhenSchema>;
+
 export const modelAssociationSchema = z.object({
   type: z.enum(['channel_model', 'channel_regex', 'model', 'regex', 'channel_tags_model', 'channel_tags_regex']),
   priority: z.number().min(0).max(100).optional().default(0),
   disabled: z.boolean().optional().default(false),
+  when: modelAssociationWhenSchema.optional().nullable(),
   channelModel: channelModelAssociationSchema.optional().nullable(),
   channelRegex: channelRegexAssociationSchema.optional().nullable(),
   regex: regexAssociationSchema.optional().nullable(),
@@ -103,8 +131,19 @@ export const modelAssociationSchema = z.object({
 });
 export type ModelAssociation = z.infer<typeof modelAssociationSchema>;
 
+export function normalizeModelRoutingPolicyValue(value?: string | null): string {
+  if (!value || value === 'system_default') {
+    return 'default';
+  }
+
+  return value;
+}
+
 export const modelSettingsSchema = z.object({
+  disableDeveloperSettingsInheritance: z.boolean().optional().default(false),
   associations: z.array(modelAssociationSchema).optional().default([]),
+  loadBalancerStrategy: z.enum(['default', 'adaptive', 'failover', 'circuit-breaker', 'round-robin']).optional().default('default'),
+  traceStickyMode: z.enum(['default', 'disabled', 'prefer_previous_channel']).optional().default('default'),
 });
 export type ModelSettings = z.infer<typeof modelSettingsSchema>;
 
@@ -112,6 +151,8 @@ export const modelSchema = z.object({
   id: z.string(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
+  editVersion: z.string().optional(),
+  missingReferencePrices: z.array(z.string()).optional(),
   developer: z.string(),
   modelID: z.string(),
   type: modelTypeSchema,
@@ -126,6 +167,8 @@ export const modelSchema = z.object({
 });
 export type Model = z.infer<typeof modelSchema>;
 
+const editableCardSchema = modelCardSchema.extend({ cost: modelCostSchema.partial().optional() });
+
 export const createModelInputSchema = z.object({
   developer: z.string().min(1, 'Developer is required'),
   modelID: z.string().min(1, 'Model ID is required'),
@@ -133,7 +176,7 @@ export const createModelInputSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   icon: z.string().min(1, 'Icon is required'),
   group: z.string().min(1, 'Group is required'),
-  modelCard: modelCardSchema,
+  modelCard: editableCardSchema,
   settings: modelSettingsSchema.optional(),
   status: modelStatusSchema.optional(),
   remark: z.string().optional(),
@@ -141,10 +184,13 @@ export const createModelInputSchema = z.object({
 export type CreateModelInput = z.infer<typeof createModelInputSchema>;
 
 export const updateModelInputSchema = z.object({
+  developer: z.string().min(1, 'Developer is required').optional(),
+  modelID: z.string().min(1, 'Model ID is required').optional(),
+  type: modelTypeSchema.optional(),
   name: z.string().min(1, 'Name is required').optional(),
   icon: z.string().min(1, 'Icon is required').optional(),
   group: z.string().min(1, 'Group is required').optional(),
-  modelCard: modelCardSchema.optional(),
+  modelCard: editableCardSchema.optional(),
   settings: modelSettingsSchema.optional(),
   status: modelStatusSchema.optional(),
   remark: z.string().optional().nullable(),
