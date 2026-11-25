@@ -13,7 +13,7 @@ import { useOIDCProviders } from '@/features/auth/data/auth';
 export default function SettingsProfile() {
   const { t } = useTranslation();
   const { data: providers = [] } = useOIDCProviders();
-  const search = useSearch({ from: '/_authenticated/settings/profile' });
+  const search = useSearch({ from: '/_authenticated/settings/' });
   const queryClient = useQueryClient();
 
   useEffect(() => {

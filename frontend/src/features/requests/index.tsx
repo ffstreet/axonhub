@@ -175,6 +175,8 @@ function clearRequestFilterSearch(draft: Record<string, unknown>) {
 }
 
 function RequestsContent() {
+  const { t } = useTranslation();
+
   const navigate = useNavigate();
   const currentSearch = useRouterState({
     select: (state) => (state.location.search ?? {}) as Record<string, unknown>,
